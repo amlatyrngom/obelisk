@@ -1,0 +1,46 @@
+[workspace]
+members = [
+    'functional',
+    'common',
+    'messaging',
+    'persistence',
+    'deployment',
+    'microbench',
+]
+
+[dependencies]
+async_once = '*'
+bytes = '*'
+lambda_runtime = '*'
+lazy_static = '*'
+serde_json = '*'
+warp = '*'
+
+[dependencies.common]
+path = './common'
+
+[dependencies.functional]
+path = './functional'
+
+[dependencies.messaging]
+path = './messaging'
+
+[dependencies.persistence]
+path = './persistence'
+
+[dependencies.microbench]
+path = './microbench'
+
+
+[dependencies.tokio]
+features = ['full']
+version = '*'
+
+[[bin]]
+name = 'obelisk_main'
+path = 'src/main.rs'
+
+[package]
+edition = '2021'
+name = 'obelisk'
+version = '0.1.0'

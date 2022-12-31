@@ -1,0 +1,56 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "Action": "s3:*",
+        "Resource": "*"
+      },
+      {
+        "Effect": "Allow",
+        "Action": "dynamodb:*",
+        "Resource": "*"
+      },
+      {
+        "Effect": "Allow",
+        "Action": "lambda:*",
+        "Resource": "*"
+      },
+      {
+        "Effect": "Allow",
+        "Action": "ecs:*",
+        "Resource": "*"
+      },
+      {
+        "Effect": "Allow",
+        "Action": "ec2:*",
+        "Resource": "*"
+      },
+      {
+        "Effect": "Allow",
+        "Action": "ecr:*",
+        "Resource": "*"
+      },
+      {
+        "Effect": "Allow",
+        "Action": "logs:*",
+        "Resource": "*"
+      },
+      {
+        "Effect": "Allow",
+        "Action": "sqs:*",
+        "Resource": "*"
+      },
+      {
+        "Effect": "Allow",
+        "Action": "elasticfilesystem:*",
+        "Resource": "*"
+      },
+      {
+        "Effect": "Allow",
+        "Action": "iam:*",
+        "Resource": "*"
+      }
+    ]
+  }
+  

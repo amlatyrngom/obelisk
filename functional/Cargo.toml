@@ -1,0 +1,24 @@
+[package]
+name = "functional"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tokio = { version = "*", features = ["full"] }
+reqwest = { version = "*", features = ["json", "rustls-tls"], default-features = false }
+aws-sdk-lambda = "*"
+aws-config = "*"
+aws-smithy-types = "*"
+aws-types = "*"
+async-trait = "*"
+serde_json = "*"
+rand = "*"
+serde = {version="*", features=["derive"]}
+chrono = {version="*", features=["serde"]}
+common = {path="../common"}
+
+
+[dev-dependencies]
+ntest = "*"

@@ -1,0 +1,29 @@
+[package]
+name = "persistence"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tokio = { version = "*", features = ["full"] }
+reqwest = { version = "*", features = ["blocking"], default-features = false }
+bincode = "*"
+bytes = "*"
+uuid = { version = "*", features = ["v4"]}
+serde = {version="*", features=["derive"]}
+serde_json = "*"
+common = {path="../common"}
+chrono = {version="*", features=["serde"]}
+async-trait = "*"
+rusqlite = { version = "*", features = ["bundled"] }
+r2d2 = "*"
+r2d2_sqlite = "*"
+fslock = "*"
+dashmap = "*"
+moka = "*"
+concurrent-queue = "*"
+
+[dev-dependencies]
+fork = "*"
+nix = "*"

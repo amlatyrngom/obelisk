@@ -1,0 +1,4 @@
+**/target
+**/.obelisk_build
+**/obelisk_shared_data
+pitch.md

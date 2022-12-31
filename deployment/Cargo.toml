@@ -1,0 +1,24 @@
+[package]
+name = "deployment"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+toml = "*"
+quote = "*"
+syn = "*"
+proc-macro2 = "*"
+tokio = { version = "*", features = ["full"] }
+aws-sdk-iam = "*"
+aws-sdk-ecr = "*"
+aws-sdk-ecrpublic = "*"
+aws-config = "*"
+aws-types = "*"
+serde = {version="*", features=["derive"]}
+common = {path="../common"}
+functional = {path="../functional"}
+messaging = {path="../messaging"}
+persistence = {path="../persistence"}
+microbench = {path="../microbench"}

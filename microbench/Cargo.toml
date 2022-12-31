@@ -1,0 +1,19 @@
+[package]
+name = "microbench"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tokio = { version = "*", features = ["full"] }
+serde_json = "*"
+serde = {version="*", features=["derive"]}
+persistence = {path="../persistence"}
+common = {path="../common"}
+messaging = {path="../messaging"}
+functional = {path="../functional"}
+async-trait = "*"
+
+[dev-dependencies]
+csv = "*"
