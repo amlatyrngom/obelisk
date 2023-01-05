@@ -323,8 +323,8 @@ impl AWS {
     }
 
     /// Create private and public ecr repos.
-    pub(crate) async fn create_repos(&self, namespace: &str) -> (String, String) {
-        let name = full_image_name(namespace);
+    pub(crate) async fn create_repos(&self, project_name: &str) -> (String, String) {
+        let name = full_image_name(project_name);
         let res = self
             .ecr_client
             .create_repository()

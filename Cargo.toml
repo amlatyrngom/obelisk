@@ -4,8 +4,8 @@ members = [
     'common',
     'messaging',
     'persistence',
-    'deployment',
     'microbench',
+    'deployment'
 ]
 
 [dependencies]

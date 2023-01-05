@@ -226,15 +226,38 @@ impl AdapterDeployment {
         // Create access endpoints.
         if setup_endpoints {
             let svc_names = vec![
-                (format!("com.amazonaws.{}.sqs", self.region), false),
+                // (format!("com.amazonaws.{}.sqs", self.region), false),
                 (format!("com.amazonaws.{}.s3", self.region), true),
                 (format!("com.amazonaws.{}.dynamodb", self.region), true),
             ];
             for (svc_name, is_gateway) in svc_names {
+                let resp = self
+                    .ec2_client
+                    .describe_vpc_endpoints()
+                    .filters(
+                        aws_sdk_ec2::model::Filter::builder()
+                            .name("vpc-id")
+                            .values(vpc_id)
+                            .build(),
+                    )
+                    .filters(
+                        aws_sdk_ec2::model::Filter::builder()
+                            .name("service-name")
+                            .values(&svc_name)
+                            .build(),
+                    )
+                    .send()
+                    .await
+                    .unwrap();
+                if let Some(resp) = resp.vpc_endpoints() {
+                    if let Some(resp) = resp.first() {
+                        println!("Found endpoint: {resp:?}");
+                        continue;
+                    }
+                }
                 let mut req = self
                     .ec2_client
                     .create_vpc_endpoint()
-                    .client_token(format!("obelisk-{svc_name}0.2"))
                     .vpc_id(vpc_id)
                     .service_name(&svc_name);
                 if is_gateway {
@@ -256,6 +279,61 @@ impl AdapterDeployment {
         }
 
         (subnet_ids, sg_id)
+    }
+
+    pub async fn teardown_vpc_endpoints(&self) {
+        // Get vpc.
+        let vpc = self
+            .ec2_client
+            .describe_vpcs()
+            .filters(
+                aws_sdk_ec2::model::Filter::builder()
+                    .name("isDefault")
+                    .values("true")
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+        let vpc = vpc.vpcs().unwrap().first().unwrap();
+        let vpc_id = vpc.vpc_id().unwrap();
+        let svc_names = vec![
+            // (format!("com.amazonaws.{}.sqs", self.region), false),
+            (format!("com.amazonaws.{}.s3", self.region), true),
+            (format!("com.amazonaws.{}.dynamodb", self.region), true),
+        ];
+        let mut delete_req = self.ec2_client.delete_vpc_endpoints();
+        let mut found = false;
+        for (svc_name, _) in svc_names {
+            let resp = self
+                .ec2_client
+                .describe_vpc_endpoints()
+                .filters(
+                    aws_sdk_ec2::model::Filter::builder()
+                        .name("vpc-id")
+                        .values(vpc_id)
+                        .build(),
+                )
+                .filters(
+                    aws_sdk_ec2::model::Filter::builder()
+                        .name("service-name")
+                        .values(&svc_name)
+                        .build(),
+                )
+                .send()
+                .await
+                .unwrap();
+            if let Some(resp) = resp.vpc_endpoints() {
+                if let Some(resp) = resp.first() {
+                    found = true;
+                    let endpoint_id = resp.vpc_endpoint_id().unwrap();
+                    delete_req = delete_req.vpc_endpoint_ids(endpoint_id);
+                }
+            }
+        }
+        if found {
+            let _ = delete_req.send().await.unwrap();
+        }
     }
 
     // /// Delete a scaling subsystem.

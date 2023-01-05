@@ -99,6 +99,12 @@ fn build_image(for_system: bool) {
     exec_cmd("docker", vec!["build", "-t", name, "-f", &file_path, "."]);
 }
 
+fn pull_system_img(system_uri: &str) {
+    let name = "obelisk_system";
+    exec_cmd("docker", vec!["pull", system_uri]);
+    exec_cmd("docker", vec!["tag", system_uri, name]);
+}
+
 fn push_images(private_uri: &str, public_uri: &str, for_system: bool) {
     let name = if for_system {
         "obelisk_system"
@@ -135,6 +141,48 @@ pub async fn build_system(deployments: &[String]) {
         aws.deploy(
             &public_uri,
             &private_uri,
+            &private_uri,
+            &public_uri,
+            &deployment,
+        )
+        .await;
+    }
+}
+
+pub async fn teardown_deployment() {
+    let aws = aws::AWS::new().await;
+    aws.deployer.teardown_vpc_endpoints().await;
+}
+
+pub async fn build_user_deployment(project_name: &str, system_img: &str, deployments: &[String]) {
+    // Gen main file.
+    let deployments: Vec<Deployment> = deployments
+        .iter()
+        .map(|s| toml::from_str(s).unwrap())
+        .collect();
+    codegen::gen_main(&deployments, false);
+    // Gen cargo file.
+    let user_cargo = std::fs::read_to_string("Cargo.toml").unwrap();
+    let user_cargo: CargoConfig = toml::from_str(&user_cargo).unwrap();
+    codegen::gen_cargo(user_cargo);
+    // Create repos and push image.
+    let aws = aws::AWS::new().await;
+    aws.deployer.create_cluster().await;
+    aws.deployer.create_bucket().await;
+    aws.deployer.get_subnet_with_endpoints(true).await;
+    // Make system repos.
+    pull_system_img(system_img);
+    let (system_private_uri, system_public_uri) = aws.create_repos("system").await;
+    push_images(&system_private_uri, &system_public_uri, true);
+    // Make user repos.
+    build_image(false);
+    let (private_uri, public_uri) = aws.create_repos(project_name).await;
+    push_images(&private_uri, &public_uri, false);
+    // Do deployment.
+    for deployment in deployments {
+        aws.deploy(
+            &system_public_uri,
+            &system_private_uri,
             &private_uri,
             &public_uri,
             &deployment,

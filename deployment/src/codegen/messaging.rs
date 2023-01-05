@@ -61,8 +61,8 @@ pub fn gen_messaging_static_code(deployments: &[Deployment]) -> TokenStream {
     result
 }
 
-pub fn gen_messaging_main() -> TokenStream {
-    quote! {
+pub fn gen_messaging_main(for_system: bool) -> TokenStream {
+    let mut result = quote! {
         if mode == "messaging_lambda" {
             let func = lambda_runtime::service_fn(messaging_lambda_handler);
             lambda_runtime::run(func).await?;
@@ -74,27 +74,43 @@ pub fn gen_messaging_main() -> TokenStream {
             generic_backend_main(backend).await;
             return Ok(());
         }
+    };
 
-        if mode == "messaging_recv" {
-            let func = lambda_runtime::service_fn(messaging_receiver_handler);
-            lambda_runtime::run(func).await?;
-            return Ok(());
-        }
+    if for_system {
+        result = quote! {
+            #result
+
+            if mode == "messaging_recv" {
+                let func = lambda_runtime::service_fn(messaging_receiver_handler);
+                lambda_runtime::run(func).await?;
+                return Ok(());
+            }
+        };
     }
+
+    result
 }
 
-pub fn gen_messaging_aux() -> TokenStream {
-    quote! {
-        async fn messaging_receiver_handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
-            let (event, _context) = event.into_parts();
-            let function = MESSAGING_RECEIVER.get().await.clone();
-            Ok(function.invoke(event).await)
-        }
-
+pub fn gen_messaging_aux(for_system: bool) -> TokenStream {
+    let mut result = quote! {
         async fn messaging_lambda_handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
             let (event, _context) = event.into_parts();
             let function = MESSAGING_FUNCTION.get().await.clone();
             Ok(function.invoke(event).await)
         }
+    };
+
+    if for_system {
+        result = quote! {
+            #result
+
+            async fn messaging_receiver_handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
+                let (event, _context) = event.into_parts();
+                let function = MESSAGING_RECEIVER.get().await.clone();
+                Ok(function.invoke(event).await)
+            }
+        }
     }
+
+    result
 }
