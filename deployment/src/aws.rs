@@ -199,7 +199,6 @@ impl AWS {
     pub(crate) async fn deploy(
         &self,
         system_public_image_uri: &str,
-        system_private_image_uri: &str,
         private_image_uri: &str,
         public_image_uri: &str,
         deployment: &Deployment,
@@ -274,13 +273,6 @@ impl AWS {
                     private_image_uri,
                     &lambda_role_arn,
                     &ap_arn,
-                    &messaging_spec,
-                )
-                .await;
-            self.deployer
-                .create_receiving_lambda_template(
-                    system_private_image_uri,
-                    &lambda_role_arn,
                     &messaging_spec,
                 )
                 .await;

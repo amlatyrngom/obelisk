@@ -43,13 +43,22 @@ impl Rescaler for MessagingRescaler {
             .signed_duration_since(scaling_state.last_rescale)
             .num_seconds() as f64;
         let mut total_active_secs: f64 = 0.0;
+        let mut force_spin_up = false;
         println!("Num metrics: {}", metrics.len());
         for m in metrics.iter() {
             let duration_secs: f64 = serde_json::from_value(m.clone()).unwrap();
+            if duration_secs < 0.001 {
+                // Hacky way to signal forcible spin up.
+                force_spin_up = true;
+            }
             total_active_secs += duration_secs;
         }
         // Compute moving average.
-        let new_activity = total_active_secs / total_interval;
+        let new_activity = if !force_spin_up {
+            total_active_secs / total_interval
+        } else {
+            10.0 // Forcibly spins up a new instance. From 100, the activity will slowly decrease if inactive.
+        };
         activity = (1.0 - MOVING_FACTOR) * activity + MOVING_FACTOR * new_activity;
         // Compute price ratio.
         let ecs_cost = 0.012144 + 2.0 * 0.0013335; // Cost of 1vcpu and 2GB of RAM.

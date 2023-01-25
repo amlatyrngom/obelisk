@@ -3,12 +3,12 @@ namespace = "microbench"
 
 [functional]
 path = "microbench::MicroFunction"
-mem_size = 8192
+mem_size = 2048
 timeout = 2
 concurrency = 1
 
 
 [messaging]
 path = "microbench::MicroActor"
-mem_size = 8192
+mem_size = 2048
 timeout = 30

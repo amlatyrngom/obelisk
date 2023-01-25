@@ -84,11 +84,6 @@ lazy_static! {
                 Arc::new(MessagingHandler::new(plog.clone(), x.unwrap(), &namespace, &name).await);
             Arc::new(AdapterBackend::new(svc_info, handler).await)
         });
-    static ref MESSAGING_RECEIVER: async_once::AsyncOnce<Arc<dyn FunctionInstance>> =
-        async_once::AsyncOnce::new(async {
-            let receiver: Arc<dyn FunctionInstance> = Arc::new(messaging::Receiver::new().await);
-            receiver
-        });
 }
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -128,11 +123,6 @@ async fn main() -> Result<(), Error> {
     if mode == "messaging_ecs" {
         let backend = MESSAGING_BACKEND.get().await.clone();
         generic_backend_main(backend).await;
-        return Ok(());
-    }
-    if mode == "messaging_recv" {
-        let func = lambda_runtime::service_fn(messaging_receiver_handler);
-        lambda_runtime::run(func).await?;
         return Ok(());
     }
     panic!("Unknown mode!");
@@ -242,11 +232,6 @@ pub async fn warp_functional_handler(
         mem_size_mb,
     };
     Ok(warp::reply::json(&resp))
-}
-async fn messaging_receiver_handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
-    let (event, _context) = event.into_parts();
-    let function = MESSAGING_RECEIVER.get().await.clone();
-    Ok(function.invoke(event).await)
 }
 async fn messaging_lambda_handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
     let (event, _context) = event.into_parts();

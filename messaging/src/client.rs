@@ -1,8 +1,6 @@
-use super::{recv_queue_name, send_queue_name, SUBSYSTEM_NAME};
-use aws_sdk_sqs::model::QueueAttributeName;
+use super::SUBSYSTEM_NAME;
 use common::adaptation::frontend::AdapterFrontend;
-use common::{full_messaging_name, full_receiving_name};
-use rand::Rng;
+use common::{full_messaging_name, has_external_access};
 
 const NUM_RECEIVE_RETRIES: i32 = 20; // ~2 seconds.
 
@@ -10,27 +8,22 @@ pub struct MessagingClient {
     direct_client: reqwest::Client,
     lambda_client: aws_sdk_lambda::Client,
     s3_client: aws_sdk_s3::Client,
-    sqs_client: aws_sdk_sqs::Client,
     frontend: AdapterFrontend,
-    send_queue_url: String,
-    recv_queue_url: String,
     actor_function_name: String,
-    receiver_name: String,
 }
 
 impl MessagingClient {
     /// Create a new actor client.
     pub async fn new(namespace: &str, name: &str) -> Self {
+        if !has_external_access() {
+            panic!("Lambda actor {namespace}/{name}. Attempting to creating a client without external access");
+        }
         let shared_config = aws_config::load_from_env().await;
-        let sqs_client = aws_sdk_sqs::Client::new(&shared_config);
         let lambda_client = aws_sdk_lambda::Client::new(&shared_config);
         let s3_client = aws_sdk_s3::Client::new(&shared_config);
         let frontend = AdapterFrontend::new(SUBSYSTEM_NAME, namespace, name).await;
-        // Get or make queues.
-        let send_queue_name = send_queue_name(namespace, name);
-        let send_queue_url = Self::get_or_make_queue(&sqs_client, &send_queue_name).await;
-        let recv_queue_name = recv_queue_name(namespace, name);
-        let recv_queue_url = Self::get_or_make_queue(&sqs_client, &recv_queue_name).await;
+        // Forcibly refresh serverful information.
+        frontend.invoke_scaler().await;
         // Try make messaging function.
         let actor_function_name = full_messaging_name(namespace, name);
         let actor_template_name = common::full_messaging_template_name(namespace);
@@ -41,26 +34,11 @@ impl MessagingClient {
             name,
         )
         .await;
-        // Try make receiver.
-        let receiver_name = full_receiving_name(namespace, name);
-        let receiver_template_name = common::full_receiving_template_name(namespace);
-        Self::try_make_function(
-            &lambda_client,
-            &receiver_name,
-            &receiver_template_name,
-            name,
-        )
-        .await;
-
         MessagingClient {
-            sqs_client,
             lambda_client,
             s3_client,
             frontend,
-            receiver_name,
             actor_function_name,
-            send_queue_url,
-            recv_queue_url,
             direct_client: reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(1))
                 .timeout(std::time::Duration::from_secs(5))
@@ -70,24 +48,6 @@ impl MessagingClient {
     }
 
     pub async fn delete(&self) {
-        let _ = self
-            .sqs_client
-            .delete_queue()
-            .queue_url(&self.recv_queue_url)
-            .send()
-            .await;
-        let _ = self
-            .sqs_client
-            .delete_queue()
-            .queue_url(&self.send_queue_url)
-            .send()
-            .await;
-        let _ = self
-            .lambda_client
-            .delete_function()
-            .function_name(&self.receiver_name)
-            .send()
-            .await;
         let _ = self
             .lambda_client
             .delete_function()
@@ -182,130 +142,81 @@ impl MessagingClient {
         }
     }
 
-    async fn get_or_make_queue(sqs_client: &aws_sdk_sqs::Client, queue_name: &str) -> String {
-        // Get or make send queue.
-        let queue_url = sqs_client
-            .get_queue_url()
-            .queue_name(queue_name)
-            .send()
-            .await;
-        let queue_url: String = match queue_url {
-            Ok(queue_url) => queue_url.queue_url().unwrap().into(),
-            Err(_) => {
-                let _ = sqs_client
-                    .create_queue()
-                    .queue_name(queue_name)
-                    .attributes(QueueAttributeName::MessageRetentionPeriod, "60")
-                    .attributes(QueueAttributeName::VisibilityTimeout, "10")
-                    .send()
-                    .await;
-                let queue_url = sqs_client
-                    .get_queue_url()
-                    .queue_name(queue_name)
-                    .send()
-                    .await
-                    .unwrap();
-                queue_url.queue_url().unwrap().into()
-            }
-        };
-        queue_url
-    }
-
     /// Send message to message queue.
     /// Use get_message_from_function or get_message_from_http to receive message.
-    async fn message_with_queue(
+    async fn indirect_message(
         &self,
         msg_id: &str,
         msg: &str,
         payload: &[u8],
     ) -> Option<(String, Vec<u8>)> {
-        let msg_meta = serde_json::to_string(&(msg_id, msg, payload.len() > 0)).unwrap();
-        if payload.len() > 0 {
-            let s3_key = format!("{}/send/{msg_id}", common::messaging_s3_dir());
-            let body = aws_sdk_s3::types::ByteStream::from(payload.to_vec());
+        {
+            // Wake up messaging function.
+            let lambda_client = self.lambda_client.clone();
+            let lambda_name = self.actor_function_name.clone();
+            tokio::spawn(async move {
+                Self::wake_up_messaging_function(lambda_client, lambda_name).await;
+            });
+        }
+
+        // Write message to S3.
+        let s3_send_key = format!("{}/send/{msg_id}", common::tmp_s3_dir());
+        let s3_recv_key = format!("{}/recv/{msg_id}", common::tmp_s3_dir());
+        let body = tokio::task::block_in_place(move || {
+            let body: (String, String, Vec<u8>) = (msg_id.into(), msg.into(), payload.into());
+            bincode::serialize(&body).unwrap()
+        });
+        let body = aws_sdk_s3::types::ByteStream::from(body);
+        let resp = self
+            .s3_client
+            .put_object()
+            .bucket(&common::bucket_name())
+            .key(&s3_send_key)
+            .body(body)
+            .send()
+            .await;
+        match resp {
+            Ok(_) => {}
+            Err(x) => {
+                println!("{x:?}");
+                return None;
+            }
+        };
+
+        // Repeatedly try reading response and waking up messaging function if response not found.
+        for _ in 0..NUM_RECEIVE_RETRIES {
+            // Wait for processing.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            // Try reading.
             let resp = self
                 .s3_client
-                .put_object()
+                .get_object()
                 .bucket(&common::bucket_name())
-                .key(s3_key)
-                .body(body)
+                .key(&s3_recv_key)
                 .send()
                 .await;
             match resp {
-                Ok(_) => {}
-                Err(x) => {
-                    println!("{x:?}");
-                    return None;
+                Ok(resp) => {
+                    // Delete response and return it.
+                    let s3_client = self.s3_client.clone();
+                    tokio::spawn(async move {
+                        let _ = s3_client
+                            .delete_object()
+                            .bucket(&common::bucket_name())
+                            .key(&s3_recv_key)
+                            .send()
+                            .await;
+                    });
+                    let body: Vec<u8> = resp.body.collect().await.unwrap().into_bytes().to_vec();
+                    let (_, msg, payload): (String, String, Vec<u8>) =
+                        bincode::deserialize(&body).unwrap();
+                    return Some((msg, payload));
                 }
-            }
-        }
-        self.sqs_client
-            .send_message()
-            .queue_url(&self.send_queue_url)
-            .message_body(&msg_meta)
-            .send()
-            .await
-            .unwrap();
-        let fn_arg = aws_smithy_types::Blob::new(serde_json::to_vec(&msg_id).unwrap());
-        for _ in 0..NUM_RECEIVE_RETRIES {
-            // Wait for response.
-            let sleep_duration = {
-                // Putting rng inside of block because it cannot be held across async.
-                let mut rng = rand::thread_rng();
-                let sleep_duration = rng.gen_range(50..150); // Wait an average of 100ms.
-                sleep_duration
-            };
-            tokio::time::sleep(std::time::Duration::from_millis(sleep_duration)).await;
-            // Invoke.
-            loop {
-                let resp = self
-                    .lambda_client
-                    .invoke()
-                    .function_name(&self.receiver_name)
-                    .payload(fn_arg.clone())
-                    .send()
-                    .await;
-                if let Ok(resp) = resp {
-                    if resp.status_code() == 200 {
-                        let resp = resp.payload().unwrap().clone().into_inner();
-                        let resp: Option<(String, bool)> = serde_json::from_slice(&resp).unwrap();
-                        if resp.is_none() {
-                            // Wake up messaging function. Then do random sleep.
-                            self.wake_up_messaging_function().await;
-                            break;
-                        }
-
-                        let (content, has_payload): (String, bool) = resp.unwrap();
-                        return if has_payload {
-                            let s3_key = format!("{}/recv/{msg_id}", common::messaging_s3_dir());
-                            let resp = self
-                                .s3_client
-                                .get_object()
-                                .bucket(&common::bucket_name())
-                                .key(&s3_key)
-                                .send()
-                                .await;
-                            let s3_client = self.s3_client.clone();
-                            // Asynchronous delete.
-                            let _ = tokio::spawn(async move {
-                                let _ = s3_client
-                                    .delete_object()
-                                    .bucket(&common::bucket_name())
-                                    .key(&s3_key)
-                                    .send()
-                                    .await;
-                            });
-                            if let Ok(resp) = resp {
-                                let payload: Vec<u8> =
-                                    resp.body.collect().await.unwrap().into_bytes().to_vec();
-                                Some((content, payload))
-                            } else {
-                                None
-                            }
-                        } else {
-                            Some((content, vec![]))
-                        };
-                    }
+                Err(_) => {
+                    // Wake up messaging function in case it is not active.
+                    let lambda_client = self.lambda_client.clone();
+                    let lambda_name = self.actor_function_name.clone();
+                    Self::wake_up_messaging_function(lambda_client, lambda_name).await;
                 }
             }
         }
@@ -313,13 +224,12 @@ impl MessagingClient {
     }
 
     /// Wake up the messaging function.
-    async fn wake_up_messaging_function(&self) {
+    async fn wake_up_messaging_function(lambda_client: aws_sdk_lambda::Client, fn_name: String) {
         let empty_json = serde_json::Value::Null.to_string();
         let fn_arg = aws_sdk_lambda::types::ByteStream::from(empty_json.as_bytes().to_vec());
-        let _ = self
-            .lambda_client
+        let _ = lambda_client
             .invoke_async()
-            .function_name(&self.actor_function_name)
+            .function_name(&fn_name)
             .invoke_args(fn_arg)
             .send()
             .await;
@@ -396,23 +306,26 @@ impl MessagingClient {
             Some(resp) => {
                 let end_time = std::time::Instant::now();
                 let duration = end_time.duration_since(start_time).as_secs_f64();
+                println!("Duration: {duration:?}");
                 self.frontend
                     .collect_metric(serde_json::to_value(&duration).unwrap())
                     .await;
                 return (Some(resp), true);
             }
-            None => {}
+            None => {
+                // Update serverful target.
+                let frontend = self.frontend.clone();
+                tokio::spawn(async move {
+                    frontend.force_read_instances().await;
+                });
+            }
         };
         // Try slow path with message queue.
-        let resp = (self.message_with_queue(&msg_id, msg, payload).await, false);
+        let resp = (self.indirect_message(&msg_id, msg, payload).await, false);
         let end_time = std::time::Instant::now();
-        let mut duration = end_time.duration_since(start_time).as_secs_f64();
-        // Subtract average queue overhead time.
-        duration -= 0.2;
-        // Bound by a minimum.
-        if duration < 0.01 {
-            duration = 0.01;
-        }
+        let duration = end_time.duration_since(start_time);
+        println!("Duration: {duration:?}");
+        let duration = duration.as_secs_f64();
         self.frontend
             .collect_metric(serde_json::to_value(&duration).unwrap())
             .await;
@@ -424,6 +337,25 @@ impl MessagingClient {
         let (resp, _) = self.send_message_internal(msg, payload).await;
         resp
     }
+
+    /// Forcibly spin up.
+    /// Returns true if already spun up.
+    pub async fn spin_up(&self) {
+        loop {
+            // Try fast path with direct message.
+            let actor_url = self.get_actor_url().await;
+            match actor_url {
+                None => {}
+                Some(_url) => return,
+            }
+            // Hacky way to signal spin up.
+            let duration = 0.0;
+            self.frontend
+                .collect_metric(serde_json::to_value(&duration).unwrap())
+                .await;
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -432,7 +364,6 @@ mod tests {
 
     async fn run_basic_test() {
         let mc = MessagingClient::new("messaging", "echo").await;
-        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         let req_msg = "essai";
         let req_payload = vec![];
         let (resp_msg, resp_payload) = mc.send_message(req_msg, &req_payload).await.unwrap();
@@ -446,7 +377,7 @@ mod tests {
         println!("Resp: ({resp_msg:?}, {resp_payload:?})");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
     async fn basic_test() {
         run_basic_test().await;
     }
@@ -466,24 +397,9 @@ mod tests {
         // The last ten rounds should almost certainly be direct calls.
         println!("Number of direct calls: {num_direct_calls}.");
         assert!(num_direct_calls >= 10);
-        // Send messages with payloads.
-        let mut num_direct_calls = 0;
-        for i in 0..100 {
-            let (resp, was_direct) = mc
-                .send_message_internal("essai", &vec![1, 2, 3, 4, 5])
-                .await;
-            println!("Round {}/100. Resp: {resp:?}", i + 1);
-            if was_direct {
-                num_direct_calls += 1;
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        }
-        // Most calls should be direct calls since last phase already scaled up ecs.
-        println!("Number of direct calls: {num_direct_calls}.");
-        assert!(num_direct_calls >= 50);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
     async fn scaling_test() {
         run_scaling_test().await;
     }

@@ -157,8 +157,16 @@ pub fn bucket_name() -> String {
     "obelisk1".into()
 }
 
-pub fn messaging_s3_dir() -> String {
-    "/system/messaging".into()
+pub fn tmp_s3_dir() -> String {
+    "/system/temporary".into()
+}
+
+pub fn has_external_access() -> bool {
+    if let Ok(mode) = std::env::var("EXECUTION_MODE") {
+        return mode == "messaging_lambda";
+    } else {
+        false
+    }
 }
 
 /// Name of file system.

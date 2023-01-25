@@ -1,8 +1,8 @@
 use crate::{
     bucket_name, clean_die, cluster_name, filesystem_name, full_function_name,
     full_messaging_template_name, full_receiving_template_name, full_scaler_name,
-    full_scaling_queue_name, full_service_definition_name, full_service_name, messaging_s3_dir,
-    scaling_queue_prefix, scaling_table_name,
+    full_scaling_queue_name, full_service_definition_name, full_service_name, scaling_queue_prefix,
+    scaling_table_name, tmp_s3_dir,
 };
 
 // use crate::{messaging_name_prefix, service_name_prefix};
@@ -227,6 +227,7 @@ impl AdapterDeployment {
         if setup_endpoints {
             let svc_names = vec![
                 // (format!("com.amazonaws.{}.sqs", self.region), false),
+                // (format!("com.amazonaws.{}.lambda", self.region), false),
                 (format!("com.amazonaws.{}.s3", self.region), true),
                 (format!("com.amazonaws.{}.dynamodb", self.region), true),
             ];
@@ -298,7 +299,8 @@ impl AdapterDeployment {
         let vpc = vpc.vpcs().unwrap().first().unwrap();
         let vpc_id = vpc.vpc_id().unwrap();
         let svc_names = vec![
-            // (format!("com.amazonaws.{}.sqs", self.region), false),
+            (format!("com.amazonaws.{}.sqs", self.region), false),
+            (format!("com.amazonaws.{}.lambda", self.region), false),
             (format!("com.amazonaws.{}.s3", self.region), true),
             (format!("com.amazonaws.{}.dynamodb", self.region), true),
         ];
@@ -1100,9 +1102,7 @@ impl AdapterDeployment {
                                     .days(1)
                                     .build(),
                             )
-                            .filter(aws_sdk_s3::model::LifecycleRuleFilter::Prefix(
-                                messaging_s3_dir(),
-                            ))
+                            .filter(aws_sdk_s3::model::LifecycleRuleFilter::Prefix(tmp_s3_dir()))
                             .status(aws_sdk_s3::model::ExpirationStatus::Enabled)
                             .build(),
                     )

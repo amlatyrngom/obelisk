@@ -19,7 +19,7 @@ pub fn gen_messaging_static_code(deployments: &[Deployment]) -> TokenStream {
         }
     }
 
-    let mut result = quote! {
+    let result = quote! {
         static ref MESSAGING_FUNCTION: async_once::AsyncOnce<Arc<dyn FunctionInstance>> = async_once::AsyncOnce::new(async {
             // This will fail if lock is ever lost.
             let namespace = std::env::var("NAMESPACE").unwrap();
@@ -44,25 +44,11 @@ pub fn gen_messaging_static_code(deployments: &[Deployment]) -> TokenStream {
         });
     };
 
-    // Add special receiver.
-    for deployment in deployments.iter() {
-        if deployment.namespace == "messaging" {
-            result = quote! {
-                #result
-
-                static ref MESSAGING_RECEIVER: async_once::AsyncOnce<Arc<dyn FunctionInstance>> = async_once::AsyncOnce::new(async {
-                    let receiver: Arc<dyn FunctionInstance> = Arc::new(messaging::Receiver::new().await);
-                    receiver
-                });
-            }
-        }
-    }
-
     result
 }
 
-pub fn gen_messaging_main(for_system: bool) -> TokenStream {
-    let mut result = quote! {
+pub fn gen_messaging_main() -> TokenStream {
+    let result = quote! {
         if mode == "messaging_lambda" {
             let func = lambda_runtime::service_fn(messaging_lambda_handler);
             lambda_runtime::run(func).await?;
@@ -76,41 +62,17 @@ pub fn gen_messaging_main(for_system: bool) -> TokenStream {
         }
     };
 
-    if for_system {
-        result = quote! {
-            #result
-
-            if mode == "messaging_recv" {
-                let func = lambda_runtime::service_fn(messaging_receiver_handler);
-                lambda_runtime::run(func).await?;
-                return Ok(());
-            }
-        };
-    }
-
     result
 }
 
-pub fn gen_messaging_aux(for_system: bool) -> TokenStream {
-    let mut result = quote! {
+pub fn gen_messaging_aux() -> TokenStream {
+    let result = quote! {
         async fn messaging_lambda_handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
             let (event, _context) = event.into_parts();
             let function = MESSAGING_FUNCTION.get().await.clone();
             Ok(function.invoke(event).await)
         }
     };
-
-    if for_system {
-        result = quote! {
-            #result
-
-            async fn messaging_receiver_handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
-                let (event, _context) = event.into_parts();
-                let function = MESSAGING_RECEIVER.get().await.clone();
-                Ok(function.invoke(event).await)
-            }
-        }
-    }
 
     result
 }

@@ -200,6 +200,7 @@ impl ActorInstance for MicroActor {
 mod tests {
     use crate::BenchRunner;
     use functional::FunctionalClient;
+    const TEST_MEM: f64 = 2.0; // 2GB.
 
     async fn write_output(points: Vec<(u64, f64, f64)>, expt_name: &str) {
         let expt_dir = "results/microbench";
@@ -238,9 +239,10 @@ mod tests {
                 // Compute total cost per active ms.
                 // For simplification, assume all ecs if any ecs.
                 let is_lambda = num_direct < 0.1;
-                // Cost of every ms for 8 gb lambda (8vcpu+16gb of ecs).
-                let lambda_cost = 8.0 * 0.0000000167;
-                let ecs_cost = (8.0 * 0.012144 + 16.0 * 0.0013335) / (3600.0 * 1000.0);
+                // Cost of every ms for 2 gb lambda (2vcpu+4gb of ecs due to overallocation).
+                let lambda_cost = TEST_MEM * 0.0000000167;
+                let ecs_cost =
+                    (1.0 * TEST_MEM * 0.012144 + 2.0 * TEST_MEM * 0.0013335) / (3600.0 * 1000.0);
                 println!("Lambda cost: {lambda_cost}. ECS cost: {ecs_cost}");
                 let cost_per_ms = if is_lambda { lambda_cost } else { ecs_cost };
                 // Cost per ms.
@@ -328,11 +330,10 @@ mod tests {
                 // Compute total cost per active ms.
                 // For simplification, assume all ecs if any ecs.
                 let is_lambda = num_direct < 0.1;
-                // Cost of every ms for 8 gb lambda (4vcpu+8gb of ecs).
-                let lambda_cost = 8.0 * 0.0000000167;
-                let sqs_cost = 4.0 * (0.4 / 1e6) / duration_ms; // Cost per ms of 4 calls to sqs.
-                let lambda_cost = lambda_cost + sqs_cost;
-                let ecs_cost = (4.0 * 0.012144 + 8.0 * 0.0013335) / (3600.0 * 1000.0);
+                // Cost of every ms for 1gb lambda (0.5vcpu+1gb of ecs).
+                let lambda_cost = TEST_MEM * 0.0000000167;
+                let ecs_cost =
+                    (0.5 * TEST_MEM * 0.012144 + TEST_MEM * 0.0013335) / (3600.0 * 1000.0);
                 println!("LambdaCost={lambda_cost}; EcsCost={ecs_cost}");
                 let cost_per_ms = if is_lambda { lambda_cost } else { ecs_cost };
                 // Cost per ms.
@@ -371,7 +372,7 @@ mod tests {
             }
         }
         // High message rate.
-        for _ in 0..200 {
+        for _ in 0..100 {
             let point = do_messaging_round(&fc, start_time, 0).await;
             points.push(point);
         }
@@ -429,14 +430,14 @@ mod tests {
             let lambda_cost = 0.0000000167;
             let ecs_cost = (0.5 * 0.012144 + 1.0 * 0.0013335) / (3600.0 * 1000.0);
             let cost_per_ms = if is_lambda {
-                // 8gb lambda.
-                lambda_cost * 8.0
+                // lambda.
+                lambda_cost * TEST_MEM
             } else if !is_replicated {
-                // 8gb ecs.
-                ecs_cost * 8.0
+                // ecs.
+                ecs_cost * TEST_MEM
             } else {
-                // 8gb ecs + six 2gb replica nodes.
-                ecs_cost * 8.0 + ecs_cost * 2.0 * 6.0
+                // ecs + six replica nodes.
+                ecs_cost * TEST_MEM + ecs_cost * 2.0 * 6.0
             };
             // Cost per ms.
             let cost_per_ms = if wait_time > 0 {
@@ -464,19 +465,19 @@ mod tests {
         let start_time = std::time::Instant::now();
         let wait_time_secs: u64 = 30;
         if variable {
-            // Low persist rate.
+            // Low rate.
             for _ in 0..10 {
                 let point = do_persist_round(&fc, start_time, wait_time_secs).await;
                 points.push(point);
             }
         }
-        // High persist rate.
-        for _ in 0..1000 {
+        // High rate.
+        for _ in 0..500 {
             let point = do_persist_round(&fc, start_time, 0).await;
             points.push(point);
         }
         if variable {
-            // Low persist rate.
+            // Low rate.
             for _ in 0..10 {
                 let point = do_persist_round(&fc, start_time, wait_time_secs).await;
                 points.push(point);

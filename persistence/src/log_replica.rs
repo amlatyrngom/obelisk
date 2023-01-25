@@ -22,6 +22,7 @@ struct LogReplicaInner {
     max_seen_owner_id: usize,
     terminating: bool,
     last_drain: chrono::DateTime<chrono::Utc>,
+    last_drain_owner: usize,
 }
 
 #[derive(Debug)]
@@ -42,7 +43,10 @@ impl ServiceInstance for LogReplica {
     }
 
     async fn custom_info(&self, _scaling_state: &ServerfulScalingState) -> serde_json::Value {
-        serde_json::Value::Null
+        tokio::task::block_in_place(move || {
+            let inner = self.inner.lock().unwrap();
+            serde_json::json!(inner.last_drain_owner)
+        })
     }
 
     async fn terminate(&self) {
@@ -65,6 +69,7 @@ impl LogReplica {
             max_seen_owner_id: 0,
             terminating: false,
             last_drain: time_service.current_time().await,
+            last_drain_owner: 0,
         }));
 
         let replica = LogReplica {
@@ -159,7 +164,7 @@ impl LogReplica {
         let _l = self.drain_lock.lock().unwrap();
         let handle = tokio::runtime::Handle::current();
         tokio::task::block_in_place(move || {
-            let (pending_logs, persisted_lsn) = {
+            let (pending_logs, persisted_lsn, drain_owner) = {
                 let mut inner = self.inner.lock().unwrap();
                 println!(
                     "Replica: persisted_lsn={}, pending_size={}.",
@@ -200,7 +205,7 @@ impl LogReplica {
                 } else {
                     inner.pending_logs.drain(..).collect()
                 };
-                (pending_logs, inner.persisted_lsn)
+                (pending_logs, inner.persisted_lsn, inner.last_drain_owner)
             };
 
             // Remove already persisted lsns to prevent unnecessary writes.
@@ -260,8 +265,38 @@ impl LogReplica {
                     }
                 }
             }
+            let mut inner = self.inner.lock().unwrap();
+            if drain_owner > inner.last_drain_owner {
+                inner.last_drain_owner = drain_owner;
+            }
             PersistenceRespMeta::Ok
         })
+    }
+
+    async fn update_shared_owner(&self) {
+        tokio::task::block_in_place(move || {
+            // Find most recent owner of shared log.
+            loop {
+                let conn =
+                    get_shared_log_connection(&self.svc_info.namespace, &self.svc_info.name, false);
+                let owner_id =
+                    conn.query_row("SELECT owner_id FROM system__shared_ownership", [], |r| {
+                        r.get(0)
+                    });
+                let owner_id: usize = match owner_id {
+                    Ok(owner_id) => owner_id,
+                    Err(x) => {
+                        println!("{x:?}");
+                        continue;
+                    }
+                };
+                let mut inner = self.inner.lock().unwrap();
+                if inner.max_seen_owner_id < owner_id {
+                    inner.max_seen_owner_id = owner_id;
+                }
+                return;
+            }
+        });
     }
 
     async fn bookkeeping_thread(&self) {
@@ -276,6 +311,7 @@ impl LogReplica {
                     return;
                 }
             });
+            self.update_shared_owner().await;
             self.handle_drain(None, None, true).await;
         }
     }

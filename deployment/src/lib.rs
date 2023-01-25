@@ -99,12 +99,6 @@ fn build_image(for_system: bool) {
     exec_cmd("docker", vec!["build", "-t", name, "-f", &file_path, "."]);
 }
 
-fn pull_system_img(system_uri: &str) {
-    let name = "obelisk_system";
-    exec_cmd("docker", vec!["pull", system_uri]);
-    exec_cmd("docker", vec!["tag", system_uri, name]);
-}
-
 fn push_images(private_uri: &str, public_uri: &str, for_system: bool) {
     let name = if for_system {
         "obelisk_system"
@@ -138,14 +132,8 @@ pub async fn build_system(deployments: &[String]) {
     let (private_uri, public_uri) = aws.create_repos("system").await;
     push_images(&private_uri, &public_uri, true);
     for deployment in deployments {
-        aws.deploy(
-            &public_uri,
-            &private_uri,
-            &private_uri,
-            &public_uri,
-            &deployment,
-        )
-        .await;
+        aws.deploy(&public_uri, &private_uri, &public_uri, &deployment)
+            .await;
     }
 }
 
@@ -170,23 +158,13 @@ pub async fn build_user_deployment(project_name: &str, system_img: &str, deploym
     aws.deployer.create_cluster().await;
     aws.deployer.create_bucket().await;
     aws.deployer.get_subnet_with_endpoints(true).await;
-    // Make system repos.
-    pull_system_img(system_img);
-    let (system_private_uri, system_public_uri) = aws.create_repos("system").await;
-    push_images(&system_private_uri, &system_public_uri, true);
     // Make user repos.
     build_image(false);
     let (private_uri, public_uri) = aws.create_repos(project_name).await;
     push_images(&private_uri, &public_uri, false);
     // Do deployment.
     for deployment in deployments {
-        aws.deploy(
-            &system_public_uri,
-            &system_private_uri,
-            &private_uri,
-            &public_uri,
-            &deployment,
-        )
-        .await;
+        aws.deploy(&system_img, &private_uri, &public_uri, &deployment)
+            .await;
     }
 }

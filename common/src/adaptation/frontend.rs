@@ -25,6 +25,7 @@ pub struct AdapterFrontend {
     pub dynamo_client: aws_sdk_dynamodb::Client,
     pub time_service: TimeService,
     pub info: Arc<FrontendInfo>,
+    pub has_external_access: bool,
     inner: Arc<RwLock<AdapterFrontendInner>>,
 }
 
@@ -62,32 +63,40 @@ impl AdapterFrontend {
         let queue_name = full_scaling_queue_name(subsystem, namespace, name);
         let scaler_name = full_scaler_name(subsystem);
         let scaling_table = scaling_table_name(subsystem);
-        println!("Creating Queue");
+        // Special case: lambdas inside VPCs have no internet access.
+        let execution_mode = std::env::var("EXECUTION_MODE").unwrap_or(String::new());
+        let has_external_access = execution_mode != "messaging_lambda";
+
         for _ in 0..NUM_RETRIES {
-            println!("Calling get queue url");
-            let queue_url = sqs_client
-                .get_queue_url()
-                .queue_name(&queue_name)
-                .send()
-                .await;
-            println!("QueueUrl resp: {queue_url:?}");
-            let queue_url = match queue_url {
-                Ok(queue_url) => queue_url,
-                Err(x) => {
-                    println!("GetQueueURl ({queue_name}) error: {x:?}");
-                    let resp = sqs_client
-                        .create_queue()
-                        .queue_name(&queue_name)
-                        .attributes(QueueAttributeName::MessageRetentionPeriod, "60")
-                        .attributes(QueueAttributeName::VisibilityTimeout, "10")
-                        .send()
-                        .await;
-                    println!("Create queue resp: {resp:?}");
-                    tokio::time::sleep(std::time::Duration::from_secs(RETRY_INTERVAL)).await;
-                    continue;
-                }
+            let queue_url: String = if has_external_access {
+                println!("Calling get queue url");
+                let queue_url = sqs_client
+                    .get_queue_url()
+                    .queue_name(&queue_name)
+                    .send()
+                    .await;
+                println!("QueueUrl resp: {queue_url:?}");
+                let queue_url = match queue_url {
+                    Ok(queue_url) => queue_url,
+                    Err(x) => {
+                        println!("GetQueueURl ({queue_name}) error: {x:?}");
+                        let resp = sqs_client
+                            .create_queue()
+                            .queue_name(&queue_name)
+                            .attributes(QueueAttributeName::MessageRetentionPeriod, "60")
+                            .attributes(QueueAttributeName::VisibilityTimeout, "10")
+                            .send()
+                            .await;
+                        println!("Create queue resp: {resp:?}");
+                        tokio::time::sleep(std::time::Duration::from_secs(RETRY_INTERVAL)).await;
+                        continue;
+                    }
+                };
+                queue_url.queue_url().unwrap().into()
+            } else {
+                "".into()
             };
-            let queue_url: String = queue_url.queue_url().unwrap().into();
+
             println!("Creating front end time service");
             let time_service = TimeService::new().await;
             println!("Made front end object");
@@ -106,6 +115,7 @@ impl AdapterFrontend {
                 time_service,
                 info,
                 inner,
+                has_external_access,
             };
 
             {
@@ -186,36 +196,46 @@ impl AdapterFrontend {
                     continue;
                 }
             };
-            if let Some(item) = item.item() {
+            let scaling_state = if let Some(item) = item.item() {
                 let scaling_state = item.get("state").unwrap().as_s().unwrap();
                 let mut scaling_state: ServerfulScalingState =
                     serde_json::from_str(scaling_state).unwrap();
                 if scaling_state.revision == revision {
                     cleanup_instances(&mut scaling_state);
-                    return scaling_state;
+                    scaling_state
                 } else {
                     println!(
                         "Resetting scaling state: Rev={revision}; OldRev={}",
                         scaling_state.revision
                     );
-                    return ServerfulScalingState::new(
+                    ServerfulScalingState::new(
                         &self.info.namespace,
                         &self.info.name,
                         &revision,
                         deployment,
                         self.time_service.current_time().await,
-                    );
+                    )
                 }
             } else {
                 println!("Resetting scaling state");
-                return ServerfulScalingState::new(
+                ServerfulScalingState::new(
                     &self.info.namespace,
                     &self.info.name,
                     &revision,
                     deployment,
                     self.time_service.current_time().await,
-                );
+                )
+            };
+            {
+                let mut inner = self.inner.write().await;
+                inner.peers = scaling_state
+                    .peers
+                    .iter()
+                    .map(|(_, instance)| instance.clone())
+                    .collect();
+                inner.scaling_state = Some(scaling_state.clone());
             }
+            return scaling_state;
         }
         clean_die("front end read instances!").await
     }
@@ -347,7 +367,10 @@ impl AdapterFrontend {
         if to_push.is_empty() {
             return;
         }
-        self.push_metrics(&to_push).await;
+        let this = self.clone();
+        tokio::spawn(async move {
+            this.push_metrics(&to_push).await;
+        });
     }
 
     /// Perform bookkeeping tasks like pushing metrics and invoking rescaler.
@@ -365,19 +388,27 @@ impl AdapterFrontend {
             let sigint = tokio::signal::ctrl_c();
             tokio::select! {
                 _ = push_interval.tick() => {
-                    self.push_collected_metrics(false).await;
+                    if self.has_external_access {
+                        self.push_collected_metrics(false).await;
+                    }
                 },
                 _ = refresh_interval.tick() => {
-                    self.invoke_scaler().await;
+                    if self.has_external_access {
+                        self.invoke_scaler().await;
+                    }
                 },
                 _ = sigint => {
-                    self.push_collected_metrics(true).await;
-                    self.invoke_scaler().await;
+                    if self.has_external_access {
+                        self.push_collected_metrics(true).await;
+                        self.invoke_scaler().await;
+                    }
                     return;
                 }
                 _ = sigterm.recv() => {
-                    self.push_collected_metrics(true).await;
-                    self.invoke_scaler().await;
+                    if self.has_external_access {
+                        self.push_collected_metrics(true).await;
+                        self.invoke_scaler().await;
+                    }
                     return;
                 }
             }

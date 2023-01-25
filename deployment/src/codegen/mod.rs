@@ -27,7 +27,7 @@ fn gen_main_file_content(deployments: &[Deployment], for_system: bool) -> String
         let generic_code = generic::gen_generic_main();
         let rescaling_code = rescaling::gen_rescaler_main();
         let functional_code = functional::gen_functional_main(for_system);
-        let messaging_code = messaging::gen_messaging_main(for_system);
+        let messaging_code = messaging::gen_messaging_main();
         quote! {
             #[tokio::main]
             async fn main() -> Result<(), Error> {
@@ -47,7 +47,7 @@ fn gen_main_file_content(deployments: &[Deployment], for_system: bool) -> String
         let generic_code = generic::gen_generic_aux();
         let rescaling_code = rescaling::gen_rescaler_aux();
         let functional_code = functional::gen_functional_aux();
-        let messaging_code = messaging::gen_messaging_aux(for_system);
+        let messaging_code = messaging::gen_messaging_aux();
         quote! {
             #generic_code
             #rescaling_code

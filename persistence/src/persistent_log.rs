@@ -538,15 +538,15 @@ impl PersistentLog {
             let entries: &[u8] = &entries;
 
             for _ in 0..NUM_DB_RETRIES {
-                let start_time = std::time::Instant::now();
+                // let start_time = std::time::Instant::now();
                 let executed = conn.execute(
                     "REPLACE INTO system__logs(lo_lsn, hi_lsn, entries) \
                     SELECT ?, ?, ? FROM system__logs_ownership WHERE owner_id=?",
                     rusqlite::params![lo_lsn, hi_lsn, entries, owner_id],
                 );
-                let end_time = std::time::Instant::now();
-                let duration = end_time.duration_since(start_time);
-                println!("DB Write took: {duration:?}");
+                // let end_time = std::time::Instant::now();
+                // let duration = end_time.duration_since(start_time);
+                // println!("DB Write took: {duration:?}");
                 match executed {
                     Ok(executed) if executed > 0 => {
                         tx.send(PersistedMode::Database).unwrap();
@@ -828,6 +828,7 @@ impl PersistentLog {
         }
         let mut reached_instances: HashSet<String> = HashSet::new();
         let owner_id = self.owner_id;
+        let has_external_access = self.front_end.has_external_access;
         loop {
             let curr_instances = self
                 .handle
@@ -850,8 +851,22 @@ impl PersistentLog {
                 let instance_id = instance.id.clone();
                 let url = instance.url.clone();
                 let persisted_lsn = persisted_lsn;
+                let drain_owner = if let Some(drain_owner) = instance.custom_info.as_u64() {
+                    drain_owner as usize
+                } else {
+                    0
+                };
                 let tx = tx.clone();
                 std::thread::spawn(move || {
+                    if drain_owner >= owner_id {
+                        tx.send((instance_id, true)).unwrap();
+                        return;
+                    }
+                    // If no external access, only indirect communication is possible.
+                    if !has_external_access {
+                        tx.send((instance_id, false)).unwrap();
+                        return;
+                    }
                     let req_body: Vec<u8> = Vec::new();
                     let req_meta = PersistenceReqMeta::Drain {
                         owner_id,
@@ -880,6 +895,7 @@ impl PersistentLog {
                     match meta {
                         PersistenceRespMeta::Ok => {
                             tx.send((instance_id, true)).unwrap();
+                            return;
                         }
                         PersistenceRespMeta::Outdated => {
                             eprintln!("A new owner has contacted replicas. Fast exiting...");
