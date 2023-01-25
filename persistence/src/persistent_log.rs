@@ -933,21 +933,21 @@ impl PersistentLog {
             let mut conn = match self.db.pool.get() {
                 Ok(conn) => conn,
                 Err(x) => {
-                    println!("{x:?}");
+                    println!("Pool: {x:?}");
                     continue;
                 }
             };
             match conn.busy_timeout(std::time::Duration::from_secs(1)) {
                 Ok(_) => {}
                 Err(x) => {
-                    println!("{x:?}");
+                    println!("Timeout: {x:?}");
                     continue;
                 }
             }
             let txn = match conn.transaction() {
                 Ok(txn) => txn,
                 Err(x) => {
-                    println!("{x:?}");
+                    println!("Txn: {x:?}");
                     continue;
                 }
             };
@@ -962,7 +962,7 @@ impl PersistentLog {
                 }
                 Err(rusqlite::Error::QueryReturnedNoRows) => {}
                 Err(x) => {
-                    println!("{x:?}");
+                    println!("Query: {x:?}");
                     continue;
                 }
             }
@@ -971,7 +971,10 @@ impl PersistentLog {
                     .prepare("REPLACE INTO system__logs(lo_lsn, hi_lsn, entries) VALUES (?, ?, ?)")
                 {
                     Ok(stmt) => stmt,
-                    _ => continue,
+                    Err(x) => {
+                        println!("Stmt: {x:?}");
+                        continue;
+                    },
                 };
                 let mut ok = true;
                 for (lo_lsn, hi_lsn, entries) in &shared_entries {
@@ -991,7 +994,7 @@ impl PersistentLog {
             match txn.commit() {
                 Ok(_) => return,
                 Err(x) => {
-                    println!("{x:?}");
+                    println!("Commit: {x:?}");
                     continue;
                 }
             }

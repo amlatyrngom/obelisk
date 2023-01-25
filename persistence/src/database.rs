@@ -51,7 +51,7 @@ impl Database {
             }
             println!("Process {}. File lock acquired.!", std::process::id());
             let manager = r2d2_sqlite::SqliteConnectionManager::file(&db_file);
-            let pool = match r2d2::Pool::builder().max_size(1).build(manager) {
+            let pool = match r2d2::Pool::builder().max_size(2).build(manager) {
                 Ok(pool) => pool,
                 Err(x) => {
                     println!("{x:?}");
