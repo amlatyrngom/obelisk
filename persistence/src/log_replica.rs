@@ -192,11 +192,11 @@ impl LogReplica {
 
                 let pending_logs = if check_recency {
                     let recency_threshold = chrono::Duration::seconds(DRAINING_INTERVAL);
-                    let pending_logs: Vec<PendingLog> = inner.pending_logs.drain(..).collect();
+                    let last_drain = inner.last_drain;
+                    let pending_logs = inner.pending_logs.drain(..);
                     let (recent, old): (Vec<_>, Vec<_>) =
-                        pending_logs.into_iter().partition(|pending_log| {
-                            inner
-                                .last_drain
+                        pending_logs.partition(|pending_log| {
+                            last_drain
                                 .signed_duration_since(pending_log.timestamp)
                                 < recency_threshold
                         });
@@ -305,14 +305,15 @@ impl LogReplica {
         drain_interval.tick().await;
         loop {
             drain_interval.tick().await;
-            tokio::task::block_in_place(move || {
+            let terminating = tokio::task::block_in_place(move || {
                 let inner = self.inner.lock().unwrap();
-                if inner.terminating {
-                    return;
-                }
+                inner.terminating
             });
             self.update_shared_owner().await;
             self.handle_drain(None, None, true).await;
+            if terminating {
+                return;
+            }
         }
     }
 

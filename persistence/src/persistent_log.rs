@@ -59,7 +59,7 @@ impl PersistentLog {
     /// Sync version of new.
     fn new_sync(handle: Handle, namespace: &str, name: &str) -> Self {
         println!("Creating persistent log!");
-        let mode = std::env::var("EXECUTION_MODE").unwrap_or(ECS_MODE.into());
+        let mode = std::env::var("EXECUTION_MODE").unwrap_or_else(|_| ECS_MODE.into());
         let storage_dir = common::shared_storage_prefix();
         let storage_dir = format!("{storage_dir}/{SUBSYSTEM_NAME}/{namespace}/{name}");
         let is_ecs = mode == ECS_MODE;
@@ -299,8 +299,7 @@ impl PersistentLog {
             self.persist_on_db(tx, entries, lo_lsn, hi_lsn);
         };
         {
-            let tx = tx.clone();
-            let entries = entries.clone();
+            let entries = entries;
             self.persist_on_replicas(tx, entries, lo_lsn, hi_lsn, persisted_lsn, instances);
         };
         // Wait for persistence.
@@ -456,7 +455,7 @@ impl PersistentLog {
                 match rows.next() {
                     Ok(Some(row)) => {
                         let mut row: Vec<u8> = row.get(0).unwrap();
-                        entries.extend(row.drain(..));
+                        entries.append(&mut row);
                     }
                     Ok(None) => {
                         break (entries, true);
@@ -485,8 +484,8 @@ impl PersistentLog {
     /// Will block every other operation.
     pub async fn terminate(&self) {
         tokio::task::block_in_place(move || {
-            let _ = self.flush_lock.lock();
-            let _ = self.instance_ids_lock.lock();
+            let _flush_lock = self.flush_lock.lock();
+            let _instance_lock = self.instance_ids_lock.lock();
             let inner = self.inner.lock().unwrap();
             if inner.instances.is_empty() {
                 return;
@@ -634,12 +633,12 @@ impl PersistentLog {
                         return;
                     }
                     let meta = meta.unwrap().to_str().unwrap();
-                    let meta: PersistenceRespMeta = serde_json::from_str(&meta).unwrap();
+                    let meta: PersistenceRespMeta = serde_json::from_str(meta).unwrap();
                     match meta {
                         PersistenceRespMeta::Ok => {
                             failed_replications.store(0, atomic::Ordering::Relaxed);
                             replica_tx.send(true).unwrap();
-                            return;
+                            
                         }
                         PersistenceRespMeta::Outdated => {
                             eprintln!("A new owner has contacted replicas. Fast exiting...");
@@ -890,12 +889,12 @@ impl PersistentLog {
                         return;
                     }
                     let meta = meta.unwrap().to_str().unwrap();
-                    let meta: PersistenceRespMeta = serde_json::from_str(&meta).unwrap();
+                    let meta: PersistenceRespMeta = serde_json::from_str(meta).unwrap();
                     println!("Resp: {meta:?}");
                     match meta {
                         PersistenceRespMeta::Ok => {
                             tx.send((instance_id, true)).unwrap();
-                            return;
+                            
                         }
                         PersistenceRespMeta::Outdated => {
                             eprintln!("A new owner has contacted replicas. Fast exiting...");
@@ -952,7 +951,8 @@ impl PersistentLog {
                 }
             };
             match txn.query_row("SELECT new_owner_id FROM system__logs_ownership", [], |r| {
-                r.get(0).map(|new_owner_id: usize| new_owner_id)
+                let res: usize = r.get(0).unwrap();
+                Ok(res)
             }) {
                 Ok(new_owner_id) => {
                     if new_owner_id > self.owner_id {
@@ -1055,7 +1055,8 @@ impl PersistentLog {
             };
             // We want to prevent old owners from
             match txn.query_row("SELECT owner_id FROM system__shared_ownership", [], |r| {
-                r.get(0).map(|owner_id: usize| owner_id)
+                let res: usize = r.get(0).unwrap();
+                Ok(res)
             }) {
                 Ok(curr_owner_id) => {
                     if curr_owner_id > self.owner_id {

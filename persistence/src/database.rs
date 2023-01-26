@@ -50,7 +50,7 @@ impl Database {
                 continue;
             }
             println!("Process {}. File lock acquired.!", std::process::id());
-            let manager = r2d2_sqlite::SqliteConnectionManager::file(&db_file);
+            let manager = r2d2_sqlite::SqliteConnectionManager::file(db_file.clone());
             let pool = match r2d2::Pool::builder().max_size(2).build(manager) {
                 Ok(pool) => pool,
                 Err(x) => {
@@ -94,7 +94,7 @@ impl Database {
                 }
             }
             let db_id = txn.query_row("SELECT db_id FROM system__ownership", [], |r| r.get(0));
-            let db_id = db_id.unwrap_or(0 as usize) + 1;
+            let db_id = db_id.unwrap_or(0_usize) + 1;
             match txn.execute(
                 "REPLACE INTO system__ownership (unique_row, db_id) VALUES (0, ?)",
                 [&db_id],

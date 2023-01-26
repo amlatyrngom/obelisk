@@ -70,7 +70,7 @@ fn get_shared_log_connection(namespace: &str, name: &str, create: bool) -> rusql
     for _ in 0..NUM_DB_RETRIES {
         // The default mode is locking_mode=none, journal_mode=delete.
         // So multiprocess writes are possible.
-        let conn = match rusqlite::Connection::open(&shared_file) {
+        let conn = match rusqlite::Connection::open(shared_file.clone()) {
             Ok(conn) => conn,
             x => {
                 println!("{x:?}");
@@ -123,7 +123,7 @@ fn fast_serialize(entries: &[(usize, Vec<u8>)], entries_size: usize) -> Vec<u8> 
         output[len_lo..len_hi].copy_from_slice(&len);
         let lsn = lsn.to_be_bytes();
         output[lsn_lo..lsn_hi].copy_from_slice(&lsn);
-        output[entry_lo..entry_hi].copy_from_slice(&entry);
+        output[entry_lo..entry_hi].copy_from_slice(entry);
         curr_offset = entry_hi;
     }
     output
