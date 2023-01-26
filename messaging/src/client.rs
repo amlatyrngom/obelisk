@@ -308,7 +308,7 @@ impl MessagingClient {
                 let duration = end_time.duration_since(start_time).as_secs_f64();
                 println!("Duration: {duration:?}");
                 self.frontend
-                    .collect_metric(serde_json::to_value(&duration).unwrap())
+                    .collect_metric(serde_json::to_value(duration).unwrap())
                     .await;
                 return (Some(resp), true);
             }
@@ -327,7 +327,7 @@ impl MessagingClient {
         println!("Duration: {duration:?}");
         let duration = duration.as_secs_f64();
         self.frontend
-            .collect_metric(serde_json::to_value(&duration).unwrap())
+            .collect_metric(serde_json::to_value(duration).unwrap())
             .await;
         resp
     }
@@ -351,7 +351,7 @@ impl MessagingClient {
             // Hacky way to signal spin up.
             let duration = 0.0;
             self.frontend
-                .collect_metric(serde_json::to_value(&duration).unwrap())
+                .collect_metric(serde_json::to_value(duration).unwrap())
                 .await;
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
@@ -369,11 +369,11 @@ mod tests {
         let (resp_msg, resp_payload) = mc.send_message(req_msg, &req_payload).await.unwrap();
         println!("Resp: ({resp_msg:?}, {resp_payload:?})");
         assert!(req_msg == resp_msg);
-        assert!(resp_payload == resp_payload);
+        assert!(req_payload == resp_payload);
         let req_payload = vec![1, 2, 3, 4, 5];
         let (resp_msg, resp_payload) = mc.send_message(req_msg, &req_payload).await.unwrap();
         assert!(req_msg == resp_msg);
-        assert!(resp_payload == resp_payload);
+        assert!(req_payload == resp_payload);
         println!("Resp: ({resp_msg:?}, {resp_payload:?})");
     }
 
@@ -387,7 +387,7 @@ mod tests {
         // Send messages without payloads.
         let mut num_direct_calls = 0;
         for i in 0..100 {
-            let (resp, was_direct) = mc.send_message_internal("essai", &vec![]).await;
+            let (resp, was_direct) = mc.send_message_internal("essai", &[]).await;
             println!("Round {}/100. Resp: {resp:?}", i + 1);
             if was_direct {
                 num_direct_calls += 1;

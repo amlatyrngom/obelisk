@@ -73,7 +73,7 @@ impl BenchRunner {
         let duration = end_time.duration_since(start_time);
         let duration_ms = duration.as_millis() as u64;
         let resp = (duration_ms, num_direct, num_indirect);
-        serde_json::to_value(&resp).unwrap()
+        serde_json::to_value(resp).unwrap()
     }
 
     async fn do_messaging_bench(&self) -> Value {
@@ -81,7 +81,7 @@ impl BenchRunner {
         let mut num_direct = 0;
         let mut num_indirect = 0;
         for _ in 0..5 {
-            let (resp, _is_direct) = self.msg_mc.send_message_internal("foo", &vec![]).await;
+            let (resp, _is_direct) = self.msg_mc.send_message_internal("foo", &[]).await;
             if let Some((execution_mode, _)) = resp {
                 if execution_mode == "messaging_ecs" {
                     num_direct += 1;
@@ -94,7 +94,7 @@ impl BenchRunner {
         let duration = end_time.duration_since(start_time);
         let duration_ms = duration.as_millis() as u64;
         let resp = (duration_ms, num_direct, num_indirect);
-        serde_json::to_value(&resp).unwrap()
+        serde_json::to_value(resp).unwrap()
     }
 
     async fn do_messaging_bench_with_payload(&self) -> Value {
@@ -102,8 +102,8 @@ impl BenchRunner {
         let mut num_direct = 0;
         let mut num_indirect = 0;
         for _ in 0..10 {
-            let (resp, is_direct) = self.msg_mc.send_message_internal("foo", &vec![1]).await;
-            if let Some(_) = resp {
+            let (resp, is_direct) = self.msg_mc.send_message_internal("foo", &[1]).await;
+            if resp.is_some() {
                 if is_direct {
                     num_direct += 1;
                 } else {
@@ -115,18 +115,18 @@ impl BenchRunner {
         let duration = end_time.duration_since(start_time);
         let duration_ms = duration.as_millis() as u64;
         let resp = (duration_ms, num_direct, num_indirect);
-        serde_json::to_value(&resp).unwrap()
+        serde_json::to_value(resp).unwrap()
     }
 
     async fn do_persistence_bench(&self) -> Value {
         let duration_ms = loop {
-            let (resp, _is_direct) = self.persist_mc.send_message_internal("foo", &vec![]).await;
+            let (resp, _is_direct) = self.persist_mc.send_message_internal("foo", &[]).await;
             if let Some((duration_ms, _)) = resp {
                 let duration_ms: u64 = duration_ms.parse().unwrap();
                 break duration_ms;
             }
         };
-        serde_json::to_value(&duration_ms).unwrap()
+        serde_json::to_value(duration_ms).unwrap()
     }
 }
 
@@ -260,12 +260,12 @@ mod tests {
                 println!("Cost per ms: {cost_per_ms}");
                 let duration = std::time::Duration::from_millis(duration_ms as u64);
                 println!("Invoke took: {duration:?}");
-                return (since, duration_ms, cost_per_ms);
+                (since, duration_ms, cost_per_ms)
             }
             Err(x) => {
                 panic!("Error: {x:?}");
             }
-        };
+        }
     }
 
     async fn run_invoke_test(variable: bool) {
@@ -349,12 +349,12 @@ mod tests {
                     cost_per_ms
                 };
                 println!("Cost per ms: {cost_per_ms}");
-                return (since, duration_ms, cost_per_ms);
+                (since, duration_ms, cost_per_ms)
             }
             Err(x) => {
                 panic!("Error: {x:?}");
             }
-        };
+        }
     }
 
     async fn run_message_test(variable: bool) {
@@ -451,7 +451,7 @@ mod tests {
             } else {
                 cost_per_ms
             };
-            return (since, duration_ms, cost_per_ms);
+            (since, duration_ms, cost_per_ms)
         } else {
             panic!("Error: {resp:?}");
         }

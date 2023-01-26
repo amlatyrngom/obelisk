@@ -65,7 +65,7 @@ impl MessagingHandler {
         _namespace: &str,
         _name: &str,
     ) -> Self {
-        let mode = std::env::var("EXECUTION_MODE").unwrap_or("messaging_lambda".into());
+        let mode = std::env::var("EXECUTION_MODE").unwrap_or_else(|_| "messaging_lambda".into());
         let shared_config = aws_config::load_from_env().await;
         let s3_client = aws_sdk_s3::Client::new(&shared_config);
         let handler = MessagingHandler {
@@ -178,7 +178,7 @@ impl MessagingHandler {
                     }
                     Err(x) => {
                         println!("Err: {x:?}");
-                        return None;
+                        None
                     }
                 }
             }));

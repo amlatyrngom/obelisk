@@ -65,7 +65,7 @@ impl Rescaler for MessagingRescaler {
         let lambda_cost = 2.0 * 0.0000166667 * 3600.0; // Cost of 2GB of RAM.
         let price_ratio = ecs_cost / lambda_cost;
         // Set new scale.
-        let new_scale = if activity >= price_ratio { 1 } else { 0 };
+        let new_scale = u64::from(activity >= price_ratio);
         let new_scaling_info = MessagingScalingInfo { activity };
         (new_scale, serde_json::to_value(&new_scaling_info).unwrap())
     }
@@ -121,7 +121,7 @@ mod tests {
             let num_entries = num_entries.round() as i32;
             for _ in 0..num_entries {
                 let duration: f64 = function_duration as f64;
-                metrics.push(serde_json::to_value(&duration).unwrap());
+                metrics.push(serde_json::to_value(duration).unwrap());
             }
             let timestamp = self
                 .test_start_time
