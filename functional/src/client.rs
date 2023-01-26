@@ -21,11 +21,11 @@ impl FunctionalClient {
             .build()
             .unwrap();
         let front_end = Arc::new(AdapterFrontend::new("functional", namespace, "fn").await);
-        let faas_client = FunctionalClient {
+
+        FunctionalClient {
             direct_client,
             front_end,
-        };
-        faas_client
+        }
     }
 
     /// Log a metric with a given probability.
@@ -42,11 +42,7 @@ impl FunctionalClient {
         // TODO: Have more sophisticated client side load balancing.
         let serverful_instances = self.front_end.serverful_instances().await;
         let instance = serverful_instances.choose(&mut rand::thread_rng());
-        if let Some(instance) = instance {
-            Some(instance.url.clone())
-        } else {
-            None
-        }
+        instance.map(|instance| instance.url.clone())
     }
 
     /// Invoke a lambda.

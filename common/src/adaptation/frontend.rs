@@ -64,7 +64,7 @@ impl AdapterFrontend {
         let scaler_name = full_scaler_name(subsystem);
         let scaling_table = scaling_table_name(subsystem);
         // Special case: lambdas inside VPCs have no internet access.
-        let execution_mode = std::env::var("EXECUTION_MODE").unwrap_or(String::new());
+        let execution_mode = std::env::var("EXECUTION_MODE").unwrap_or_default();
         let has_external_access = execution_mode != "messaging_lambda" && execution_mode != "local";
 
         for _ in 0..NUM_RETRIES {
@@ -155,7 +155,7 @@ impl AdapterFrontend {
                 let revision = v.as_s().unwrap();
                 let v = item.get("deployment").unwrap();
                 let deployment = v.as_s().unwrap();
-                return (revision.into(), serde_json::from_str(&deployment).unwrap());
+                return (revision.into(), serde_json::from_str(deployment).unwrap());
             } else {
                 let revision = uuid::Uuid::new_v4().to_string();
                 let deployment = Value::Null;
@@ -228,11 +228,7 @@ impl AdapterFrontend {
             };
             {
                 let mut inner = self.inner.write().await;
-                inner.peers = scaling_state
-                    .peers
-                    .iter()
-                    .map(|(_, instance)| instance.clone())
-                    .collect();
+                inner.peers = scaling_state.peers.values().cloned().collect();
                 inner.scaling_state = Some(scaling_state.clone());
             }
             return scaling_state;
@@ -260,7 +256,7 @@ impl AdapterFrontend {
             } else {
                 let now = std::time::Instant::now();
                 let since_last_push = now.duration_since(inner.last_push);
-                since_last_push >= std::time::Duration::from_secs(MAX_METRIC_PUSH_INTERVAL as u64)
+                since_last_push >= std::time::Duration::from_secs(MAX_METRIC_PUSH_INTERVAL)
             };
             if should_push {
                 inner.last_push = std::time::Instant::now();
@@ -336,11 +332,7 @@ impl AdapterFrontend {
             let serverful_service: ServerfulScalingState = serde_json::from_slice(&resp).unwrap();
             {
                 let mut inner = self.inner.write().await;
-                inner.peers = serverful_service
-                    .peers
-                    .iter()
-                    .map(|(_, instance)| instance.clone())
-                    .collect();
+                inner.peers = serverful_service.peers.values().cloned().collect();
                 inner.scaling_state = Some(serverful_service);
             }
             return;
@@ -375,12 +367,11 @@ impl AdapterFrontend {
 
     /// Perform bookkeeping tasks like pushing metrics and invoking rescaler.
     async fn bookkeeping(&self) {
-        let mut push_interval = tokio::time::interval(std::time::Duration::from_secs(
-            MAX_METRIC_PUSH_INTERVAL as u64,
-        ));
+        let mut push_interval =
+            tokio::time::interval(std::time::Duration::from_secs(MAX_METRIC_PUSH_INTERVAL));
         push_interval.tick().await;
         let mut refresh_interval =
-            tokio::time::interval(std::time::Duration::from_secs(RESCALING_INTERVAL as u64));
+            tokio::time::interval(std::time::Duration::from_secs(RESCALING_INTERVAL));
         refresh_interval.tick().await;
         loop {
             let terminate_signal = unix::SignalKind::terminate();

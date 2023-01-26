@@ -121,7 +121,7 @@ impl AdapterScaling {
         println!("Rescaler req: {req}");
         let req: ScalerReq = serde_json::from_value(req).unwrap();
         let resp = self.handle_request(&req, true).await;
-        serde_json::to_value(&resp).unwrap()
+        serde_json::to_value(resp).unwrap()
     }
 
     pub async fn handle_request(&self, req: &ScalerReq, scale_ecs: bool) -> ServerfulScalingState {
@@ -311,11 +311,11 @@ impl AdapterScaling {
             let batch = &receipts[lo..hi];
             i = hi;
             let mut request = self.sqs_client.delete_message_batch().queue_url(queue_url);
-            for j in 0..(hi - lo) {
+            for (j, handle) in batch.iter().enumerate() {
                 request = request.entries(
                     DeleteMessageBatchRequestEntry::builder()
                         .id(format!("entry{j}"))
-                        .receipt_handle(&batch[j])
+                        .receipt_handle(handle)
                         .build(),
                 );
             }
@@ -368,7 +368,7 @@ impl AdapterScaling {
                 let revision = v.as_s().unwrap();
                 let v = item.get("deployment").unwrap();
                 let deployment = v.as_s().unwrap();
-                return (revision.into(), serde_json::from_str(&deployment).unwrap());
+                return (revision.into(), serde_json::from_str(deployment).unwrap());
             } else {
                 return ("".into(), Value::Null);
             }
@@ -445,7 +445,7 @@ impl AdapterScaling {
             }
         };
         let (curr_scale, scaling_info) = rescaler
-            .rescale(&scaling_state, req.timestamp, metrics)
+            .rescale(scaling_state, req.timestamp, metrics)
             .await;
         scaling_state.current_scale = curr_scale;
         println!("Setting scaling info: {scaling_info}");

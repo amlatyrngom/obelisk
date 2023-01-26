@@ -162,11 +162,10 @@ impl AdapterBackend {
 
     /// Book keeping thread.
     async fn bookkeeping(&self) {
-        let mut refresh_interval = tokio::time::interval(std::time::Duration::from_secs(
-            SERVERFUL_REFRESH_TIME as u64,
-        ));
+        let mut refresh_interval =
+            tokio::time::interval(std::time::Duration::from_secs(SERVERFUL_REFRESH_TIME));
         let mut rescale_interval =
-            tokio::time::interval(std::time::Duration::from_secs(RESCALING_INTERVAL as u64));
+            tokio::time::interval(std::time::Duration::from_secs(RESCALING_INTERVAL));
         loop {
             let terminate_signal = unix::SignalKind::terminate();
             let mut sigterm = unix::signal(terminate_signal).unwrap();

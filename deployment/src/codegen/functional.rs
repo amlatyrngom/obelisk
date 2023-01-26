@@ -41,7 +41,7 @@ pub fn gen_functional_static_code(deployments: &[Deployment]) -> TokenStream {
         }
     }
 
-    return result;
+    result
 }
 
 pub fn gen_functional_main(for_system: bool) -> TokenStream {

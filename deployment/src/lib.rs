@@ -164,7 +164,7 @@ pub async fn build_user_deployment(project_name: &str, system_img: &str, deploym
     push_images(&private_uri, &public_uri, false);
     // Do deployment.
     for deployment in deployments {
-        aws.deploy(&system_img, &private_uri, &public_uri, &deployment)
+        aws.deploy(system_img, &private_uri, &public_uri, &deployment)
             .await;
     }
 }

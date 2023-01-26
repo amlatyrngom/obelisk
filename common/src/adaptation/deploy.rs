@@ -11,6 +11,7 @@ use aws_sdk_dynamodb::model::AttributeValue;
 use aws_sdk_dynamodb::model::{AttributeDefinition, ScalarAttributeType, TimeToLiveSpecification};
 use aws_sdk_dynamodb::model::{BillingMode, KeySchemaElement, KeyType};
 use aws_sdk_ecs::model::{ContainerDefinition, KeyValuePair, PortMapping};
+use aws_sdk_efs::model::FileSystemDescription;
 use aws_sdk_lambda::model::{function_code, PackageType};
 use aws_sdk_sqs::model::QueueAttributeName;
 use serde::{Deserialize, Serialize};
@@ -177,7 +178,7 @@ impl AdapterDeployment {
         println!("Subnets: {subnet:?}");
         let subnets = subnet.subnets().unwrap();
         let subnet_ids: Vec<String> = subnets
-            .into_iter()
+            .iter()
             .map(|s| s.subnet_id().unwrap().into())
             .collect();
         // Get sg ids.
@@ -926,7 +927,7 @@ impl AdapterDeployment {
             );
 
         for i in 0..*num_workers {
-            let port = 37001 + i as i32;
+            let port = 37001 + i;
             let container_name = format!("worker{i}");
             task_def = task_def.container_definitions(
                 ContainerDefinition::builder()
@@ -1188,7 +1189,7 @@ impl AdapterDeployment {
 
         if let Ok(ap_info) = ap_info {
             if let Some(ap_info) = ap_info.access_points() {
-                if ap_info.len() > 0 {
+                if !ap_info.is_empty() {
                     let ap_id = ap_info.first().unwrap().access_point_id().unwrap();
                     let ap_arn = ap_info.first().unwrap().access_point_arn().unwrap();
                     return (ap_id.into(), ap_arn.into());
@@ -1266,9 +1267,8 @@ impl AdapterDeployment {
             }
             let fs_info = fs_info.send().await.unwrap();
             marker = fs_info.next_marker().map(|x| x.to_string());
-            let fs_info = fs_info
-                .file_systems()
-                .map_or(vec![], |f| f.into_iter().map(|f| f.clone()).collect());
+            let fs_info: Vec<FileSystemDescription> =
+                fs_info.file_systems().map_or(vec![], |f| f.into());
             if fs_info.is_empty() {
                 break;
             }
@@ -1345,7 +1345,7 @@ impl AdapterDeployment {
             let curr_fns = curr_fns.send().await.unwrap();
             marker = curr_fns.next_marker().map(|x| x.to_string());
             let curr_fns = curr_fns.functions().map_or(vec![], |f| {
-                f.into_iter()
+                f.iter()
                     .map(|f| f.function_name().unwrap().to_string())
                     .collect()
             });
@@ -1431,7 +1431,7 @@ impl AdapterDeployment {
             let curr_fns = curr_fns.send().await.unwrap();
             marker = curr_fns.next_marker().map(|x| x.to_string());
             let curr_fns = curr_fns.functions().map_or(vec![], |f| {
-                f.into_iter()
+                f.iter()
                     .map(|f| f.function_name().unwrap().to_string())
                     .collect()
             });

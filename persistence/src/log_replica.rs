@@ -194,12 +194,9 @@ impl LogReplica {
                     let recency_threshold = chrono::Duration::seconds(DRAINING_INTERVAL);
                     let last_drain = inner.last_drain;
                     let pending_logs = inner.pending_logs.drain(..);
-                    let (recent, old): (Vec<_>, Vec<_>) =
-                        pending_logs.partition(|pending_log| {
-                            last_drain
-                                .signed_duration_since(pending_log.timestamp)
-                                < recency_threshold
-                        });
+                    let (recent, old): (Vec<_>, Vec<_>) = pending_logs.partition(|pending_log| {
+                        last_drain.signed_duration_since(pending_log.timestamp) < recency_threshold
+                    });
                     inner.pending_logs = recent;
                     old
                 } else {

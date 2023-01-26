@@ -119,5 +119,5 @@ pub(crate) fn gen_cargo(mut cargo_config: CargoConfig) {
         std::fs::create_dir_all(dir_path).unwrap();
     }
     let file_path = format!("{BUILD_DIR}/Cargo.toml");
-    std::fs::write(&file_path, cargo_config).unwrap();
+    std::fs::write(file_path, cargo_config).unwrap();
 }

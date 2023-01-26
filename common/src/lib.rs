@@ -63,13 +63,11 @@ pub fn get_port() -> Option<u16> {
         Some(37000)
     } else if mode == "lambda" {
         None
+    } else if let Ok(worker_idx) = std::env::var("WORKER_INDEX") {
+        let worker_idx: u16 = worker_idx.parse().unwrap();
+        Some(37001 + worker_idx)
     } else {
-        if let Ok(worker_idx) = std::env::var("WORKER_INDEX") {
-            let worker_idx: u16 = worker_idx.parse().unwrap();
-            Some(37001 + worker_idx)
-        } else {
-            Some(37000)
-        }
+        Some(37000)
     }
 }
 
@@ -100,7 +98,7 @@ pub async fn clean_die(msg: &str) -> ! {
             .arg("TERM")
             .arg(std::process::id().to_string())
             .output();
-        if let Ok(_) = cmd {
+        if cmd.is_ok() {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             std::process::exit(1);
         } else {
@@ -163,7 +161,7 @@ pub fn tmp_s3_dir() -> String {
 
 pub fn has_external_access() -> bool {
     if let Ok(mode) = std::env::var("EXECUTION_MODE") {
-        return mode != "messaging_lambda";
+        mode != "messaging_lambda"
     } else {
         true
     }

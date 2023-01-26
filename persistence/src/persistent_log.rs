@@ -299,6 +299,7 @@ impl PersistentLog {
             self.persist_on_db(tx, entries, lo_lsn, hi_lsn);
         };
         {
+            let tx = tx;
             let entries = entries;
             self.persist_on_replicas(tx, entries, lo_lsn, hi_lsn, persisted_lsn, instances);
         };
@@ -638,7 +639,6 @@ impl PersistentLog {
                         PersistenceRespMeta::Ok => {
                             failed_replications.store(0, atomic::Ordering::Relaxed);
                             replica_tx.send(true).unwrap();
-                            
                         }
                         PersistenceRespMeta::Outdated => {
                             eprintln!("A new owner has contacted replicas. Fast exiting...");
@@ -894,7 +894,6 @@ impl PersistentLog {
                     match meta {
                         PersistenceRespMeta::Ok => {
                             tx.send((instance_id, true)).unwrap();
-                            
                         }
                         PersistenceRespMeta::Outdated => {
                             eprintln!("A new owner has contacted replicas. Fast exiting...");
