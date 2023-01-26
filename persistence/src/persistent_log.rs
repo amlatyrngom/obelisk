@@ -780,7 +780,7 @@ impl PersistentLog {
         }
         // If amount of replication is not safe, empty instances.
         if !is_safe || !self.try_replicate {
-            println!("NOT REPLICATE: {is_safe:?}");
+            println!("NOT REPLICATE.");
             new_instances.clear();
         }
         let new_instance_ids: HashSet<String> = new_instances
@@ -974,7 +974,7 @@ impl PersistentLog {
                     Err(x) => {
                         println!("Stmt: {x:?}");
                         continue;
-                    },
+                    }
                 };
                 let mut ok = true;
                 for (lo_lsn, hi_lsn, entries) in &shared_entries {

@@ -65,7 +65,7 @@ impl AdapterFrontend {
         let scaling_table = scaling_table_name(subsystem);
         // Special case: lambdas inside VPCs have no internet access.
         let execution_mode = std::env::var("EXECUTION_MODE").unwrap_or(String::new());
-        let has_external_access = execution_mode != "messaging_lambda";
+        let has_external_access = execution_mode != "messaging_lambda" && execution_mode != "local";
 
         for _ in 0..NUM_RETRIES {
             let queue_url: String = if has_external_access {

@@ -163,9 +163,9 @@ pub fn tmp_s3_dir() -> String {
 
 pub fn has_external_access() -> bool {
     if let Ok(mode) = std::env::var("EXECUTION_MODE") {
-        return mode == "messaging_lambda";
+        return mode != "messaging_lambda";
     } else {
-        false
+        true
     }
 }
 

@@ -299,8 +299,6 @@ impl AdapterDeployment {
         let vpc = vpc.vpcs().unwrap().first().unwrap();
         let vpc_id = vpc.vpc_id().unwrap();
         let svc_names = vec![
-            (format!("com.amazonaws.{}.sqs", self.region), false),
-            (format!("com.amazonaws.{}.lambda", self.region), false),
             (format!("com.amazonaws.{}.s3", self.region), true),
             (format!("com.amazonaws.{}.dynamodb", self.region), true),
         ];
