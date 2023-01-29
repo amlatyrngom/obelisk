@@ -43,13 +43,20 @@ impl TimeService {
         } else {
             let ntp_time = loop {
                 inner.last_ntp_req = Instant::now();
-                let res = inner.sntp_client.synchronize("time.google.com").await;
-                if let Ok(res) = res {
-                    break res.datetime().into_chrono_datetime().unwrap();
+                if crate::has_external_access() {
+                    let res = inner.sntp_client.synchronize("time.google.com").await;
+                    if let Ok(res) = res {
+                        break res.datetime().into_chrono_datetime().unwrap();
+                    } else {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        continue;
+                    }
                 } else {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    continue;
+                    // In lambda mode, just use local time.
+                    println!("Warning: using local time due to absence of external access!");
+                    break chrono::Utc::now();
                 }
+                
             };
             inner.last_ntp_time = ntp_time;
             inner.last_ntp_time

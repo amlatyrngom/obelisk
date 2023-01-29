@@ -188,6 +188,17 @@ impl PersistentLog {
         inner.flush_lsn
     }
 
+    /// Get current flush lsn.
+    pub async fn get_start_lsn(&self) -> usize {
+        tokio::task::block_in_place(move || self.get_start_lsn_sync())
+    }
+
+    /// Sync version of get_flush_lsn.
+    pub fn get_start_lsn_sync(&self) -> usize {
+        let inner = self.inner.lock().unwrap();
+        inner.start_lsn
+    }
+
     /// Enqueue one new element in the log.
     pub async fn enqueue(&self, content: Vec<u8>) -> usize {
         tokio::task::block_in_place(move || self.enqueue_sync(content))
@@ -352,6 +363,7 @@ impl PersistentLog {
     }
 
     /// Truncate up to (and including) at most the given lsn.
+    /// TODO: Might have to vaccum.
     pub async fn truncate(&self, lsn: usize) {
         tokio::task::block_in_place(move || self.truncate_sync(lsn))
     }
@@ -362,7 +374,6 @@ impl PersistentLog {
             let inner = self.inner.lock().unwrap();
             inner.start_lsn
         };
-        println!("CurrStartLsn, lsn = {curr_start_lsn}, {lsn}");
         if curr_start_lsn >= lsn {
             return;
         }
@@ -732,7 +743,6 @@ impl PersistentLog {
         let mut curr_instance_ids = self.instance_ids_lock.lock().unwrap();
         if !set_ownership {
             let counter = self.failed_replications.load(atomic::Ordering::Relaxed);
-            println!("Counter: {counter}");
             if counter < MAX_REPLICATION_FAILURES {
                 return;
             }
@@ -752,7 +762,6 @@ impl PersistentLog {
                 o => o,
             }
         });
-        println!("All Instances: {all_instances:?}");
         let mut az_counts: HashMap<String, u64> = all_instances
             .iter()
             .map(|instance| (instance.az.clone(), 0))
@@ -779,7 +788,6 @@ impl PersistentLog {
         }
         // If amount of replication is not safe, empty instances.
         if !is_safe || !self.try_replicate {
-            println!("NOT REPLICATE.");
             new_instances.clear();
         }
         let new_instance_ids: HashSet<String> = new_instances
@@ -795,7 +803,6 @@ impl PersistentLog {
         let conn = self.db.pool.get().unwrap();
         for _ in 0..NUM_DB_RETRIES {
             // Can only execute if no new owner since startup.
-            println!("Writing {new_instances_str}");
             let executed = conn.execute(
                 "UPDATE system__logs_ownership SET instances=?, owner_id=? WHERE new_owner_id=?",
                 rusqlite::params![new_instances_str, self.owner_id, self.owner_id],

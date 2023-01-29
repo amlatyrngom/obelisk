@@ -404,10 +404,6 @@ impl AdapterScaling {
                 if scaling_state.revision == revision {
                     return scaling_state;
                 } else {
-                    println!(
-                        "Resetting scaling state: Rev={revision}; OldRev={}",
-                        scaling_state.revision
-                    );
                     return ServerfulScalingState::new(
                         &req.namespace,
                         &req.name,
@@ -417,7 +413,6 @@ impl AdapterScaling {
                     );
                 }
             } else {
-                println!("Resetting scaling state");
                 return ServerfulScalingState::new(
                     &req.namespace,
                     &req.name,

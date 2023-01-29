@@ -69,13 +69,11 @@ impl AdapterFrontend {
 
         for _ in 0..NUM_RETRIES {
             let queue_url: String = if has_external_access {
-                println!("Calling get queue url");
                 let queue_url = sqs_client
                     .get_queue_url()
                     .queue_name(&queue_name)
                     .send()
                     .await;
-                println!("QueueUrl resp: {queue_url:?}");
                 let queue_url = match queue_url {
                     Ok(queue_url) => queue_url,
                     Err(x) => {
@@ -97,7 +95,6 @@ impl AdapterFrontend {
                 "".into()
             };
 
-            println!("Creating front end time service");
             let time_service = TimeService::new().await;
             println!("Made front end object");
             let info = Arc::new(FrontendInfo {
@@ -176,6 +173,14 @@ impl AdapterFrontend {
         clean_die("front end cannot read deployment.").await
     }
 
+    pub async fn current_time(&self) -> chrono::DateTime<chrono::Utc> {
+        if self.has_external_access {
+            self.time_service.current_time().await
+        } else {
+            chrono::Utc::now()
+        }
+    }
+
     pub async fn force_read_instances(&self) -> ServerfulScalingState {
         for _ in 0..NUM_RETRIES {
             let (revision, deployment) = self.force_read_deployment().await;
@@ -204,26 +209,21 @@ impl AdapterFrontend {
                     cleanup_instances(&mut scaling_state);
                     scaling_state
                 } else {
-                    println!(
-                        "Resetting scaling state: Rev={revision}; OldRev={}",
-                        scaling_state.revision
-                    );
                     ServerfulScalingState::new(
                         &self.info.namespace,
                         &self.info.name,
                         &revision,
                         deployment,
-                        self.time_service.current_time().await,
+                        self.current_time().await,
                     )
                 }
             } else {
-                println!("Resetting scaling state");
                 ServerfulScalingState::new(
                     &self.info.namespace,
                     &self.info.name,
                     &revision,
                     deployment,
-                    self.time_service.current_time().await,
+                    self.current_time().await,
                 )
             };
             {
@@ -272,6 +272,10 @@ impl AdapterFrontend {
 
     /// Push metrics to SQS.
     pub async fn push_metrics(&self, metrics: &[Value]) {
+        if !self.has_external_access {
+            return;
+        }
+
         for _ in 0..NUM_RETRIES {
             if metrics.is_empty() {
                 return;
@@ -298,6 +302,11 @@ impl AdapterFrontend {
 
     /// Invoke scaler.
     pub async fn invoke_scaler(&self) {
+        if !self.has_external_access {
+            self.force_read_instances().await;
+            return;
+        }
+
         for _ in 0..NUM_RETRIES {
             let req = ScalerReq {
                 namespace: self.info.namespace.clone(),
@@ -379,27 +388,19 @@ impl AdapterFrontend {
             let sigint = tokio::signal::ctrl_c();
             tokio::select! {
                 _ = push_interval.tick() => {
-                    if self.has_external_access {
-                        self.push_collected_metrics(false).await;
-                    }
+                    self.push_collected_metrics(false).await;
                 },
                 _ = refresh_interval.tick() => {
-                    if self.has_external_access {
-                        self.invoke_scaler().await;
-                    }
+                    self.invoke_scaler().await;
                 },
                 _ = sigint => {
-                    if self.has_external_access {
-                        self.push_collected_metrics(true).await;
-                        self.invoke_scaler().await;
-                    }
+                    self.push_collected_metrics(true).await;
+                    self.invoke_scaler().await;
                     return;
                 }
                 _ = sigterm.recv() => {
-                    if self.has_external_access {
-                        self.push_collected_metrics(true).await;
-                        self.invoke_scaler().await;
-                    }
+                    self.push_collected_metrics(true).await;
+                    self.invoke_scaler().await;
                     return;
                 }
             }
