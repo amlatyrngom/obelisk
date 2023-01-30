@@ -100,7 +100,8 @@ impl MessagingClient {
                         .unwrap();
                     let config = template.configuration().unwrap();
                     let mem_size = config.memory_size().unwrap();
-                    create_function = create_function.memory_size(mem_size);
+                    let timeout = config.timeout().unwrap();
+                    create_function = create_function.memory_size(mem_size).timeout(timeout);
                     if let Some(efs_config) = config.file_system_configs() {
                         create_function = create_function
                             .file_system_configs(efs_config.first().unwrap().clone());
@@ -226,13 +227,17 @@ impl MessagingClient {
     /// Wake up the messaging function.
     async fn wake_up_messaging_function(lambda_client: aws_sdk_lambda::Client, fn_name: String) {
         let empty_json = serde_json::Value::Null.to_string();
-        let fn_arg = aws_sdk_lambda::types::ByteStream::from(empty_json.as_bytes().to_vec());
-        let _ = lambda_client
-            .invoke_async()
-            .function_name(&fn_name)
-            .invoke_args(fn_arg)
-            .send()
-            .await;
+        let fn_arg = aws_smithy_types::Blob::new(empty_json.as_bytes());
+        // Async invokes have weird behavior (they keep being retried until long after).
+        // So do fake async.
+        tokio::spawn(async move {
+            let _ = lambda_client
+                .invoke()
+                .function_name(&fn_name)
+                .payload(fn_arg)
+                .send()
+                .await;
+        });
     }
 
     /// Send message to url using http.

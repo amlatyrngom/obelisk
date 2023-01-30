@@ -4,6 +4,8 @@ use serde_json::Value;
 
 /// Factor for moving average.
 const MOVING_FACTOR: f64 = 0.25;
+/// Value to force spin up.
+const FORCE_THRESHOLD: f64 = 1e-4;
 
 /// Info to maintain for scaling functions.
 #[derive(Serialize, Deserialize)]
@@ -47,7 +49,7 @@ impl Rescaler for MessagingRescaler {
         println!("Num metrics: {}", metrics.len());
         for m in metrics.iter() {
             let duration_secs: f64 = serde_json::from_value(m.clone()).unwrap();
-            if duration_secs < 0.001 {
+            if duration_secs < FORCE_THRESHOLD {
                 // Hacky way to signal forcible spin up.
                 force_spin_up = true;
             }
