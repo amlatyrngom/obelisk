@@ -173,11 +173,11 @@ impl ActorInstance for MicroActor {
         }
         // Make 1 byte flushes and time them.
         let flush_lsn = self.plog.get_flush_lsn().await;
-        self.plog.truncate(flush_lsn).await;
+        self.plog.truncate(flush_lsn).await.unwrap();
         let start_time = std::time::Instant::now();
         for _ in 0..10 {
             self.plog.enqueue(vec![1]).await;
-            self.plog.flush(None).await;
+            self.plog.flush().await;
             println!("Done Flushing");
         }
         let end_time = std::time::Instant::now();
@@ -191,7 +191,7 @@ impl ActorInstance for MicroActor {
         println!("Checkpoint: terminating=({terminating})");
         if terminating {
             let flush_lsn = self.plog.get_flush_lsn().await;
-            self.plog.truncate(flush_lsn).await;
+            self.plog.truncate(flush_lsn).await.unwrap();
         }
     }
 }
@@ -472,7 +472,7 @@ mod tests {
             }
         }
         // High rate.
-        for _ in 0..500 {
+        for _ in 0..600 {
             let point = do_persist_round(&fc, start_time, 0).await;
             points.push(point);
         }

@@ -249,6 +249,7 @@ impl AWS {
         if let Some(messaging) = &deployment.messaging {
             let messaging_spec = MessagingSpec {
                 mem: messaging.mem_size,
+                fn_mem: messaging.fn_mem.unwrap_or(messaging.mem_size),
                 cpus: messaging.mem_size / 2,
                 timeout: messaging.timeout,
                 namespace: deployment.namespace.clone(),
@@ -280,6 +281,7 @@ impl AWS {
                 cpus: messaging_spec.cpus,
                 mem: messaging_spec.mem,
                 timeout: messaging_spec.timeout,
+                fn_mem: messaging_spec.fn_mem,
             });
         }
 

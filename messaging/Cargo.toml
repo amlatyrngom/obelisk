@@ -19,6 +19,7 @@ async-trait = "*"
 serde_json = "*"
 bincode = "*"
 chrono = "*"
+rand = "*"
 uuid = { version = "*", features = ["v4"]}
 serde = {version="*", features=["derive"]}
 persistence = {path="../persistence"}

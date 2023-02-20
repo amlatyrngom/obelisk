@@ -49,9 +49,8 @@ impl FunctionalClient {
     pub async fn invoke_lambda(&self, arg: &[u8]) -> Result<Vec<u8>, String> {
         let fn_name = full_function_name(&self.front_end.info.namespace);
         let arg = aws_smithy_types::Blob::new(arg);
-        let resp = self
-            .front_end
-            .lambda_client
+        let lambda_client = self.front_end.clients.clone().unwrap().lambda_client;
+        let resp = lambda_client
             .invoke()
             .function_name(&fn_name)
             .payload(arg.clone())

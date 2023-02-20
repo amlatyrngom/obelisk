@@ -1,20 +1,17 @@
-use fslock::LockFile;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
-use std::sync::{Arc, Mutex};
+use std::sync::{atomic, Arc};
 
 /// Time between retries.
-/// There is already timeout of ~1s for connecting, so this is additive.
-const RETRY_INTERVAL_MS: u64 = 500;
-/// Maximum number of retries.
-const MAX_NUM_RETRIES: u64 = 30;
+const MAX_NUM_RETRIES: usize = 100;
+const MAX_NUM_RETRIES_LAMBDA: usize = 1;
+const BUSY_TIMEOUT_MS: u64 = 1000;
 
 #[derive(Clone)]
 pub struct Database {
     pub pool: Pool<SqliteConnectionManager>,
     pub db_id: usize,
-    pub lock_file_path: String,
-    lock: Arc<Mutex<Option<LockFile>>>,
+    pub acquired: Arc<atomic::AtomicBool>,
 }
 
 impl Database {
@@ -24,72 +21,65 @@ impl Database {
         let create_dir_resp = std::fs::create_dir_all(storage_dir);
         println!("Create Dir ({storage_dir}) Resp: {create_dir_resp:?}");
         let db_file = format!("{storage_dir}/{filename}.db");
-        let lock_file_path = format!("{storage_dir}/{filename}.lock");
         // Lock.
-        let max_num_tries = if with_retry { MAX_NUM_RETRIES } else { 1 };
-        for n in 0..max_num_tries {
-            if n > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(RETRY_INTERVAL_MS));
+        for n in 0..Self::get_num_retries() {
+            if n > 0 && !with_retry {
+                break;
             }
-            let mut lock_file = match LockFile::open(&lock_file_path) {
-                Ok(lock_file) => lock_file,
-                Err(x) => {
-                    println!("{x:?}");
-                    continue;
-                }
-            };
-            let has_lock = match lock_file.try_lock() {
-                Ok(has_lock) => has_lock,
-                Err(x) => {
-                    println!("{x:?}");
-                    continue;
-                }
-            };
-            if !has_lock {
-                println!("Process {}. File lock not acquired.!", std::process::id());
-                continue;
-            }
-            println!("Process {}. File lock acquired.!", std::process::id());
             let manager = r2d2_sqlite::SqliteConnectionManager::file(db_file.clone());
-            let pool = match r2d2::Pool::builder().max_size(2).build(manager) {
+            let pool = match r2d2::Pool::builder().max_size(1).build(manager) {
                 Ok(pool) => pool,
                 Err(x) => {
-                    println!("{x:?}");
+                    println!("Builder: {x:?}");
                     continue;
                 }
             };
-            let mut conn = match pool.get() {
+            let mut conn = match pool.get_timeout(std::time::Duration::from_secs(1)) {
                 Ok(conn) => conn,
                 Err(x) => {
-                    println!("{x:?}");
+                    println!("Conn: {x:?}");
                     continue;
                 }
             };
-            match conn.busy_timeout(std::time::Duration::from_secs(1)) {
+            match conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS)) {
                 Ok(_) => {}
                 Err(x) => {
-                    println!("{x:?}");
+                    println!("Setting Timeout: {x:?}");
+                    continue;
+                }
+            }
+            match conn.pragma_update(None, "locking_mode", "exclusive") {
+                Ok(_) => {}
+                Err(x) => {
+                    println!("Pragma 1: {x:?}");
+                    continue;
+                }
+            }
+            match conn.pragma_update(None, "journal_mode", "wal") {
+                Ok(_) => {}
+                Err(x) => {
+                    println!("Pragma 2: {x:?}");
                     continue;
                 }
             }
             let txn = match conn.transaction() {
                 Ok(txn) => txn,
                 Err(x) => {
-                    println!("{x:?}");
+                    println!("Txn 1: {x:?}");
                     continue;
                 }
             };
             match txn.execute("CREATE TABLE IF NOT EXISTS system__ownership (unique_row INTEGER PRIMARY KEY, db_id INT)", ()) {
                 Ok(_) => {},
                 Err(x) => {
-                    println!("{x:?}");
+                    println!("Txn 2: {x:?}");
                     continue;
                 }
             }
             match txn.execute("CREATE TABLE IF NOT EXISTS system__ownership (unique_row INTEGER PRIMARY KEY, db_id INT)", ()) {
                 Ok(_) => {},
                 Err(x) => {
-                    println!("{x:?}");
+                    println!("Txn 3: {x:?}");
                     continue;
                 }
             }
@@ -101,21 +91,18 @@ impl Database {
             ) {
                 Ok(_) => {}
                 Err(x) => {
-                    println!("{x:?}");
+                    println!("Txn 4: {x:?}");
                     continue;
                 }
             };
             match txn.commit() {
                 Ok(_) => {
                     println!("Successfully opened database!");
+                    let acquired = Arc::new(atomic::AtomicBool::new(true));
                     return Database {
                         pool,
                         db_id,
-                        lock_file_path,
-                        lock: Arc::new(Mutex::new(
-                            // Release lock in lambda mode to let others take it.
-                            if with_retry { Some(lock_file) } else { None },
-                        )),
+                        acquired,
                     };
                 }
                 _ => {
@@ -130,38 +117,115 @@ impl Database {
         std::process::exit(1);
     }
 
+    /// Return number of attempts to make.
+    fn get_num_retries() -> usize {
+        let mode = std::env::var("EXECUTION_MODE").unwrap_or_else(|_| "messaging_lambda".into());
+        if mode == "messaging_lambda" {
+            MAX_NUM_RETRIES_LAMBDA
+        } else {
+            MAX_NUM_RETRIES
+        }
+    }
+
+    /// Sync version of release.
+    pub fn release_sync(&self) {
+        self.acquired.store(false, atomic::Ordering::Release);
+        let conn = loop {
+            match self.pool.get() {
+                Ok(conn) => break conn,
+                Err(x) => {
+                    println!("{x:?}");
+                    continue;
+                }
+            };
+        };
+
+        match conn.pragma_update(None, "journal_mode", "delete") {
+            Ok(_) => {}
+            Err(x) => {
+                println!("Cannot release: {x:?}");
+                std::process::exit(1);
+            }
+        }
+        match conn.pragma_update(None, "locking_mode", "normal") {
+            Ok(_) => {}
+            Err(x) => {
+                println!("Cannot release: {x:?}");
+                std::process::exit(1);
+            }
+        }
+        // Actually release lock in sqlite.
+        match conn.query_row("SELECT unique_row FROM system__ownership", [], |r| r.get(0)) {
+            Ok(res) => {
+                let _res: usize = res;
+            }
+            Err(x) => {
+                println!("Cannot release: {x:?}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     /// Use to release lambda's lock on database.
     pub async fn release(&self) {
-        let mut lock = self.lock.lock().unwrap();
-        *lock = None;
+        tokio::task::block_in_place(move || self.release_sync())
+    }
+
+    /// Sync version of acquire.
+    pub fn acquire_sync(&self, retry: bool) -> bool {
+        let conn = loop {
+            match self.pool.get() {
+                Ok(conn) => break conn,
+                Err(x) => {
+                    println!("{x:?}");
+                    continue;
+                }
+            };
+        };
+        for n in 0..Self::get_num_retries() {
+            if n > 0 && !retry {
+                return false;
+            }
+            match conn.pragma_update(None, "locking_mode", "exclusive") {
+                Ok(_) => {}
+                Err(x) => {
+                    println!("Cannot acquire yet: {x:?}");
+                    continue;
+                }
+            }
+            match conn.pragma_update(None, "journal_mode", "wal") {
+                Ok(_) => {}
+                Err(x) => {
+                    println!("Cannot acquire yet: {x:?}");
+                    continue;
+                }
+            }
+
+            // Actually acquire lock in sqlite.
+            match conn.execute("UPDATE system__ownership SET unique_row=0", []) {
+                Ok(res) => {
+                    let _res: usize = res;
+                    self.acquired.store(true, atomic::Ordering::Release);
+                    return true;
+                }
+                Err(x) => {
+                    println!("Cannot acquire yet: {x:?}");
+                    continue;
+                }
+            }
+        }
+        println!("Could not acquire lock!");
+        false
     }
 
     /// Use to acquire lambda's lock.
-    pub async fn acquire(&self) -> bool {
-        let mut lock = self.lock.lock().unwrap();
-        if lock.is_some() {
-            return true;
-        }
-        let mut lock_file = match LockFile::open(&self.lock_file_path) {
-            Ok(lock_file) => lock_file,
-            Err(x) => {
-                println!("{x:?}");
-                return false;
-            }
-        };
-        let has_lock = match lock_file.try_lock() {
-            Ok(has_lock) => has_lock,
-            Err(x) => {
-                println!("{x:?}");
-                return false;
-            }
-        };
-        if !has_lock {
-            false
-        } else {
-            *lock = Some(lock_file);
-            true
-        }
+    pub async fn acquire(&self, retry: bool) -> bool {
+        tokio::task::block_in_place(move || self.acquire_sync(retry))
+    }
+
+    /// Check if db is acquired for background tasks.
+    pub async fn is_acquired(&self) -> bool {
+        self.acquired.load(atomic::Ordering::Acquire)
     }
 }
 
@@ -245,14 +309,20 @@ mod tests {
 
     #[test]
     fn test_database() {
+        let test_release = true;
         match fork() {
             Ok(Fork::Parent(child1)) => {
                 match fork() {
                     Ok(Fork::Parent(child2)) => {
-                        {
+                        let _parent_db: Option<Database> = {
                             // Open a database and write a few values.
                             let db = Database::new(&common::shared_storage_prefix(), "test", false);
                             println!("Parent: {}", db.db_id);
+                            if test_release {
+                                // Fake release and reaquire.
+                                db.release_sync();
+                                db.acquire_sync(true);
+                            }
                             // Wait for child1 to crash.
                             std::thread::sleep(std::time::Duration::from_secs(2));
                             // Child1 must have exited with a status of 1.
@@ -264,7 +334,15 @@ mod tests {
                             assert!(
                                 matches!(child_status, nix::sys::wait::WaitStatus::Exited(_, i) if i == 1)
                             );
-                        }
+                            if test_release {
+                                // Test releasing the database.
+                                db.release_sync();
+                                Some(db)
+                            } else {
+                                // Test dropping the connection.
+                                None
+                            }
+                        };
                         // Wait for child2 to open and cleanly exit.
                         std::thread::sleep(std::time::Duration::from_secs(2));
                         let child_status =
@@ -275,8 +353,8 @@ mod tests {
                         );
                     }
                     Ok(Fork::Child) => {
-                        // Wait for parent to open db.
-                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        // Wait for parent and child1 to open db.
+                        std::thread::sleep(std::time::Duration::from_secs(2));
                         // Unlike the other child, retrying ensures this does not crash.
                         let db = Database::new(&common::shared_storage_prefix(), "test", true);
                         println!("Child 2: {}", db.db_id); // Should not be reached.

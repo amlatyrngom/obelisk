@@ -39,6 +39,7 @@ pub struct MessagingSpec {
     pub namespace: String,
     pub cpus: i32,
     pub mem: i32,
+    pub fn_mem: i32,
     pub timeout: i32,
 }
 
@@ -67,6 +68,7 @@ pub struct FunctionalDeploymentInfo {
 pub struct MessagingDeploymentInfo {
     pub cpus: i32,
     pub mem: i32,
+    pub fn_mem: i32,
     pub timeout: i32,
 }
 
@@ -466,19 +468,18 @@ impl AdapterDeployment {
         if deployment_info.subsys_info.is_some() {
             subsystems.push(namespace.into());
         }
+        let revision = uuid::Uuid::new_v4().to_string();
         for subsystem in subsystems {
             self.create_scaling_table(&subsystem).await;
             let scaling_table = scaling_table_name(&subsystem);
+            println!("Resetting revision {scaling_table}: {revision}");
             let deployment_str = serde_json::to_string(&deployment_info).unwrap();
             self.dynamo_client
                 .put_item()
                 .table_name(&scaling_table)
                 .item("namespace", AttributeValue::S("system".into()))
                 .item("name", AttributeValue::S(namespace.into()))
-                .item(
-                    "revision",
-                    AttributeValue::S(uuid::Uuid::new_v4().to_string()),
-                )
+                .item("revision", AttributeValue::S(revision.clone()))
                 .item("deployment", AttributeValue::S(deployment_str))
                 .send()
                 .await
@@ -1395,7 +1396,7 @@ impl AdapterDeployment {
             .create_function()
             .function_name(&function_name)
             .code(code)
-            .memory_size(spec.mem)
+            .memory_size(spec.fn_mem)
             .package_type(PackageType::Image)
             .timeout(spec.timeout)
             .role(role_arn)
@@ -1544,7 +1545,7 @@ impl AdapterDeployment {
             .name(&service_def_name)
             .mount_points(
                 aws_sdk_ecs::model::MountPoint::builder()
-                    .container_path(crate::shared_storage_prefix())
+                    .container_path(crate::messaging_mnt_path())
                     .source_volume("obelisk_volume")
                     .build(),
             )

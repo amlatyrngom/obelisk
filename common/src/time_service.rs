@@ -56,7 +56,6 @@ impl TimeService {
                     println!("Warning: using local time due to absence of external access!");
                     break chrono::Utc::now();
                 }
-                
             };
             inner.last_ntp_time = ntp_time;
             inner.last_ntp_time

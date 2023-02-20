@@ -1,8 +1,12 @@
 use common::adaptation::ServerfulScalingState;
 use common::{ActorInstance, FunctionInstance, ServiceInstance};
 use persistence::PersistentLog;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::{Mutex, RwLock};
+
+const UNLOCK_SLEEP_TIME_MS: u64 = 100;
 
 #[derive(Clone)]
 pub struct MessagingHandler {
@@ -10,40 +14,110 @@ pub struct MessagingHandler {
     actor_instance: Arc<dyn ActorInstance>,
     plog: Arc<PersistentLog>,
     terminating: Arc<Mutex<bool>>,
+    db_lock: Arc<RwLock<usize>>,
+    namespace: String,
+    name: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum LambdaReq {
+    ReleaseLock,
+    Msg(String, Vec<u8>),
+    IndirectMsg,
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum LambdaResp {
+    ReleaseLock,
+    IndirectMsg,
+    Msg(Option<(String, Vec<u8>)>),
 }
 
 #[async_trait::async_trait]
 impl FunctionInstance for MessagingHandler {
     /// Invoke should only be called to wake up sleeping lambda.
     /// Use this to process messages in batch then go to sleep.
-    async fn invoke(&self, _arg: Value) -> Value {
-        // Try acquiring db lock to decrease likelihood of conflict.
-        println!("Invoke called");
-        let acquired = self.plog.db.acquire().await;
-        if !acquired {
-            println!("Lock not acquired");
-            return Value::Null;
-        }
-        println!("Lock acquired");
-        // Handle batch.
-        let handled = self.handle_message_batch().await;
-        if !handled {
-            // Tentatively wait for message to be available.
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            self.handle_message_batch().await;
-        }
-        self.actor_instance.checkpoint(false).await;
-        // Release db lock.
-        self.plog.db.release().await;
-        Value::Null
+    async fn invoke(&self, arg: Value) -> Value {
+        // Parse message.
+        let lambda_msg: LambdaReq = serde_json::from_value(arg).unwrap();
+        let resp = match lambda_msg {
+            LambdaReq::ReleaseLock => {
+                // Release lock.
+                let mut db_lock = self.db_lock.clone().write_owned().await;
+                *db_lock = 0;
+                println!("Releasing lock.");
+                self.actor_instance.checkpoint(false).await;
+                self.plog.db.release().await;
+                println!("Lock released. Sleeping...");
+                tokio::time::sleep(std::time::Duration::from_millis(UNLOCK_SLEEP_TIME_MS)).await;
+                LambdaResp::ReleaseLock
+            }
+            LambdaReq::Msg(msg, payload) => {
+                let mut db_lock = self.db_lock.clone().write_owned().await;
+                println!("DBLock: {}", *db_lock);
+                let has_lock = if *db_lock == 0 {
+                    self.plog.db.acquire(false).await
+                } else {
+                    true
+                };
+                if has_lock {
+                    *db_lock += 1;
+                    let resp = self.actor_instance.message(msg, payload).await;
+                    LambdaResp::Msg(Some(resp))
+                } else {
+                    println!("Lost lock ownership. Dying...");
+                    std::process::exit(1);
+                }
+            }
+            LambdaReq::IndirectMsg => {
+                let db_lock = self.db_lock.clone().read_owned().await;
+                println!("DBLock: {}", *db_lock);
+                let has_lock = if *db_lock == 0 {
+                    self.plog.db.acquire(false).await
+                } else {
+                    true
+                };
+                if has_lock {
+                    let handled = self.handle_message_batch().await;
+                    if !handled {
+                        // Tentatively wait for message to be available.
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        self.handle_message_batch().await;
+                    }
+                } else {
+                    println!("Lost lock ownership. Dying...");
+                    std::process::exit(1);
+                }
+                LambdaResp::IndirectMsg
+            }
+        };
+        // Return
+        serde_json::to_value(resp).unwrap()
     }
 }
 
 #[async_trait::async_trait]
 impl ServiceInstance for MessagingHandler {
+    /// Direct calls.
     async fn call(&self, meta: String, arg: Vec<u8>) -> (String, Vec<u8>) {
-        let (_msg_id, msg): (String, String) = serde_json::from_str(&meta).unwrap();
-        self.actor_instance.message(msg, arg).await
+        // On first call, acquire db lock.
+        let already_locked = {
+            let db_lock = self.db_lock.read().await;
+            *db_lock > 0
+        };
+        if !already_locked {
+            let mut db_lock = self.db_lock.write().await;
+            if *db_lock == 0 {
+                *db_lock = 1;
+                PersistentLog::pause_lambda_lock(&self.namespace, &self.name).await;
+                let acquired = self.plog.db.acquire(true).await;
+                if !acquired {
+                    std::process::exit(1);
+                }
+            }
+        }
+        // Process request.
+        self.actor_instance.message(meta, arg).await
     }
 
     async fn custom_info(&self, _scaling_state: &ServerfulScalingState) -> Value {
@@ -53,7 +127,7 @@ impl ServiceInstance for MessagingHandler {
     async fn terminate(&self) {
         self.actor_instance.checkpoint(true).await;
         self.plog.terminate().await;
-        let mut terminating = self.terminating.lock().unwrap();
+        let mut terminating = self.terminating.lock().await;
         *terminating = true;
     }
 }
@@ -62,23 +136,29 @@ impl MessagingHandler {
     pub async fn new(
         plog: Arc<PersistentLog>,
         actor_instance: Arc<dyn ActorInstance>,
-        _namespace: &str,
-        _name: &str,
+        namespace: &str,
+        name: &str,
     ) -> Self {
         let mode = std::env::var("EXECUTION_MODE").unwrap_or_else(|_| "messaging_lambda".into());
         let shared_config = aws_config::load_from_env().await;
         let s3_client = aws_sdk_s3::Client::new(&shared_config);
         let handler = MessagingHandler {
             plog,
-            actor_instance,
             s3_client,
+            actor_instance,
             terminating: Arc::new(Mutex::new(false)),
+            db_lock: Arc::new(RwLock::new(0)),
+            namespace: namespace.into(),
+            name: name.into(),
         };
         if mode != "messaging_lambda" {
+            // ECS takes ~10s before becoming available. So do indirect messaging.
             let handler = handler.clone();
             tokio::spawn(async move {
                 handler.message_queue_thread().await;
             });
+        } else {
+            handler.plog.db.release().await;
         }
         handler
     }
@@ -88,14 +168,14 @@ impl MessagingHandler {
         let mut last_checkpoint = std::time::Instant::now();
         loop {
             let terminating: bool = {
-                let terminating = self.terminating.lock().unwrap();
+                let terminating = self.terminating.lock().await;
                 *terminating
             };
             if terminating {
                 return;
             }
             if should_wait {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
             let processed = self.handle_message_batch().await;
             should_wait = !processed;

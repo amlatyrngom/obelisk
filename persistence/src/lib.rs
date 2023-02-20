@@ -1,16 +1,12 @@
-pub mod counter;
 pub mod database;
 pub mod log_replica;
 pub mod persistent_log;
 pub mod rescaler;
 
-pub use counter::Counter;
 pub use log_replica::LogReplica;
 pub use persistent_log::PersistentLog;
 pub use rescaler::LogRescaler;
 
-// pub use persistent_log::PersistentLog;
-use common::clean_die;
 use serde::{Deserialize, Serialize};
 
 const NUM_DB_RETRIES: usize = 20;
@@ -56,77 +52,29 @@ enum PersistenceRespMeta {
     Err(String),
 }
 
-fn sync_clean_die(handle: &tokio::runtime::Handle, msg: &str) -> ! {
-    handle.block_on(async move { clean_die(msg).await })
-}
-
-fn get_shared_log_connection(namespace: &str, name: &str, create: bool) -> rusqlite::Connection {
-    let prefix = common::shared_storage_prefix();
-    let storage_dir = format!("{prefix}/{SUBSYSTEM_NAME}/{namespace}/{name}");
-    if create {
-        std::fs::create_dir_all(&storage_dir).unwrap();
-    }
-    let shared_file = format!("{storage_dir}/shared.db");
-    for _ in 0..NUM_DB_RETRIES {
-        // The default mode is locking_mode=none, journal_mode=delete.
-        // So multiprocess writes are possible.
-        let conn = match rusqlite::Connection::open(shared_file.clone()) {
-            Ok(conn) => conn,
-            x => {
-                println!("{x:?}");
-                continue;
-            }
-        };
-        match conn.busy_timeout(std::time::Duration::from_secs(1)) {
-            Ok(_) => {}
-            x => {
-                println!("{x:?}");
-                continue;
-            }
+async fn fast_serialize(entries: &[(usize, Vec<u8>)], entries_size: usize) -> Vec<u8> {
+    tokio::task::block_in_place(move || {
+        // Output format: (len_1: usize, lsn_1: u64, entry_1: Vec<u8>) ..., (len_n, lsn_n, entry_n).
+        let total_size = 2 * entries.len() * 8 + entries_size;
+        let mut output: Vec<u8> = Vec::new();
+        output.resize(total_size, 0);
+        let mut curr_offset = 0;
+        for (lsn, entry) in entries {
+            let len_lo = curr_offset;
+            let len_hi = len_lo + 8;
+            let lsn_lo = len_hi;
+            let lsn_hi = lsn_lo + 8;
+            let entry_lo = lsn_hi;
+            let entry_hi = entry_lo + entry.len();
+            let len = entry.len().to_be_bytes();
+            output[len_lo..len_hi].copy_from_slice(&len);
+            let lsn = lsn.to_be_bytes();
+            output[lsn_lo..lsn_hi].copy_from_slice(&lsn);
+            output[entry_lo..entry_hi].copy_from_slice(entry);
+            curr_offset = entry_hi;
         }
-        if create {
-            match conn.execute("CREATE TABLE IF NOT EXISTS system__shared_ownership(unique_row INTEGER PRIMARY KEY, owner_id BIGINT)", []) {
-                Ok(_) => {},
-                x => {
-                    println!("{x:?}");
-                    continue;
-                }
-            }
-            match conn.execute("CREATE TABLE IF NOT EXISTS system__shared_logs(lo_lsn INTEGER PRIMARY KEY, hi_lsn BIGINT, entries BLOB)", []) {
-                Ok(_) => {},
-                x => {
-                    println!("{x:?}");
-                    continue;
-                }
-            }
-        }
-        return conn;
-    }
-    eprintln!("Cannot connect to shared db. Fast exiting...");
-    std::process::exit(1);
-}
-
-fn fast_serialize(entries: &[(usize, Vec<u8>)], entries_size: usize) -> Vec<u8> {
-    // Output format: (len_1: usize, lsn_1: u64, entry_1: Vec<u8>) ..., (len_n, lsn_n, entry_n).
-    let total_size = 2 * entries.len() * 8 + entries_size;
-    let mut output: Vec<u8> = Vec::new();
-    output.resize(total_size, 0);
-    let mut curr_offset = 0;
-    for (lsn, entry) in entries {
-        let len_lo = curr_offset;
-        let len_hi = len_lo + 8;
-        let lsn_lo = len_hi;
-        let lsn_hi = lsn_lo + 8;
-        let entry_lo = lsn_hi;
-        let entry_hi = entry_lo + entry.len();
-        let len = entry.len().to_be_bytes();
-        output[len_lo..len_hi].copy_from_slice(&len);
-        let lsn = lsn.to_be_bytes();
-        output[lsn_lo..lsn_hi].copy_from_slice(&lsn);
-        output[entry_lo..entry_hi].copy_from_slice(entry);
-        curr_offset = entry_hi;
-    }
-    output
+        output
+    })
 }
 
 /// Deserialize in a predictable manner.

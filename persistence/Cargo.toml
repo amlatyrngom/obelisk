@@ -7,7 +7,10 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "*", features = ["full"] }
-reqwest = { version = "*", features = ["blocking"], default-features = false }
+reqwest = { version = "*", features = ["json", "rustls-tls"], default-features = false }
+aws-config = "*"
+aws-smithy-types = "*"
+aws-sdk-lambda = "*"
 bincode = "*"
 bytes = "*"
 uuid = { version = "*", features = ["v4"]}
@@ -19,10 +22,6 @@ async-trait = "*"
 rusqlite = { version = "*", features = ["bundled"] }
 r2d2 = "*"
 r2d2_sqlite = "*"
-fslock = "*"
-dashmap = "*"
-moka = "*"
-concurrent-queue = "*"
 
 [dev-dependencies]
 fork = "*"

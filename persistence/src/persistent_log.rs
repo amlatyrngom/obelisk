@@ -1,31 +1,29 @@
-use super::{
-    fast_deserialize, fast_serialize, get_shared_log_connection, sync_clean_die, ECS_MODE,
-    NUM_DB_RETRIES, SUBSYSTEM_NAME,
-};
+use super::{fast_deserialize, fast_serialize, ECS_MODE, NUM_DB_RETRIES, SUBSYSTEM_NAME};
 use bytes::Bytes;
 use common::adaptation::frontend::AdapterFrontend;
 use common::adaptation::ServerfulInstance;
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::Arc;
 use tokio::runtime::Handle;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, Mutex, RwLock};
 
 use crate::database::Database;
+use crate::log_replica::PendingLog;
 use crate::{PersistenceReqMeta, PersistenceRespMeta};
-const MAX_REPLICATION_FAILURES: usize = 500;
+const MAX_REPLICATION_FAILURES: usize = 100;
 
 /// A lockful implementation of persistent log.
 /// Probably should not have more than two concurrent flushers.
 #[derive(Clone)]
 pub struct PersistentLog {
     inner: Arc<Mutex<PersistentLogInner>>,
-    instance_ids_lock: Arc<Mutex<HashSet<String>>>,
+    replication_lock: Arc<RwLock<()>>,
     flush_lock: Arc<Mutex<()>>,
     failed_replications: Arc<atomic::AtomicUsize>,
     owner_id: usize,
-    direct_client: reqwest::blocking::Client,
+    direct_client: reqwest::Client,
     front_end: Arc<AdapterFrontend>,
     pub db: Database,
     try_replicate: bool,
@@ -41,6 +39,7 @@ struct PersistentLogInner {
     new_entries: Vec<(usize, Vec<u8>)>, // Enqueued entries.
     new_entries_size: usize,            // Total size of enqueued entries.
     instances: Vec<ServerfulInstance>,  // Instances to replicate to.
+    terminating: bool,                  // Actor terminating.
 }
 
 #[derive(Debug)]
@@ -50,8 +49,47 @@ enum PersistedMode {
 }
 
 impl PersistentLog {
+    // Pause lambda lock to be able to acquire lock.
+    // Should be called very rarely (e.g. when first acquiring lock).
+    pub async fn pause_lambda_lock(namespace: &str, name: &str) {
+        let actor_function_name = common::full_messaging_name(namespace, name);
+        tokio::spawn(async move {
+            let shared_config = aws_config::load_from_env().await;
+            let lambda_client = aws_sdk_lambda::Client::new(&shared_config);
+            let arg = serde_json::json!("ReleaseLock");
+            let arg = serde_json::to_vec(&arg).unwrap();
+            let arg = aws_smithy_types::Blob::new(arg);
+            let mut num_remaining: i64 = 10;
+            while num_remaining > 0 {
+                let resp = lambda_client
+                    .invoke()
+                    .function_name(&actor_function_name)
+                    .payload(arg.clone())
+                    .send()
+                    .await;
+                if let Ok(resp) = &resp {
+                    if let Some(err) = resp.function_error() {
+                        if !err.contains("TooManyRequestsException") {
+                            num_remaining -= 1;
+                            println!("Unlock error {actor_function_name}: {err:?}");
+                            continue;
+                        }
+                    }
+                }
+                num_remaining -= 1;
+                println!("Unlock resp: {resp:?}");
+            }
+        });
+    }
+
     /// Create a new persistent log.
     pub async fn new(namespace: &str, name: &str) -> Self {
+        let mode = std::env::var("EXECUTION_MODE").unwrap_or_else(|_| "".into());
+        if mode == ECS_MODE {
+            // Remove potential lambda's lock.
+            println!("Removing lambda's lock!");
+            Self::pause_lambda_lock(namespace, name).await;
+        }
         let handle = Handle::current();
         tokio::task::block_in_place(move || Self::new_sync(handle, namespace, name))
     }
@@ -60,10 +98,18 @@ impl PersistentLog {
     fn new_sync(handle: Handle, namespace: &str, name: &str) -> Self {
         println!("Creating persistent log!");
         let mode = std::env::var("EXECUTION_MODE").unwrap_or_else(|_| ECS_MODE.into());
-        let storage_dir = common::shared_storage_prefix();
-        let storage_dir = format!("{storage_dir}/{SUBSYSTEM_NAME}/{namespace}/{name}");
+        let shared_dir = common::shared_storage_prefix();
+        let storage_dir = format!("{shared_dir}/{SUBSYSTEM_NAME}/{namespace}/{name}");
         let is_ecs = mode == ECS_MODE;
-        let db = Database::new(&storage_dir, "main", is_ecs);
+        // TODO: Remove this.
+        // println!("Cleanup up shared dir. TODO: Remove me. I am only for testing.");
+        // if namespace == "sbtree" && name == "manager" && !is_ecs {
+        //     std::fs::remove_dir_all(format!("{shared_dir}/{SUBSYSTEM_NAME}")).unwrap();
+        //     std::fs::remove_dir_all(format!("{shared_dir}/sless_btree")).unwrap();
+        //     std::fs::remove_dir_all(format!("{shared_dir}/sbtree")).unwrap();
+        // }
+
+        let db = Database::new(&storage_dir, "main", true);
         // First, use db to retrieve and update ownership and quorum information
         println!("Setting up persistent log!");
         let mut conn = db.pool.get().unwrap();
@@ -143,6 +189,7 @@ impl PersistentLog {
         // 2. Every write they have received should make it to shared disk.
         // We also need to recover flush_lsn and curr_lsn.
         // The initialize function() does all of this.
+        std::mem::drop(conn); // Drop handle for initialize().
         let inner = Arc::new(Mutex::new(PersistentLogInner {
             curr_lsn: 0,      // Will be set in initialize().
             flush_lsn: 0,     // Will be set in initialize().
@@ -151,6 +198,7 @@ impl PersistentLog {
             new_entries_size: 0,
             new_entries: Vec::new(),
             instances: Vec::new(), // Will be set in initialize().
+            terminating: false,
         }));
         println!("Creating frontend");
         let front_end = handle
@@ -160,10 +208,10 @@ impl PersistentLog {
             db,
             owner_id: my_owner_id,
             flush_lock: Arc::new(Mutex::new(())),
-            instance_ids_lock: Arc::new(Mutex::new(HashSet::new())),
-            direct_client: reqwest::blocking::ClientBuilder::new()
-                .connect_timeout(std::time::Duration::from_millis(500))
-                .timeout(std::time::Duration::from_millis(500))
+            replication_lock: Arc::new(RwLock::new(())),
+            direct_client: reqwest::ClientBuilder::new()
+                .connect_timeout(std::time::Duration::from_secs(2))
+                .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap(),
             handle,
@@ -173,40 +221,27 @@ impl PersistentLog {
         };
         let old_instances = serde_json::from_str(&old_instances).unwrap();
         println!("Initializing persistent log.");
-        plog.initialize(namespace, name, old_instances);
+        plog.handle.block_on(async {
+            plog.initialize(old_instances).await;
+        });
         plog
     }
 
     /// Get current flush lsn.
     pub async fn get_flush_lsn(&self) -> usize {
-        tokio::task::block_in_place(move || self.get_flush_lsn_sync())
-    }
-
-    /// Sync version of get_flush_lsn.
-    pub fn get_flush_lsn_sync(&self) -> usize {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().await;
         inner.flush_lsn
     }
 
     /// Get current flush lsn.
     pub async fn get_start_lsn(&self) -> usize {
-        tokio::task::block_in_place(move || self.get_start_lsn_sync())
-    }
-
-    /// Sync version of get_flush_lsn.
-    pub fn get_start_lsn_sync(&self) -> usize {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().await;
         inner.start_lsn
     }
 
     /// Enqueue one new element in the log.
     pub async fn enqueue(&self, content: Vec<u8>) -> usize {
-        tokio::task::block_in_place(move || self.enqueue_sync(content))
-    }
-
-    /// Sync version of enqueue
-    pub fn enqueue_sync(&self, content: Vec<u8>) -> usize {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().await;
         // First log entry should be 1. So increment beforehand.
         // The 0th log entry is the null entry.
         inner.curr_lsn += 1;
@@ -216,20 +251,12 @@ impl PersistentLog {
         lsn
     }
 
-    /// Flush all enqued logs.
-    /// Allows concurrent flushes.
-    /// You should use spawn blocking within an async context.
-    pub async fn flush(&self, ch: Option<oneshot::Sender<()>>) -> usize {
-        tokio::task::block_in_place(move || self.flush_sync(ch))
-    }
-
-    /// Sync version of flush.
-    pub fn flush_sync(&self, ch: Option<oneshot::Sender<()>>) -> usize {
+    /// Flush log entries.
+    pub async fn flush(&self) -> usize {
         // Only allow one flush at a time, but also allow enqueues while flushing.
-        // Using the channel, caller can know that flushing has started and keep enqueuing.
-        let _l = self.flush_lock.lock().unwrap();
+        let _l = self.flush_lock.lock().await;
         let (entries, entries_size, curr_lsn, persisted_lsn, instances) = {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock().await;
             // Get and reset size.
             let entries_size = inner.new_entries_size;
             inner.new_entries_size = 0;
@@ -243,50 +270,53 @@ impl PersistentLog {
                 inner.instances.clone(),
             )
         };
-        // Allow new enqueues.
-        if let Some(ch) = ch {
-            let _ = ch.send(());
-        }
-        self.handle.block_on(async {
+        // Log metrics if some entries are being flushed.
+        if !entries.is_empty() {
             self.front_end.collect_metric(serde_json::Value::Null).await;
-        });
-        self.flush_entries(entries, entries_size, persisted_lsn, instances);
+        }
+
+        self.flush_entries(entries, entries_size, persisted_lsn, instances)
+            .await;
         {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock().await;
             inner.flush_lsn = curr_lsn;
         }
         let failed_count = self.failed_replications.load(atomic::Ordering::Relaxed);
-        if failed_count > 500 {
-            self.change_instances(false);
+        if failed_count > MAX_REPLICATION_FAILURES {
+            let this = self.clone();
+            tokio::spawn(async move {
+                this.change_instances(false).await;
+            });
         }
         curr_lsn
     }
 
     /// Deserialize in a predictable manner.
-    pub fn fast_deserialize(&self, entries: Vec<u8>) -> Vec<(usize, Vec<u8>)> {
-        let total_size = entries.len();
-        let mut curr_offset = 0;
-        let mut output = Vec::new();
-        while curr_offset < total_size {
-            let len_lo = curr_offset;
-            let len_hi = len_lo + 8;
-            let lsn_lo = len_hi;
-            let lsn_hi = lsn_lo + 8;
-            let len = &entries[len_lo..len_hi];
-            let len = usize::from_be_bytes(len.try_into().unwrap());
-            let lsn = &entries[lsn_lo..lsn_hi];
-            let lsn = usize::from_be_bytes(lsn.try_into().unwrap());
-            let entry_lo = lsn_hi;
-            let entry_hi = entry_lo + len;
-            let entry = &entries[entry_lo..entry_hi];
-            output.push((lsn, entry.to_vec()));
-            curr_offset = entry_hi;
-        }
-
-        output
+    pub async fn fast_deserialize(&self, entries: Vec<u8>) -> Vec<(usize, Vec<u8>)> {
+        tokio::task::block_in_place(move || {
+            let total_size = entries.len();
+            let mut curr_offset = 0;
+            let mut output = Vec::new();
+            while curr_offset < total_size {
+                let len_lo = curr_offset;
+                let len_hi = len_lo + 8;
+                let lsn_lo = len_hi;
+                let lsn_hi = lsn_lo + 8;
+                let len = &entries[len_lo..len_hi];
+                let len = usize::from_be_bytes(len.try_into().unwrap());
+                let lsn = &entries[lsn_lo..lsn_hi];
+                let lsn = usize::from_be_bytes(lsn.try_into().unwrap());
+                let entry_lo = lsn_hi;
+                let entry_hi = entry_lo + len;
+                let entry = &entries[entry_lo..entry_hi];
+                output.push((lsn, entry.to_vec()));
+                curr_offset = entry_hi;
+            }
+            output
+        })
     }
 
-    fn flush_entries(
+    async fn flush_entries(
         &self,
         entries: Vec<(usize, Vec<u8>)>,
         entries_size: usize,
@@ -300,122 +330,98 @@ impl PersistentLog {
         let lo_lsn = entries.first().unwrap().0;
         let hi_lsn = entries.last().unwrap().0;
         // Serialize
-        let entries = fast_serialize(&entries, entries_size);
+        let entries = fast_serialize(&entries, entries_size).await;
         let entries = bytes::Bytes::from(entries);
         // Send to database and to replicas.
-        let (tx, rx) = mpsc::channel();
+        let (tx, mut rx) = mpsc::channel(2);
         {
             let tx = tx.clone();
             let entries = entries.clone();
-            self.persist_on_db(tx, entries, lo_lsn, hi_lsn);
+            self.persist_on_db(tx, entries, lo_lsn, hi_lsn).await;
         };
         {
             let tx = tx;
             let entries = entries;
-            self.persist_on_replicas(tx, entries, lo_lsn, hi_lsn, persisted_lsn, instances);
+            self.persist_on_replicas(tx, entries, lo_lsn, hi_lsn, persisted_lsn, instances)
+                .await;
         };
         // Wait for persistence.
-        let persisted = rx.recv().unwrap();
+        let persisted = rx.recv().await.unwrap();
         match persisted {
             PersistedMode::Database => {
                 // On db, persistence is guaranteed. So async recv remaining.
-                std::thread::spawn(move || {
-                    let _persisted = rx.recv().unwrap();
+                tokio::spawn(async move {
+                    let _persisted = rx.recv().await;
                 });
             }
             PersistedMode::Replicas(replicated) => {
                 if replicated {
                     // When replicated on a quorum, persistence is guaranteed. So async drain.
-                    std::thread::spawn(move || {
-                        let _persisted = rx.recv().unwrap();
+                    tokio::spawn(async move {
+                        let _persisted = rx.recv().await;
                     });
                 } else {
                     // Without a quorum, we have to wait for database.
-                    let _persisted = rx.recv().unwrap();
-                    // println!("{_persisted:?}");
+                    let _persisted = rx.recv().await;
                 }
             }
         }
-    }
-
-    /// Return total size of log. Should not be called frequently.
-    /// You should generally prevent the log from growing past 1GB.
-    pub async fn log_size(&self) -> usize {
-        tokio::task::block_in_place(move || {
-            let conn = self.db.pool.get().unwrap();
-            for _ in 0..NUM_DB_RETRIES {
-                match conn.busy_timeout(std::time::Duration::from_secs(1)) {
-                    Ok(_) => {}
-                    _ => continue,
-                }
-                match conn.query_row(
-                    "SELECT page_count * page_size as size FROM pragma_page_count(), pragma_page_size()",
-                    [],
-                    |row| {
-                        row.get(0)
-                }) {
-                    Ok(total_size) => {return total_size;}
-                    _ => continue,
-                }
-            }
-            sync_clean_die(&self.handle, "Cannot access db. Fast exiting...");
-        })
     }
 
     /// Truncate up to (and including) at most the given lsn.
     /// TODO: Might have to vaccum.
-    pub async fn truncate(&self, lsn: usize) {
-        tokio::task::block_in_place(move || self.truncate_sync(lsn))
-    }
-
-    /// Sync version of truncate.
-    pub fn truncate_sync(&self, lsn: usize) {
+    pub async fn truncate(&self, lsn: usize) -> Result<(), String> {
         let curr_start_lsn = {
-            let inner = self.inner.lock().unwrap();
+            let inner = self.inner.lock().await;
             inner.start_lsn
         };
         if curr_start_lsn >= lsn {
-            return;
+            return Ok(());
         }
-
-        let mut conn = self.db.pool.get().unwrap();
-        for _ in 0..NUM_DB_RETRIES {
-            let txn = match conn.transaction() {
-                Ok(txn) => txn,
-                _ => continue,
-            };
-            match txn.execute(
-                "UPDATE system__logs_ownership SET start_lsn=? WHERE new_owner_id=?",
-                [lsn, self.owner_id],
-            ) {
-                Ok(executed) if executed > 0 => {}
-                Ok(executed) if executed == 0 => {
-                    eprintln!("Truncating node does not own db. Fast exiting...");
-                    std::process::exit(1);
+        // Update DB.
+        let resp = tokio::task::block_in_place(move || {
+            for _ in 0..NUM_DB_RETRIES {
+                let mut conn = self.db.pool.get().unwrap();
+                let txn = match conn.transaction() {
+                    Ok(txn) => txn,
+                    Err(x) => {
+                        println!("Truncate 1: {x:?}");
+                        continue;
+                    }
+                };
+                match txn.execute(
+                    "UPDATE system__logs_ownership SET start_lsn=? WHERE new_owner_id=?",
+                    [lsn, self.owner_id],
+                ) {
+                    Ok(executed) if executed > 0 => {}
+                    Ok(executed) if executed == 0 => {
+                        eprintln!("Truncating node does not own db. Fast exiting...");
+                        std::process::exit(1);
+                    }
+                    x => {
+                        println!("Truncate 2: {x:?}");
+                        continue;
+                    }
                 }
-                _ => {
-                    continue;
+                match txn.execute("DELETE FROM system__logs WHERE hi_lsn <= ?", [lsn]) {
+                    Ok(_) => {}
+                    _ => continue,
+                }
+                match txn.commit() {
+                    Ok(_) => return Ok(()),
+                    _ => continue,
                 }
             }
-            match txn.execute("DELETE FROM system__logs WHERE hi_lsn <= ?", [lsn]) {
-                Ok(_) => {}
-                _ => continue,
+            return Err("Cannot access db".into());
+        });
+        if resp.is_ok() {
+            let mut inner = self.inner.lock().await;
+            // Concurrent truncate may change value.
+            if inner.start_lsn < lsn {
+                inner.start_lsn = lsn;
             }
-            match txn.commit() {
-                Ok(_) => {}
-                _ => continue,
-            }
-            {
-                let mut inner = self.inner.lock().unwrap();
-                // Concurrent truncate may change value.
-                if inner.start_lsn < lsn {
-                    inner.start_lsn = lsn;
-                }
-                return;
-            };
         }
-        eprintln!("Cannot access db. Fast exiting...");
-        std::process::exit(1);
+        resp
     }
 
     /// Replay log entries, possibly starting from a given lsn.
@@ -423,91 +429,21 @@ impl PersistentLog {
     /// So use start_lsn to get values starting from a given lsn (exclusive).
     /// When called concurrently with flush(), may miss some last few entries
     /// Returns Vec<(lsn, log)>.
-    pub async fn replay(&self, exclusive_start_lsn: usize) -> Vec<(usize, Vec<u8>)> {
-        tokio::task::block_in_place(move || self.replay_sync(exclusive_start_lsn))
-    }
-
-    /// Sync version of replay.
-    pub fn replay_sync(&self, exclusive_start_lsn: usize) -> Vec<(usize, Vec<u8>)> {
+    pub async fn replay(
+        &self,
+        exclusive_start_lsn: usize,
+    ) -> Result<Vec<(usize, Vec<u8>)>, String> {
         let exclusive_start_lsn = {
-            let inner = self.inner.lock().unwrap();
+            let inner = self.inner.lock().await;
             if inner.start_lsn > exclusive_start_lsn {
                 inner.start_lsn
             } else {
                 exclusive_start_lsn
             }
         };
-        // println!("Exclusive start lsn: {exclusive_start_lsn}");
-        for _ in 0..NUM_DB_RETRIES {
-            let conn = match self.db.pool.get() {
-                Ok(conn) => conn,
-                Err(x) => {
-                    println!("{x:?}");
-                    continue;
-                }
-            };
-            let mut stmt = match conn.prepare(
-                "SELECT entries FROM system__logs WHERE lo_lsn > ? ORDER BY lo_lsn LIMIT 2",
-            ) {
-                Ok(stmt) => stmt,
-                Err(x) => {
-                    println!("{x:?}");
-                    continue;
-                }
-            };
-            let mut rows = match stmt.query([exclusive_start_lsn]) {
-                Ok(rows) => rows,
-                Err(x) => {
-                    println!("{x:?}");
-                    continue;
-                }
-            };
-            let mut entries: Vec<u8> = Vec::new();
-            let (entries, ok) = loop {
-                match rows.next() {
-                    Ok(Some(row)) => {
-                        let mut row: Vec<u8> = row.get(0).unwrap();
-                        entries.append(&mut row);
-                    }
-                    Ok(None) => {
-                        break (entries, true);
-                    }
-                    Err(x) => {
-                        println!("{x:?}");
-                        break (vec![], false);
-                    }
-                }
-            };
-            if !ok {
-                continue;
-            }
-            let entries = fast_deserialize(&entries);
-            let entries = entries
-                .into_iter()
-                .filter(|(lsn, _)| *lsn > exclusive_start_lsn)
-                .collect();
-            return entries;
-        }
-        eprintln!("Cannot access db. Fast exiting...");
-        std::process::exit(1);
-    }
-
-    /// Call this to allow faster recovery.
-    /// Will block every other operation.
-    pub async fn terminate(&self) {
         tokio::task::block_in_place(move || {
-            let _flush_lock = self.flush_lock.lock();
-            let _instance_lock = self.instance_ids_lock.lock();
-            let inner = self.inner.lock().unwrap();
-            if inner.instances.is_empty() {
-                return;
-            }
-            let persisted_lsn = self.fetch_persisted_lsn();
-            self.drain_instances(&inner.instances, persisted_lsn);
-            let new_instances: Vec<ServerfulInstance> = Vec::new();
-            let new_instances_str = serde_json::to_string(&new_instances).unwrap();
-            loop {
-                // Can only execute if no new owner since startup.
+            // println!("Exclusive start lsn: {exclusive_start_lsn}");
+            for _ in 0..NUM_DB_RETRIES {
                 let conn = match self.db.pool.get() {
                     Ok(conn) => conn,
                     Err(x) => {
@@ -515,26 +451,113 @@ impl PersistentLog {
                         continue;
                     }
                 };
-                let executed = conn.execute(
-                    "UPDATE system__logs_ownership SET instances=? WHERE new_owner_id=?",
-                    rusqlite::params![new_instances_str, self.owner_id],
-                );
-                match executed {
-                    Ok(x) if x > 0 => {
-                        return;
+                let mut stmt = match conn.prepare(
+                    "SELECT entries FROM system__logs WHERE lo_lsn > ? ORDER BY lo_lsn LIMIT 2",
+                ) {
+                    Ok(stmt) => stmt,
+                    Err(x) => {
+                        println!("Replay 1: {x:?}");
+                        continue;
                     }
-                    Ok(_) => {
-                        eprintln!("New owner changed underneath! Exiting...");
-                        std::process::exit(1);
+                };
+                let mut rows = match stmt.query([exclusive_start_lsn]) {
+                    Ok(rows) => rows,
+                    Err(x) => {
+                        println!("Replay 2: {x:?}");
+                        continue;
                     }
-                    Err(_err) => continue,
+                };
+                let mut entries: Vec<u8> = Vec::new();
+                let (entries, ok) = loop {
+                    match rows.next() {
+                        Ok(Some(row)) => {
+                            let mut row: Vec<u8> = row.get(0).unwrap();
+                            entries.append(&mut row);
+                        }
+                        Ok(None) => {
+                            break (entries, true);
+                        }
+                        Err(x) => {
+                            println!("{x:?}");
+                            break (vec![], false);
+                        }
+                    }
+                };
+                if !ok {
+                    continue;
                 }
+                let entries = fast_deserialize(&entries);
+                let entries = entries
+                    .into_iter()
+                    .filter(|(lsn, _)| *lsn > exclusive_start_lsn)
+                    .collect();
+                return Ok(entries);
+            }
+            return Err("Cannot access db".into());
+        })
+    }
+
+    /// Call this to allow faster recovery.
+    /// Will block every other operation.
+    pub async fn terminate(&self) {
+        // Prevent new replications.
+        let _replication_lock = self.replication_lock.write().await;
+        let curr_instances = {
+            let mut inner = self.inner.lock().await;
+            inner.terminating = true;
+            if inner.instances.is_empty() {
+                return;
+            }
+            inner.instances.clone()
+        };
+        // Drain instances until there are no pending logs.
+        loop {
+            let persisted_lsn = {
+                let inner = self.inner.lock().await;
+                inner.persisted_lsn
+            };
+            let pending_logs = self.drain_instances(&curr_instances, persisted_lsn).await;
+            if pending_logs.is_empty() {
+                break;
+            } else {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+        // Write empty instances.
+        let new_instances: Vec<ServerfulInstance> = Vec::new();
+        let new_instances_str = serde_json::to_string(&new_instances).unwrap();
+
+        tokio::task::block_in_place(move || loop {
+            // Can only execute if no new owner since startup.
+            let conn = match self.db.pool.get() {
+                Ok(conn) => conn,
+                Err(x) => {
+                    println!("{x:?}");
+                    continue;
+                }
+            };
+            let executed = conn.execute(
+                "UPDATE system__logs_ownership SET instances=? WHERE new_owner_id=?",
+                rusqlite::params![new_instances_str, self.owner_id],
+            );
+            match executed {
+                Ok(x) if x > 0 => {
+                    return;
+                }
+                Ok(_) => {
+                    eprintln!("New owner changed underneath! Exiting...");
+                    std::process::exit(1);
+                }
+                Err(_err) => continue,
             }
         });
+        // Update inner.
+        let mut inner = self.inner.lock().await;
+        inner.instances = vec![];
     }
 
     /// Persist entries in DB.
-    fn persist_on_db(
+    async fn persist_on_db(
         &self,
         tx: mpsc::Sender<PersistedMode>,
         entries: Bytes,
@@ -544,49 +567,53 @@ impl PersistentLog {
         let db = self.db.clone();
         let owner_id = self.owner_id;
         let inner = self.inner.clone(); // To modify persisted lsn.
-        std::thread::spawn(move || {
-            let conn = db.pool.get().unwrap();
-            let entries: &[u8] = &entries;
-
-            for _ in 0..NUM_DB_RETRIES {
-                // let start_time = std::time::Instant::now();
-                let executed = conn.execute(
-                    "REPLACE INTO system__logs(lo_lsn, hi_lsn, entries) \
-                    SELECT ?, ?, ? FROM system__logs_ownership WHERE owner_id=?",
-                    rusqlite::params![lo_lsn, hi_lsn, entries, owner_id],
-                );
-                // let end_time = std::time::Instant::now();
-                // let duration = end_time.duration_since(start_time);
-                // println!("DB Write took: {duration:?}");
-                match executed {
-                    Ok(executed) if executed > 0 => {
-                        tx.send(PersistedMode::Database).unwrap();
-                        let mut inner = inner.lock().unwrap();
-                        if hi_lsn > inner.persisted_lsn {
-                            inner.persisted_lsn = hi_lsn;
+        tokio::spawn(async move {
+            // Write in DB.
+            tokio::task::block_in_place(move || {
+                let entries: &[u8] = &entries;
+                for _ in 0..NUM_DB_RETRIES {
+                    // let start_time = std::time::Instant::now();
+                    let conn = db.pool.get().unwrap();
+                    let executed = conn.execute(
+                        "REPLACE INTO system__logs(lo_lsn, hi_lsn, entries) \
+                        SELECT ?, ?, ? FROM system__logs_ownership WHERE new_owner_id=?",
+                        rusqlite::params![lo_lsn, hi_lsn, entries, owner_id],
+                    );
+                    // let end_time = std::time::Instant::now();
+                    // let duration = end_time.duration_since(start_time);
+                    // println!("DB Write took: {duration:?}");
+                    match executed {
+                        Ok(executed) if executed > 0 => {
+                            return;
                         }
-                        return;
-                    }
-                    Ok(_) => {
-                        eprintln!("Node {owner_id} cannot persist due to ownership change. Fast exiting...");
-                        std::process::exit(1);
-                    }
-                    Err(err) => {
-                        let err = format!("{err:?}");
-                        if !(err.contains("busy") || err.contains("locked")) {
-                            eprintln!("Unhandled sqlite error: {err:?}");
+                        Ok(_) => {
+                            eprintln!("Node {owner_id} cannot persist due to ownership change. Fast exiting...");
                             std::process::exit(1);
+                        }
+                        Err(err) => {
+                            let err = format!("{err:?}");
+                            if !(err.contains("busy") || err.contains("locked")) {
+                                eprintln!("Unhandled sqlite error: {err:?}");
+                                std::process::exit(1);
+                            }
                         }
                     }
                 }
+                eprintln!("Cannot access db. Fast exiting...");
+                std::process::exit(1);
+            });
+            // Respond.
+            tx.send(PersistedMode::Database).await.unwrap();
+            // Update persisted lsn.
+            let mut inner = inner.lock().await;
+            if hi_lsn > inner.persisted_lsn {
+                inner.persisted_lsn = hi_lsn;
             }
-            eprintln!("Cannot access db. Fast exiting...");
-            std::process::exit(1);
         });
     }
 
     /// Persist entries in a quorum of replicas.
-    fn persist_on_replicas(
+    async fn persist_on_replicas(
         &self,
         tx: mpsc::Sender<PersistedMode>,
         entries: Bytes,
@@ -601,23 +628,33 @@ impl PersistentLog {
         let failed_replications = self.failed_replications.clone();
         if num_total == 0 {
             failed_replications.fetch_add(1, atomic::Ordering::Relaxed);
-            tx.send(PersistedMode::Replicas(false)).unwrap();
+            tx.send(PersistedMode::Replicas(false)).await.unwrap();
             return;
         }
+        // Prevent concurrent replica changes.
+        let replication_lock = self.replication_lock.clone().try_read_owned();
+        if replication_lock.is_err() {
+            // Return if replicas changing.
+            tx.send(PersistedMode::Replicas(false)).await.unwrap();
+            return;
+        }
+
         let quorum_size: usize = num_total / 2 + 1;
         let client = self.direct_client.clone();
         let owner_id = self.owner_id;
-        std::thread::spawn(move || {
+        tokio::spawn(async move {
+            // Prevent concurrent replica changes.
+            let _replication_lock = replication_lock.unwrap();
             let mut num_completed: usize = 0;
             let mut num_valid: usize = 0;
             // Send to each replica.
-            let (replica_tx, replica_rx) = mpsc::channel();
+            let (replica_tx, mut replica_rx) = mpsc::channel(6);
             for instance in instances {
                 let entries = entries.clone();
                 let client = client.clone();
                 let replica_tx = replica_tx.clone();
-                let failed_replications = failed_replications.clone();
-                std::thread::spawn(move || {
+                tokio::spawn(async move {
+                    // Send request.
                     let meta = PersistenceReqMeta::Log {
                         lo_lsn,
                         hi_lsn,
@@ -626,30 +663,35 @@ impl PersistentLog {
                         replica_id: instance.id.clone(),
                     };
                     let meta = serde_json::to_string(&meta).unwrap();
-
                     let resp = client
-                        .post(instance.url)
+                        .post(&instance.url)
                         .header("obelisk-meta", meta)
+                        .header("content-length", entries.len())
                         .body(entries)
-                        .send();
+                        .send()
+                        .await;
+                    // Parse resp.
                     if resp.is_err() {
-                        failed_replications.fetch_add(1, atomic::Ordering::Relaxed);
-                        replica_tx.send(false).unwrap();
+                        println!("Resp err: {resp:?}");
+                        replica_tx.send(false).await.unwrap();
                         return;
                     }
                     let resp = resp.unwrap();
                     let meta = resp.headers().get("obelisk-meta");
                     if meta.is_none() {
-                        failed_replications.fetch_add(1, atomic::Ordering::Relaxed);
-                        replica_tx.send(false).unwrap();
+                        replica_tx.send(false).await.unwrap();
                         return;
                     }
                     let meta = meta.unwrap().to_str().unwrap();
                     let meta: PersistenceRespMeta = serde_json::from_str(meta).unwrap();
                     match meta {
                         PersistenceRespMeta::Ok => {
-                            failed_replications.store(0, atomic::Ordering::Relaxed);
-                            replica_tx.send(true).unwrap();
+                            replica_tx.send(true).await.unwrap();
+                            return;
+                        }
+                        PersistenceRespMeta::Terminating => {
+                            replica_tx.send(false).await.unwrap();
+                            return;
                         }
                         PersistenceRespMeta::Outdated => {
                             eprintln!("A new owner has contacted replicas. Fast exiting...");
@@ -663,84 +705,100 @@ impl PersistentLog {
                 });
             }
             while num_completed < num_total && num_valid < quorum_size {
-                let valid = replica_rx.recv().unwrap();
+                let valid = replica_rx.recv().await.unwrap();
                 num_completed += 1;
                 if valid {
                     num_valid += 1;
                 }
             }
             if num_valid >= quorum_size {
-                tx.send(PersistedMode::Replicas(true)).unwrap();
+                failed_replications.store(0, atomic::Ordering::Relaxed);
+                tx.send(PersistedMode::Replicas(true)).await.unwrap();
             } else {
-                tx.send(PersistedMode::Replicas(false)).unwrap();
+                failed_replications.fetch_add(1, atomic::Ordering::Relaxed);
+                tx.send(PersistedMode::Replicas(false)).await.unwrap();
             }
             while num_completed < num_total {
-                let _ = replica_rx.recv().unwrap();
+                let _ = replica_rx.recv().await.unwrap();
                 num_completed += 1;
             }
         });
     }
 
     /// See the comments inside new_sync() for what this function does.
-    fn initialize(&self, namespace: &str, name: &str, old_instances: Vec<ServerfulInstance>) {
+    async fn initialize(&self, old_instances: Vec<ServerfulInstance>) {
         // Assuming no more than AZ+1 uncontolled failures, when drain_instances is done,
         // All accepted writes have made it to disk.
         println!("Old Instances: {old_instances:?}");
-        if !old_instances.is_empty() {
-            println!("Draining instances");
-            let persisted_lsn = self.fetch_persisted_lsn();
-            self.drain_instances(&old_instances, persisted_lsn);
+        let mut persisted_lsn = self.fetch_persisted_lsn().await;
+        let replicated_logs = self.drain_instances(&old_instances, persisted_lsn).await;
+        if !replicated_logs.is_empty() {
+            // Recover and refetch persistent lsn.
+            self.recover_replicated_logs(replicated_logs).await;
+            persisted_lsn = self.fetch_persisted_lsn().await;
+            // Hacky way to remove replicated log entries.
+            self.drain_instances(&old_instances, persisted_lsn).await;
         }
-        // When update shared_ownership is done, we can assume that even single replicas
-        // Stuck in a partition with old owner cannot write to shared storage.
-        println!("Update shared ownership!");
-        self.update_shared_ownership(namespace, name);
-        // It's safe to take the shared logs.
-        println!("Take shared logs!");
-        let shared_entries = self.take_shared_logs(namespace, name);
-        println!("Apply shared logs: {:?}!", shared_entries.len());
-        self.apply_shared_logs(shared_entries);
-        // It's safe to take ownership with possibly new list of replicas.
-        println!("Change lsns!");
-        self.change_instances(true);
-        // Update lsns.
-        println!("Fetch lsns!");
-        let persisted_lsn = self.fetch_persisted_lsn();
-        let mut inner = self.inner.lock().unwrap();
-        inner.flush_lsn = persisted_lsn;
-        inner.curr_lsn = persisted_lsn;
-        inner.persisted_lsn = persisted_lsn;
+        // Set persisted lsn.
+        {
+            let mut inner = self.inner.lock().await;
+            inner.flush_lsn = persisted_lsn;
+            inner.curr_lsn = persisted_lsn;
+            inner.persisted_lsn = persisted_lsn;
+        }
+        // Reset ownership of instances.
+        self.change_instances(true).await;
     }
 
     /// Fetch current flush_lsn and curr_lsn.
-    fn fetch_persisted_lsn(&self) -> usize {
-        for _ in 0..NUM_DB_RETRIES {
-            let conn = self.db.pool.get().unwrap();
-            let persisted_lsn =
-                conn.query_row("SELECT MAX(hi_lsn) FROM system__logs", [], |r| r.get(0));
-            println!("Persisted lsn: {persisted_lsn:?}");
-            match persisted_lsn {
-                Ok(persisted_lsn) => {
-                    return persisted_lsn;
-                }
-                Err(rusqlite::Error::InvalidColumnType(_, _, rusqlite::types::Type::Null)) => {
-                    let inner = self.inner.lock().unwrap();
-                    return inner.start_lsn;
-                }
-                _ => {
-                    continue;
+    async fn fetch_persisted_lsn(&self) -> usize {
+        // Read from database.
+        let persisted_lsn: Option<usize> = tokio::task::block_in_place(move || {
+            for _ in 0..NUM_DB_RETRIES {
+                let conn = self.db.pool.get().unwrap();
+                let persisted_lsn =
+                    conn.query_row("SELECT MAX(hi_lsn) FROM system__logs", [], |r| r.get(0));
+                println!("Persisted lsn: {persisted_lsn:?}");
+                match persisted_lsn {
+                    Ok(persisted_lsn) => {
+                        return Some(persisted_lsn);
+                    }
+                    Err(rusqlite::Error::InvalidColumnType(_, _, rusqlite::types::Type::Null)) => {
+                        return None;
+                    }
+                    _ => {
+                        continue;
+                    }
                 }
             }
+            eprintln!("Cannot access db. Fast exiting...");
+            std::process::exit(1);
+        });
+        // Return.
+        if let Some(persisted_lsn) = persisted_lsn {
+            persisted_lsn
+        } else {
+            let inner = self.inner.lock().await;
+            inner.start_lsn
         }
-        eprintln!("Cannot access db. Fast exiting...");
-        std::process::exit(1);
     }
 
     /// Change instances to replicate to.
     /// When set_ownership is set, will also set self as owner.
-    fn change_instances(&self, set_ownership: bool) {
+    async fn change_instances(&self, set_ownership: bool) {
         // Prevent concurrent changes.
-        let mut curr_instance_ids = self.instance_ids_lock.lock().unwrap();
+        let mut _replication_lock = self.replication_lock.write().await;
+        let curr_instances = {
+            // No change if terminating.
+            let inner = self.inner.lock().await;
+            if inner.terminating {
+                return;
+            }
+            inner.instances.clone()
+        };
+        let curr_instance_ids: HashSet<String> =
+            curr_instances.iter().map(|s| s.id.clone()).collect();
+        // If not setting ownership, only change ownership after multiple replication failures.
         if !set_ownership {
             let counter = self.failed_replications.load(atomic::Ordering::Relaxed);
             if counter < MAX_REPLICATION_FAILURES {
@@ -748,10 +806,9 @@ impl PersistentLog {
             }
             self.failed_replications.store(0, atomic::Ordering::Relaxed);
         }
+        // Read instances.
         let mut new_instances = Vec::new();
-        let mut all_instances = self
-            .handle
-            .block_on(async { self.front_end.serverful_instances().await });
+        let mut all_instances = self.front_end.serverful_instances().await;
         // Order join_time. This to maximize reuse.
         all_instances.sort_by(|x1, x2| {
             match x1.join_time.cmp(&x2.join_time) {
@@ -798,47 +855,66 @@ impl PersistentLog {
         if !set_ownership && curr_instance_ids.eq(&new_instance_ids) {
             return;
         }
-        // If instances have changed, or we are resetting ownership, write to db.
-        let new_instances_str = serde_json::to_string(&new_instances).unwrap();
-        let conn = self.db.pool.get().unwrap();
-        for _ in 0..NUM_DB_RETRIES {
-            // Can only execute if no new owner since startup.
-            let executed = conn.execute(
-                "UPDATE system__logs_ownership SET instances=?, owner_id=? WHERE new_owner_id=?",
-                rusqlite::params![new_instances_str, self.owner_id, self.owner_id],
-            );
-            match executed {
-                Ok(x) if x > 0 => {
-                    let mut inner = self.inner.lock().unwrap();
-                    *curr_instance_ids = new_instance_ids;
-                    inner.instances = new_instances;
-                    println!("Updated ownership");
-                    return;
-                }
-                Ok(_) => {
-                    eprintln!("New owner changed underneath! Exiting...");
-                    std::process::exit(1);
-                }
-                Err(_err) => continue,
+        // Drain instances until there are no pending logs.
+        loop {
+            let persisted_lsn = {
+                let inner = self.inner.lock().await;
+                inner.persisted_lsn
+            };
+            let pending_logs = self.drain_instances(&curr_instances, persisted_lsn).await;
+            if pending_logs.is_empty() {
+                break;
+            } else {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         }
-        eprintln!("Cannot access db. Fast exiting...");
-        std::process::exit(1);
+        // Write to db.
+        let new_instances_str = serde_json::to_string(&new_instances).unwrap();
+        tokio::task::block_in_place(move || {
+            for _ in 0..NUM_DB_RETRIES {
+                let conn = self.db.pool.get().unwrap();
+                // Can only execute if no new owner since startup.
+                let executed = conn.execute(
+                    "UPDATE system__logs_ownership SET instances=?, owner_id=? WHERE new_owner_id=?",
+                    rusqlite::params![new_instances_str, self.owner_id, self.owner_id],
+                );
+                match executed {
+                    Ok(x) if x > 0 => {
+                        return;
+                    }
+                    Ok(_) => {
+                        eprintln!("New owner changed underneath! Exiting...");
+                        std::process::exit(1);
+                    }
+                    Err(_err) => continue,
+                }
+            }
+            eprintln!("Cannot access db. Fast exiting...");
+            std::process::exit(1);
+        });
+        let mut inner = self.inner.lock().await;
+        inner.instances = new_instances;
+        println!("Updated ownership");
     }
 
     /// Assuming at most AZ+1 uncontrolled crashes, this function makes sure that
     /// all acked writes will make to shared storage and that no previously active node can replicate new stuff.
-    fn drain_instances(&self, instances: &[ServerfulInstance], persisted_lsn: usize) {
+    async fn drain_instances(
+        &self,
+        instances: &[ServerfulInstance],
+        persisted_lsn: usize,
+    ) -> Vec<(usize, usize, Vec<u8>)> {
         if instances.is_empty() {
-            return;
+            return vec![];
         }
         let mut reached_instances: HashSet<String> = HashSet::new();
+        let mut all_entries: BTreeMap<usize, (usize, Vec<u8>)> = BTreeMap::new();
         let owner_id = self.owner_id;
-        let has_external_access = self.front_end.has_external_access;
         loop {
-            let curr_instances = self
-                .handle
-                .block_on(async { self.front_end.force_read_instances().await.peers });
+            let mut curr_instances = self.front_end.force_read_instances().await;
+            common::adaptation::cleanup_instances(&mut curr_instances);
+            let curr_instances = curr_instances.peers;
+            println!("Draining Current: {curr_instances:?}");
             let mut remaining_instances: Vec<&ServerfulInstance> = Vec::new();
             for instance in instances {
                 if curr_instances.contains_key(&instance.id)
@@ -848,31 +924,24 @@ impl PersistentLog {
                 }
             }
             if remaining_instances.is_empty() {
-                return;
+                return all_entries
+                    .into_iter()
+                    .map(|(lo_lsn, (hi_lsn, entries))| (lo_lsn, hi_lsn, entries))
+                    .collect();
             }
             // Contact all remaining instances.
-            let (tx, rx) = mpsc::channel();
+            let (tx, mut rx) = mpsc::channel(remaining_instances.len());
             for instance in remaining_instances.iter() {
                 let client = self.direct_client.clone();
                 let instance_id = instance.id.clone();
-                let url = instance.url.clone();
-                let persisted_lsn = persisted_lsn;
-                let drain_owner = if let Some(drain_owner) = instance.custom_info.as_u64() {
-                    drain_owner as usize
+                let url = if common::has_external_access() {
+                    instance.url.clone()
                 } else {
-                    0
+                    instance.private_url.clone()
                 };
+                let persisted_lsn = persisted_lsn;
                 let tx = tx.clone();
-                std::thread::spawn(move || {
-                    if drain_owner >= owner_id {
-                        tx.send((instance_id, true)).unwrap();
-                        return;
-                    }
-                    // If no external access, only indirect communication is possible.
-                    if !has_external_access {
-                        tx.send((instance_id, false)).unwrap();
-                        return;
-                    }
+                tokio::spawn(async move {
                     let req_body: Vec<u8> = Vec::new();
                     let req_meta = PersistenceReqMeta::Drain {
                         owner_id,
@@ -883,16 +952,19 @@ impl PersistentLog {
                     let resp = client
                         .post(url)
                         .header("obelisk-meta", req_meta)
+                        .header("content-length", req_body.len())
                         .body(req_body)
-                        .send();
+                        .send()
+                        .await;
                     if resp.is_err() {
-                        tx.send((instance_id, false)).unwrap();
+                        println!("Drain err: {resp:?}");
+                        tx.send((instance_id, None)).await.unwrap();
                         return;
                     }
                     let resp = resp.unwrap();
                     let meta = resp.headers().get("obelisk-meta");
                     if meta.is_none() {
-                        tx.send((instance_id, false)).unwrap();
+                        tx.send((instance_id, None)).await.unwrap();
                         return;
                     }
                     let meta = meta.unwrap().to_str().unwrap();
@@ -900,7 +972,13 @@ impl PersistentLog {
                     println!("Resp: {meta:?}");
                     match meta {
                         PersistenceRespMeta::Ok => {
-                            tx.send((instance_id, true)).unwrap();
+                            let resp_body = resp.bytes().await.unwrap().to_vec();
+                            let pending_logs: Vec<PendingLog> =
+                                bincode::deserialize(&resp_body).unwrap();
+                            tx.send((instance_id, Some(pending_logs))).await.unwrap();
+                        }
+                        PersistenceRespMeta::Terminating => {
+                            tx.send((instance_id, None)).await.unwrap();
                         }
                         PersistenceRespMeta::Outdated => {
                             eprintln!("A new owner has contacted replicas. Fast exiting...");
@@ -917,7 +995,21 @@ impl PersistentLog {
             let mut all_ok = true;
             while num_received < remaining_instances.len() {
                 // Reqwest client has a timeout, so this (hopefully) won't block too long.
-                let (instance_id, ok) = rx.recv().unwrap();
+                let (instance_id, pending_logs) = rx.recv().await.unwrap();
+                let ok = if let Some(pending_logs) = pending_logs {
+                    let pending_logs: Vec<PendingLog> = pending_logs;
+                    for pending_log in pending_logs {
+                        let PendingLog {
+                            lo_lsn,
+                            hi_lsn,
+                            entries,
+                        } = pending_log;
+                        all_entries.insert(lo_lsn, (hi_lsn, entries));
+                    }
+                    true
+                } else {
+                    false
+                };
                 if ok {
                     reached_instances.insert(instance_id);
                 }
@@ -926,176 +1018,92 @@ impl PersistentLog {
             }
             if !all_ok {
                 // Avoid putting too much pressure on dynamo and network.
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         }
     }
 
-    fn apply_shared_logs(&self, shared_entries: Vec<(usize, usize, Vec<u8>)>) {
-        println!("{shared_entries:?}");
-        for _ in 0..NUM_DB_RETRIES {
-            println!("Apply");
-            let mut conn = match self.db.pool.get() {
-                Ok(conn) => conn,
-                Err(x) => {
-                    println!("Pool: {x:?}");
-                    continue;
-                }
-            };
-            match conn.busy_timeout(std::time::Duration::from_secs(1)) {
-                Ok(_) => {}
-                Err(x) => {
-                    println!("Timeout: {x:?}");
-                    continue;
-                }
-            }
-            let txn = match conn.transaction() {
-                Ok(txn) => txn,
-                Err(x) => {
-                    println!("Txn: {x:?}");
-                    continue;
-                }
-            };
-            match txn.query_row("SELECT new_owner_id FROM system__logs_ownership", [], |r| {
-                let res: usize = r.get(0).unwrap();
-                Ok(res)
-            }) {
-                Ok(new_owner_id) => {
-                    if new_owner_id > self.owner_id {
-                        eprintln!("Shared db is higher id owner. Fast exiting...");
-                        std::process::exit(1);
-                    }
-                }
-                Err(rusqlite::Error::QueryReturnedNoRows) => {}
-                Err(x) => {
-                    println!("Query: {x:?}");
-                    continue;
-                }
-            }
-            let ok = {
-                let mut stmt = match txn
-                    .prepare("REPLACE INTO system__logs(lo_lsn, hi_lsn, entries) VALUES (?, ?, ?)")
-                {
-                    Ok(stmt) => stmt,
+    async fn recover_replicated_logs(&self, replicated_entries: Vec<(usize, usize, Vec<u8>)>) {
+        println!("Recover replicated logs: {replicated_entries:?}");
+        if replicated_entries.is_empty() {
+            return;
+        }
+        tokio::task::block_in_place(move || {
+            for _ in 0..NUM_DB_RETRIES {
+                println!("Apply");
+                let mut conn = match self.db.pool.get() {
+                    Ok(conn) => conn,
                     Err(x) => {
-                        println!("Stmt: {x:?}");
+                        println!("Pool: {x:?}");
                         continue;
                     }
                 };
-                let mut ok = true;
-                for (lo_lsn, hi_lsn, entries) in &shared_entries {
-                    match stmt.execute(rusqlite::params![lo_lsn, hi_lsn, entries]) {
-                        Ok(_) => {}
-                        _ => {
-                            ok = false;
-                            break;
-                        }
-                    }
-                }
-                ok
-            };
-            if !ok {
-                continue;
-            }
-            match txn.commit() {
-                Ok(_) => return,
-                Err(x) => {
-                    println!("Commit: {x:?}");
-                    continue;
-                }
-            }
-        }
-        eprintln!("Cannot access shared db. Fast exiting...");
-        std::process::exit(1);
-    }
-
-    fn take_shared_logs(&self, namespace: &str, name: &str) -> Vec<(usize, usize, Vec<u8>)> {
-        for _ in 0..NUM_DB_RETRIES {
-            let conn = get_shared_log_connection(namespace, name, true);
-            let mut prepared =
-                conn.prepare("SELECT lo_lsn, hi_lsn, entries FROM system__shared_logs");
-            let mut rows = match &mut prepared {
-                Ok(stmt) => match stmt.query([]) {
-                    Ok(rows) => rows,
+                match conn.busy_timeout(std::time::Duration::from_secs(1)) {
+                    Ok(_) => {}
                     Err(x) => {
-                        println!("{x:?}");
+                        println!("Timeout: {x:?}");
                         continue;
                     }
-                },
-                x => {
-                    println!("{x:?}");
-                    continue;
                 }
-            };
-            let mut res: Vec<(usize, usize, Vec<u8>)> = Vec::new();
-            loop {
-                let row = rows.next();
-                if let Ok(row) = row {
-                    if let Some(row) = row {
-                        res.push((
-                            row.get(0).unwrap(),
-                            row.get(1).unwrap(),
-                            row.get(2).unwrap(),
-                        ))
-                    } else {
-                        return res;
+                let txn = match conn.transaction() {
+                    Ok(txn) => txn,
+                    Err(x) => {
+                        println!("Txn: {x:?}");
+                        continue;
                     }
-                } else {
-                    break;
-                }
-            }
-        }
-        eprintln!("Take shared logs. Cannot access shared db. Fast exiting...");
-        std::process::exit(1);
-    }
-
-    fn update_shared_ownership(&self, namespace: &str, name: &str) {
-        for _ in 0..NUM_DB_RETRIES {
-            let mut conn = get_shared_log_connection(namespace, name, true);
-            let txn = match conn.transaction() {
-                Ok(txn) => txn,
-                x => {
-                    println!("{x:?}");
-                    continue;
-                }
-            };
-            // We want to prevent old owners from
-            match txn.query_row("SELECT owner_id FROM system__shared_ownership", [], |r| {
-                let res: usize = r.get(0).unwrap();
-                Ok(res)
-            }) {
-                Ok(curr_owner_id) => {
-                    if curr_owner_id > self.owner_id {
-                        eprintln!("Shared db is higher id owner. Fast exiting...");
-                        std::process::exit(1);
+                };
+                match txn.query_row("SELECT new_owner_id FROM system__logs_ownership", [], |r| {
+                    let res: usize = r.get(0).unwrap();
+                    Ok(res)
+                }) {
+                    Ok(new_owner_id) => {
+                        if new_owner_id > self.owner_id {
+                            eprintln!("Shared db is higher id owner. Fast exiting...");
+                            std::process::exit(1);
+                        }
+                    }
+                    Err(rusqlite::Error::QueryReturnedNoRows) => {}
+                    Err(x) => {
+                        println!("Query: {x:?}");
+                        continue;
                     }
                 }
-                Err(rusqlite::Error::QueryReturnedNoRows) => {}
-                x => {
-                    println!("{x:?}");
+                let ok = {
+                    let mut stmt = match txn.prepare(
+                        "REPLACE INTO system__logs(lo_lsn, hi_lsn, entries) VALUES (?, ?, ?)",
+                    ) {
+                        Ok(stmt) => stmt,
+                        Err(x) => {
+                            println!("Stmt: {x:?}");
+                            continue;
+                        }
+                    };
+                    let mut ok = true;
+                    for (lo_lsn, hi_lsn, entries) in &replicated_entries {
+                        match stmt.execute(rusqlite::params![lo_lsn, hi_lsn, entries]) {
+                            Ok(_) => {}
+                            _ => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    ok
+                };
+                if !ok {
                     continue;
                 }
-            }
-            match txn.execute(
-                "REPLACE INTO system__shared_ownership(unique_row, owner_id) VALUES (0, ?)",
-                [self.owner_id],
-            ) {
-                Ok(_) => {}
-                x => {
-                    println!("{x:?}");
-                    continue;
+                match txn.commit() {
+                    Ok(_) => return,
+                    Err(x) => {
+                        println!("Commit: {x:?}");
+                        continue;
+                    }
                 }
             }
-            match txn.commit() {
-                Ok(_) => return,
-                x => {
-                    println!("{x:?}");
-                    continue;
-                }
-            }
-        }
-        eprintln!("Update shared ownership. Cannot access shared db. Fast exiting...");
-        std::process::exit(1);
+            eprintln!("Cannot access shared db. Fast exiting...");
+            std::process::exit(1);
+        });
     }
 }
 
@@ -1152,7 +1160,7 @@ mod tests {
         for i in 0..num_writes {
             plog.enqueue(content.clone()).await;
             if (i + 1) % 100 == 0 {
-                plog.flush(None).await;
+                plog.flush().await;
             }
         }
         let end_time = std::time::Instant::now();
@@ -1165,7 +1173,7 @@ mod tests {
         let plog = Arc::new(PersistentLog::new("messaging", "echo").await);
         let flush_lsn = plog.get_flush_lsn().await;
         println!("Flush Lsn: {flush_lsn}");
-        plog.truncate(flush_lsn).await;
+        plog.truncate(flush_lsn).await.unwrap();
         let mut num_entries = 0;
         let mut expected_entries = vec![];
         for i in 0..10 {
@@ -1174,13 +1182,13 @@ mod tests {
                 expected_entries.push(vec![i, j]);
                 plog.enqueue(vec![i, j]).await;
             }
-            plog.flush(None).await;
+            plog.flush().await;
         }
         println!("Num entries: {num_entries}");
         let mut num_found_entries = 0;
         let mut curr_last_lsn = flush_lsn;
         loop {
-            let entries = plog.replay(curr_last_lsn).await;
+            let entries = plog.replay(curr_last_lsn).await.unwrap();
             if entries.is_empty() {
                 break;
             }
@@ -1204,35 +1212,17 @@ mod tests {
         let plog = Arc::new(PersistentLog::new("messaging", "echo").await);
         // Make 100 empty flushes per seconds for 100 seconds to trigger a scale up.
         // Note that the code is written to push metrics even for empty flushes.
-        for i in 0..10 {
+        for i in 0..100 {
             let round = i + 1;
             println!("Round {round}/100");
             let failed_count = plog
                 .failed_replications
                 .load(std::sync::atomic::Ordering::Relaxed);
             println!("FailedCount={failed_count}");
-            let scaling_state = plog.front_end.scaling_state().await;
-            if let Some(scaling_state) = scaling_state {
-                let deployment = scaling_state.deployment;
-                let count = scaling_state.current_scale;
-                let scaling_info = scaling_state.scaling_info;
-                let peers = scaling_state.peers;
-                tokio::task::block_in_place(|| {
-                    plog.change_instances(false);
-                    let inner = plog.inner.lock().unwrap();
-                    println!("Instances={:?}", inner.instances);
-                });
-                println!("Deployment={deployment:?}");
-                println!("Count={count:?}");
-                println!("ScalingInfo={scaling_info:?}");
-                println!("PeersLen={:?}", peers.len());
-            } else {
-                println!("No scaling state yet!");
-            }
             let start_time = std::time::Instant::now();
-            for _ in 0..2000 {
+            for _ in 0..1000 {
                 plog.enqueue(vec![1, 2, 3]).await;
-                plog.flush(None).await;
+                plog.flush().await;
             }
             let end_time = std::time::Instant::now();
             let duration = end_time.duration_since(start_time);
@@ -1240,7 +1230,12 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
         }
         {
-            let inner = plog.inner.lock().unwrap();
+            let inner = plog.inner.lock().await;
+            println!("Instances: {:?}", inner.instances);
+        }
+        plog.terminate().await;
+        {
+            let inner = plog.inner.lock().await;
             println!("Instances: {:?}", inner.instances);
         }
     }

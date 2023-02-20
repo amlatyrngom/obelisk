@@ -20,13 +20,18 @@ const RETRY_INTERVAL: u64 = 1;
 /// Frontend of an adapter.
 #[derive(Clone)]
 pub struct AdapterFrontend {
-    pub sqs_client: aws_sdk_sqs::Client,
-    pub lambda_client: aws_sdk_lambda::Client,
-    pub dynamo_client: aws_sdk_dynamodb::Client,
-    pub time_service: TimeService,
     pub info: Arc<FrontendInfo>,
     pub has_external_access: bool,
     inner: Arc<RwLock<AdapterFrontendInner>>,
+    pub clients: Option<FrontendClients>,
+    pub dynamo_client: aws_sdk_dynamodb::Client,
+}
+
+#[derive(Clone)]
+pub struct FrontendClients {
+    pub sqs_client: aws_sdk_sqs::Client,
+    pub lambda_client: aws_sdk_lambda::Client,
+    pub time_service: TimeService,
 }
 
 #[derive(Clone, Debug)]
@@ -50,10 +55,24 @@ impl AdapterFrontend {
     /// Return the frontend of the adapter.
     pub async fn new(subsystem: &str, namespace: &str, name: &str) -> Self {
         println!("Creating FrontEnd object!");
+        // Special case: lambdas inside VPCs have no internet access.
+        let execution_mode = std::env::var("EXECUTION_MODE").unwrap_or_default();
+        let has_external_access = execution_mode != "messaging_lambda" && execution_mode != "local";
         let shared_config = aws_config::load_from_env().await;
-        let sqs_client = aws_sdk_sqs::Client::new(&shared_config);
-        let lambda_client = aws_sdk_lambda::Client::new(&shared_config);
         let dynamo_client = aws_sdk_dynamodb::Client::new(&shared_config);
+        let clients = if has_external_access {
+            let sqs_client = aws_sdk_sqs::Client::new(&shared_config);
+            let lambda_client = aws_sdk_lambda::Client::new(&shared_config);
+            let time_service = TimeService::new().await;
+            Some(FrontendClients {
+                sqs_client,
+                lambda_client,
+                time_service,
+            })
+        } else {
+            None
+        };
+        println!("Made clients!");
         let inner = Arc::new(RwLock::new(AdapterFrontendInner {
             last_push: std::time::Instant::now(),
             scaling_state: None,
@@ -63,12 +82,11 @@ impl AdapterFrontend {
         let queue_name = full_scaling_queue_name(subsystem, namespace, name);
         let scaler_name = full_scaler_name(subsystem);
         let scaling_table = scaling_table_name(subsystem);
-        // Special case: lambdas inside VPCs have no internet access.
-        let execution_mode = std::env::var("EXECUTION_MODE").unwrap_or_default();
-        let has_external_access = execution_mode != "messaging_lambda" && execution_mode != "local";
+        println!("Frontend: loop start!");
 
         for _ in 0..NUM_RETRIES {
             let queue_url: String = if has_external_access {
+                let sqs_client = clients.clone().unwrap().sqs_client;
                 let queue_url = sqs_client
                     .get_queue_url()
                     .queue_name(&queue_name)
@@ -95,7 +113,6 @@ impl AdapterFrontend {
                 "".into()
             };
 
-            let time_service = TimeService::new().await;
             println!("Made front end object");
             let info = Arc::new(FrontendInfo {
                 queue_url,
@@ -106,13 +123,11 @@ impl AdapterFrontend {
                 name: name.into(),
             });
             let frontend = AdapterFrontend {
-                sqs_client,
-                lambda_client,
-                dynamo_client,
-                time_service,
+                clients,
                 info,
                 inner,
                 has_external_access,
+                dynamo_client,
             };
 
             {
@@ -134,7 +149,7 @@ impl AdapterFrontend {
                 .dynamo_client
                 .get_item()
                 .table_name(&self.info.scaling_table)
-                .consistent_read(false)
+                .consistent_read(true)
                 .key("namespace", AttributeValue::S("system".into()))
                 .key("name", AttributeValue::S(self.info.namespace.clone()))
                 .send()
@@ -175,7 +190,8 @@ impl AdapterFrontend {
 
     pub async fn current_time(&self) -> chrono::DateTime<chrono::Utc> {
         if self.has_external_access {
-            self.time_service.current_time().await
+            let time_service = self.clients.clone().unwrap().time_service;
+            time_service.current_time().await
         } else {
             chrono::Utc::now()
         }
@@ -188,7 +204,7 @@ impl AdapterFrontend {
                 .dynamo_client
                 .get_item()
                 .table_name(&self.info.scaling_table)
-                .consistent_read(false)
+                .consistent_read(true)
                 .key("namespace", AttributeValue::S(self.info.namespace.clone()))
                 .key("name", AttributeValue::S(self.info.name.clone()))
                 .send()
@@ -281,8 +297,8 @@ impl AdapterFrontend {
                 return;
             }
             let metrics = serde_json::to_string(metrics).unwrap();
-            let resp = self
-                .sqs_client
+            let sqs_client = self.clients.clone().unwrap().sqs_client;
+            let resp = sqs_client
                 .send_message()
                 .queue_url(&self.info.queue_url)
                 .message_body(metrics)
@@ -308,15 +324,17 @@ impl AdapterFrontend {
         }
 
         for _ in 0..NUM_RETRIES {
+            let time_service = self.clients.clone().unwrap().time_service;
+            let lambda_client = self.clients.clone().unwrap().lambda_client;
+
             let req = ScalerReq {
                 namespace: self.info.namespace.clone(),
                 name: self.info.name.clone(),
-                timestamp: self.time_service.current_time().await,
+                timestamp: time_service.current_time().await,
             };
             let req = serde_json::to_vec(&req).unwrap();
             let req = aws_smithy_types::Blob::new(req);
-            let resp = self
-                .lambda_client
+            let resp = lambda_client
                 .invoke()
                 .function_name(&self.info.scaler_name)
                 .payload(req)

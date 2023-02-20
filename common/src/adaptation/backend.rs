@@ -15,6 +15,7 @@ pub struct ServiceInfo {
     pub id: String,
     pub az: String,
     pub url: String,
+    pub private_url: String,
     pub subsystem: String,
     pub namespace: String,
     pub name: String,
@@ -141,6 +142,7 @@ impl AdapterBackend {
                     id: self.svc_info.id.clone(),
                     az: self.svc_info.az.clone(),
                     url: self.svc_info.url.clone(),
+                    private_url: self.svc_info.private_url.clone(),
                     active_time: req.timestamp,
                     join_time: self.join_time,
                     custom_info: self.svc.custom_info(&scaling_state).await,
@@ -166,12 +168,22 @@ impl AdapterBackend {
             tokio::time::interval(std::time::Duration::from_secs(SERVERFUL_REFRESH_TIME));
         let mut rescale_interval =
             tokio::time::interval(std::time::Duration::from_secs(RESCALING_INTERVAL));
+        let terminate_signal = unix::SignalKind::terminate();
+        let mut sigterm = unix::signal(terminate_signal).unwrap();
+        let int_signal = unix::SignalKind::interrupt();
+        let mut sigint = unix::signal(int_signal).unwrap();
+        let terminated = Arc::new(RwLock::new(false));
         loop {
-            let terminate_signal = unix::SignalKind::terminate();
-            let mut sigterm = unix::signal(terminate_signal).unwrap();
-            let sigint = tokio::signal::ctrl_c();
             tokio::select! {
                 _ = refresh_interval.tick() => {
+                    {
+                        // Check if terminated.
+                        let terminated = terminated.read().await;
+                        if *terminated {
+                            self.deregister().await;
+                            return
+                        }
+                    }
                     // Spawn to prevent blocked signal processing.
                     let this = self.clone();
                     tokio::spawn (async move {
@@ -185,15 +197,23 @@ impl AdapterBackend {
                         this.invoke_scaler().await;
                     });
                 },
-                _ = sigint => {
-                    self.svc.terminate().await;
-                    self.deregister().await;
-                    return;
+                _ = sigint.recv() => {
+                    let svc = self.svc.clone();
+                    let terminated = terminated.clone();
+                    tokio::spawn (async move {
+                        svc.terminate().await;
+                        let mut terminated = terminated.write().await;
+                        *terminated = true;
+                    });
                 }
                 _ = sigterm.recv() => {
-                    self.svc.terminate().await;
-                    self.deregister().await;
-                    return;
+                    let svc = self.svc.clone();
+                    let terminated = terminated.clone();
+                    tokio::spawn (async move {
+                        svc.terminate().await;
+                        let mut terminated = terminated.write().await;
+                        *terminated = true;
+                    });
                 }
             }
         }
@@ -205,15 +225,18 @@ impl ServiceInfo {
     pub async fn new() -> Result<ServiceInfo, String> {
         let shared_config = aws_config::load_from_env().await;
         let ecs_client = aws_sdk_ecs::Client::new(&shared_config);
-        let service_url = crate::get_function_url().await?;
+        let service_url = crate::get_function_url().await?; // TODO: Get from metadata.
         let uri = std::env::var("ECS_CONTAINER_METADATA_URI_V4").map_err(|x| format!("{x:?}"))?;
         let uri = format!("{uri}/task");
         let resp = reqwest::get(uri).await.map_err(|x| format!("{x:?}"))?;
         let task: serde_json::Value = resp.json().await.map_err(|x| format!("{x:?}"))?;
+        // Get AZ.
         let az = task.get("AvailabilityZone").unwrap().as_str().unwrap();
         println!("Got AZ {az:?}");
+        // Get task arn.
         let task = task.get("TaskARN").unwrap().as_str().unwrap();
         println!("Got Task: {task}");
+        // Describe task to get namespace and name.
         let task = ecs_client
             .describe_tasks()
             .tasks(task)
@@ -222,6 +245,14 @@ impl ServiceInfo {
             .await
             .map_err(|x| format!("{x:?}"))?;
         let task = task.tasks().unwrap().first().unwrap();
+        // Get private url.
+        let container = task.containers().unwrap().first().unwrap();
+        let ni = container.network_interfaces().unwrap().first().unwrap();
+        let private_address = ni.private_ipv4_address().unwrap();
+        let port = crate::get_port().unwrap();
+        let private_url = format!("http://{private_address}:{port}/invoke");
+        println!("Private Url: {private_url}");
+        // Get service namespace and name.
         let group = task.group().unwrap();
         println!("Got group: {group}");
         let service: String = group[8..].into();
@@ -237,6 +268,7 @@ impl ServiceInfo {
             subsystem: subsystem.into(),
             namespace: namespace.into(),
             name: name.into(),
+            private_url,
         })
     }
 }

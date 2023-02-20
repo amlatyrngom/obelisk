@@ -1,4 +1,4 @@
-use common::adaptation::{Rescaler, ServerfulScalingState};
+use common::adaptation::{deploy::DeploymentInfo, Rescaler, ServerfulScalingState};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -32,6 +32,11 @@ impl Rescaler for MessagingRescaler {
         curr_timestamp: chrono::DateTime<chrono::Utc>,
         metrics: Vec<Value>,
     ) -> (u64, Value) {
+        // Read deployment.
+        let deployed_actor: DeploymentInfo =
+            serde_json::from_value(scaling_state.deployment.clone()).unwrap();
+        let deployed_actor = deployed_actor.msg_info.unwrap();
+        let mem_ratio = (deployed_actor.fn_mem as f64) / (deployed_actor.mem as f64);
         // Get old activity.
         let mut activity = if let Some(scaling_info) = &scaling_state.scaling_info {
             let scaling_info: MessagingScalingInfo =
@@ -57,14 +62,20 @@ impl Rescaler for MessagingRescaler {
         }
         // Compute moving average.
         let new_activity = if !force_spin_up {
-            total_active_secs / total_interval
+            let new_activity = total_active_secs / total_interval;
+            // Limit to 1 (>1 occurs in the presence of parallism).
+            if new_activity > 1.0 {
+                1.0
+            } else {
+                new_activity
+            }
         } else {
             10.0 // Forcibly spins up a new instance. From 100, the activity will slowly decrease if inactive.
         };
         activity = (1.0 - MOVING_FACTOR) * activity + MOVING_FACTOR * new_activity;
         // Compute price ratio.
         let ecs_cost = 0.012144 + 2.0 * 0.0013335; // Cost of 1vcpu and 2GB of RAM.
-        let lambda_cost = 2.0 * 0.0000166667 * 3600.0; // Cost of 2GB of RAM.
+        let lambda_cost = 2.0 * 0.0000166667 * 3600.0 * mem_ratio; // Cost of 2GB of RAM.
         let price_ratio = ecs_cost / lambda_cost;
         // Set new scale.
         let new_scale = u64::from(activity >= price_ratio);

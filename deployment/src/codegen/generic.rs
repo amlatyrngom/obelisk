@@ -100,6 +100,7 @@ pub fn gen_generic_aux() -> TokenStream {
             let invoke_path = warp::path!("invoke")
                 .and(warp::post())
                 .and(meta)
+                .and(warp::body::content_length_limit(1024 * 1024 * 1024)) // 1GB.
                 .and(warp::body::bytes())
                 .and(with_backend(backend))
                 .and_then(warp_backend_handler);

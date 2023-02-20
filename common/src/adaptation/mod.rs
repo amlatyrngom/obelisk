@@ -26,13 +26,14 @@ pub trait Rescaler: Send + Sync {
 }
 
 pub const RESCALING_INTERVAL: u64 = 10;
-pub const SERVERFUL_REFRESH_TIME: u64 = 5;
-pub const SERVERFUL_INACTIVE_TIME: u64 = 15;
+pub const SERVERFUL_REFRESH_TIME: u64 = 15;
+pub const SERVERFUL_INACTIVE_TIME: u64 = 25;
 
 /// Information about a serverful instance.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ServerfulInstance {
     pub url: String,
+    pub private_url: String,
     pub active_time: chrono::DateTime<chrono::Utc>,
     pub join_time: chrono::DateTime<chrono::Utc>,
     pub az: String,
@@ -452,7 +453,7 @@ impl AdapterScaling {
 }
 
 /// Cleanup stale instances.
-fn cleanup_instances(scaling_state: &mut ServerfulScalingState) {
+pub fn cleanup_instances(scaling_state: &mut ServerfulScalingState) {
     let mut to_delete = Vec::new();
     let grace_period = chrono::Duration::seconds(SERVERFUL_INACTIVE_TIME as i64);
     for (id, info) in scaling_state.peers.iter() {

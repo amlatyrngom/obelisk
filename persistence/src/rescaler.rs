@@ -46,11 +46,11 @@ impl Rescaler for LogRescaler {
         let total_interval = curr_timestamp
             .signed_duration_since(scaling_state.last_rescale)
             .num_seconds() as f64;
-        // Assume every flush increases latency by 10ms.
+        // Assume every flush increases latency by 15ms.
         let mut total_active_secs: f64 = 0.0;
         println!("Num metrics: {}", metrics.len());
         for _ in metrics.iter() {
-            total_active_secs += 0.01;
+            total_active_secs += 0.015;
         }
         // Compute moving average.
         let new_activity = total_active_secs / total_interval;
@@ -61,7 +61,7 @@ impl Rescaler for LogRescaler {
         // let lambda_cost = mem_size * 0.0000166667 * 3600.0; // Cost of running a lambda.
         // let price_ratio = ecs_cost / lambda_cost;
         // Set new scale.
-        let new_scale = if activity >= 0.1 { 6 } else { 0 };
+        let new_scale = if activity >= 0.25 { 6 } else { 0 };
         let new_scaling_info = LogScalingInfo { activity };
         (new_scale, serde_json::to_value(&new_scaling_info).unwrap())
     }

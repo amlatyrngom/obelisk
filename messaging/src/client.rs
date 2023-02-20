@@ -1,9 +1,12 @@
+use super::handler::{LambdaReq, LambdaResp};
 use super::SUBSYSTEM_NAME;
 use common::adaptation::frontend::AdapterFrontend;
 use common::{full_messaging_name, has_external_access};
 
-const NUM_RECEIVE_RETRIES: i32 = 20; // ~2 seconds.
+const NUM_RECEIVE_RETRIES: i32 = 50; // ~3 seconds.
+const NUM_INDIRECT_RETRIES: i32 = 5; // ~500ms.
 
+#[derive(Clone)]
 pub struct MessagingClient {
     direct_client: reqwest::Client,
     lambda_client: aws_sdk_lambda::Client,
@@ -35,13 +38,13 @@ impl MessagingClient {
         )
         .await;
         MessagingClient {
-            lambda_client,
             s3_client,
+            lambda_client,
             frontend,
             actor_function_name,
             direct_client: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(1))
-                .timeout(std::time::Duration::from_secs(5))
+                .connect_timeout(std::time::Duration::from_millis(500))
+                .timeout(std::time::Duration::from_millis(5000))
                 .build()
                 .unwrap(),
         }
@@ -143,14 +146,94 @@ impl MessagingClient {
         }
     }
 
-    /// Send message to message queue.
-    /// Use get_message_from_function or get_message_from_http to receive message.
-    async fn indirect_message(
+    /// Directly call lambda.
+    async fn lambda_message(&self, msg: &str, payload: &[u8]) -> Option<(String, Vec<u8>)> {
+        let arg = LambdaReq::Msg(msg.into(), payload.into());
+        let arg = serde_json::to_vec(&arg).unwrap(); // Inefficent with large payload.
+        let arg = aws_smithy_types::Blob::new(arg);
+        let resp = self
+            .lambda_client
+            .invoke()
+            .function_name(&self.actor_function_name)
+            .payload(arg.clone())
+            .send()
+            .await;
+        match resp {
+            Ok(resp) => {
+                if let Some(x) = resp.function_error() {
+                    if !x.is_empty() {
+                        return None;
+                    }
+                }
+                let resp: Vec<u8> = resp.payload().unwrap().clone().into_inner();
+                let resp: LambdaResp = serde_json::from_slice(&resp).unwrap();
+                return if let LambdaResp::Msg(resp) = resp {
+                    resp
+                } else {
+                    panic!("Impossible response type");
+                };
+            }
+            Err(x) => {
+                println!("{x:?}");
+                return None;
+            }
+        };
+    }
+
+    /// Send message to url using http.
+    async fn message_with_http(
         &self,
-        msg_id: &str,
+        url: &str,
         msg: &str,
         payload: &[u8],
     ) -> Option<(String, Vec<u8>)> {
+        let resp = self
+            .direct_client
+            .post(url)
+            .header("obelisk-meta", msg)
+            .header("content-length", payload.len())
+            .body(payload.to_vec())
+            .send()
+            .await;
+        match resp {
+            Ok(resp) => {
+                let content: String = resp
+                    .headers()
+                    .get("obelisk-meta")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .into();
+                let payload = resp.bytes().await.unwrap().to_vec();
+                // println!(
+                // "Did message with http: {content:?}, payload_len={}",
+                // payload.len()
+                // );
+                Some((content, payload))
+            }
+            Err(err) => {
+                println!("Direct Message Error: {err:?}");
+                None
+            }
+        }
+    }
+
+    /// Wake up the messaging function.
+    async fn wake_up_messaging_function(lambda_client: aws_sdk_lambda::Client, fn_name: String) {
+        let msg_id = super::handler::LambdaReq::IndirectMsg;
+        let msg_id = serde_json::to_vec(&msg_id).unwrap();
+        let fn_arg = aws_smithy_types::Blob::new(msg_id);
+        let _ = lambda_client
+            .invoke()
+            .function_name(&fn_name)
+            .payload(fn_arg)
+            .send()
+            .await;
+    }
+
+    /// Indirect message.
+    async fn indirect_message(&self, msg: &str, payload: &[u8]) -> Option<(String, Vec<u8>)> {
+        let msg_id = uuid::Uuid::new_v4().to_string();
         {
             // Wake up messaging function.
             let lambda_client = self.lambda_client.clone();
@@ -162,6 +245,7 @@ impl MessagingClient {
 
         // Write message to S3.
         let s3_send_key = format!("{}/send/{msg_id}", common::tmp_s3_dir());
+        println!("Sending to S3: {s3_send_key:?}");
         let s3_recv_key = format!("{}/recv/{msg_id}", common::tmp_s3_dir());
         let body = tokio::task::block_in_place(move || {
             let body: (String, String, Vec<u8>) = (msg_id.into(), msg.into(), payload.into());
@@ -185,7 +269,7 @@ impl MessagingClient {
         };
 
         // Repeatedly try reading response and waking up messaging function if response not found.
-        for _ in 0..NUM_RECEIVE_RETRIES {
+        for _n in 0..NUM_INDIRECT_RETRIES {
             // Wait for processing.
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             // Try reading.
@@ -224,64 +308,14 @@ impl MessagingClient {
         None
     }
 
-    /// Wake up the messaging function.
-    async fn wake_up_messaging_function(lambda_client: aws_sdk_lambda::Client, fn_name: String) {
-        let empty_json = serde_json::Value::Null.to_string();
-        let fn_arg = aws_smithy_types::Blob::new(empty_json.as_bytes());
-        // Async invokes have weird behavior (they keep being retried until long after).
-        // So do fake async.
-        tokio::spawn(async move {
-            let _ = lambda_client
-                .invoke()
-                .function_name(&fn_name)
-                .payload(fn_arg)
-                .send()
-                .await;
-        });
-    }
-
-    /// Send message to url using http.
-    async fn message_with_http(
-        &self,
-        url: &str,
-        msg_id: &str,
-        msg: &str,
-        payload: &[u8],
-    ) -> Option<(String, Vec<u8>)> {
-        let msg_meta = serde_json::to_string(&(msg_id, msg)).unwrap();
-        let resp = self
-            .direct_client
-            .post(url)
-            .header("obelisk-meta", msg_meta)
-            .body(payload.to_vec())
-            .send()
-            .await;
-        if let Ok(resp) = resp {
-            let content: String = resp
-                .headers()
-                .get("obelisk-meta")
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .into();
-            let payload = resp.bytes().await.unwrap().to_vec();
-            println!(
-                "Did message with http: {content:?}, payload_len={}",
-                payload.len()
-            );
-            Some((content, payload))
-        } else {
-            None
-        }
-    }
-
     /// Get actor's url.
     async fn get_actor_url(&self) -> Option<String> {
+        // Find latest actor to successfully join.
         let instances = self.frontend.serverful_instances().await;
         let join_time = instances.into_iter().fold(None, |curr, next| match curr {
             None => Some((next.join_time, next.url)),
             Some((curr_join_time, curr_url)) => {
-                if curr_join_time < next.join_time {
+                if curr_join_time > next.join_time {
                     Some((curr_join_time, curr_url))
                 } else {
                     Some((next.join_time, next.url))
@@ -291,55 +325,82 @@ impl MessagingClient {
         join_time.map(|(_, url)| url)
     }
 
+    /// Send message.
     pub async fn send_message_internal(
         &self,
         msg: &str,
         payload: &[u8],
     ) -> (Option<(String, Vec<u8>)>, bool) {
-        let msg_id: String = uuid::Uuid::new_v4().to_string();
-        // Add metric. For now let it be empty, since we only need number of invocations.
-        // TODO: Add duration here.
         let start_time = std::time::Instant::now();
-        // Try fast path with direct message.
-        let actor_url = self.get_actor_url().await;
-        let resp = match actor_url {
-            None => None,
-            Some(url) => self.message_with_http(&url, &msg_id, msg, payload).await,
-        };
-        // Return resp if direct message possible.
-        match resp {
-            Some(resp) => {
+        for n in 0..NUM_RECEIVE_RETRIES {
+            if n > 0 {
+                // Sleep random amount for client-side congestion control.
+                let f = rand::random::<f64>(); // Number between 0-1.
+                let duration_ms = (f * 20.0).ceil() as u64; // Number between 1-20ms.
+                tokio::time::sleep(std::time::Duration::from_millis(duration_ms)).await;
+            }
+            // Try fast path with direct message.
+            let actor_url = self.get_actor_url().await;
+            let resp = match &actor_url {
+                None => None,
+                Some(url) => match self.message_with_http(url, msg, payload).await {
+                    Some(resp) => Some(resp),
+                    None => self.indirect_message(msg, payload).await,
+                },
+            };
+
+            let (resp, is_direct) = match resp {
+                Some(resp) => {
+                    // Return resp if direct message possible.
+                    (Some(resp), true)
+                }
+                None => {
+                    // // Async update serverful target if unreachable.
+                    // if actor_url.is_some() {
+                    //     let frontend = self.frontend.clone();
+                    //     tokio::spawn(async move {
+                    //         frontend.force_read_instances().await;
+                    //     });
+                    // }
+                    // Try slow path.
+                    let resp = match self.lambda_message(msg, payload).await {
+                        Some(resp) => Some(resp),
+                        None => self.indirect_message(msg, payload).await,
+                    };
+                    (resp, false)
+                }
+            };
+
+            // Return resp.
+            if resp.is_some() {
                 let end_time = std::time::Instant::now();
-                let duration = end_time.duration_since(start_time).as_secs_f64();
-                println!("Duration: {duration:?}");
+                let duration = end_time.duration_since(start_time);
+                println!("Duration: {duration:?}. Is Direct: {is_direct}");
+                let mut duration = duration.as_secs_f64();
+                if is_direct {
+                    // Add overhead of a lambda call.
+                    // This is to prevent unecessary scale downs followed by scale up.
+                    duration += 0.012;
+                }
                 self.frontend
                     .collect_metric(serde_json::to_value(duration).unwrap())
                     .await;
-                return (Some(resp), true);
+                return (resp, is_direct);
             }
-            None => {
-                // Update serverful target.
-                let frontend = self.frontend.clone();
-                tokio::spawn(async move {
-                    frontend.force_read_instances().await;
-                });
-            }
-        };
-        // Try slow path with message queue.
-        let resp = (self.indirect_message(&msg_id, msg, payload).await, false);
-        let end_time = std::time::Instant::now();
-        let duration = end_time.duration_since(start_time);
-        println!("Duration: {duration:?}");
-        let duration = duration.as_secs_f64();
-        self.frontend
-            .collect_metric(serde_json::to_value(duration).unwrap())
-            .await;
-        resp
+        }
+        (None, false)
     }
 
     /// Send message to an actor and get response back.
     pub async fn send_message(&self, msg: &str, payload: &[u8]) -> Option<(String, Vec<u8>)> {
         let (resp, _) = self.send_message_internal(msg, payload).await;
+        if resp.is_none() {
+            // When response is none, forcibly spin up.
+            let this = self.clone();
+            tokio::spawn(async move {
+                this.spin_up().await;
+            });
+        }
         resp
     }
 
@@ -347,17 +408,17 @@ impl MessagingClient {
     /// Returns true if already spun up.
     pub async fn spin_up(&self) {
         loop {
+            // Hacky way to signal spin up.
+            let duration = 0.0;
+            self.frontend
+                .collect_metric(serde_json::to_value(duration).unwrap())
+                .await;
             // Try fast path with direct message.
             let actor_url = self.get_actor_url().await;
             match actor_url {
                 None => {}
                 Some(_url) => return,
             }
-            // Hacky way to signal spin up.
-            let duration = 0.0;
-            self.frontend
-                .collect_metric(serde_json::to_value(duration).unwrap())
-                .await;
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
     }
@@ -391,13 +452,13 @@ mod tests {
         let mc = MessagingClient::new("messaging", "echo").await;
         // Send messages without payloads.
         let mut num_direct_calls = 0;
-        for i in 0..100 {
-            let (resp, was_direct) = mc.send_message_internal("essai", &[]).await;
-            println!("Round {}/100. Resp: {resp:?}", i + 1);
+        for _ in 0..1000 {
+            let (_resp, was_direct) = mc.send_message_internal("essai", &[]).await;
+            // println!("Round {}/100. Resp: {resp:?}", i + 1);
             if was_direct {
                 num_direct_calls += 1;
             }
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         // The last ten rounds should almost certainly be direct calls.
         println!("Number of direct calls: {num_direct_calls}.");
@@ -409,34 +470,25 @@ mod tests {
         run_scaling_test().await;
     }
 
-    async fn run_basic_counter_test() {
-        let mc = MessagingClient::new("persistence", "counter").await;
-        // Send enough messages to trigger an actor scale up.
+    async fn run_parallel_scaling_test() {
+        let mc = MessagingClient::new("messaging", "echo").await;
         let req_msg = "essai";
         let req_payload = vec![];
-        for _ in 0..100 {
-            let resp = mc.send_message(req_msg, &req_payload).await;
-            if let Some((resp_msg, resp_payload)) = resp {
-                println!("Resp: ({resp_msg:?}, {resp_payload:?})");
-                let duration_ms: u64 = resp_msg.parse().unwrap();
-                let duration = std::time::Duration::from_millis(duration_ms);
-                println!("Duration: {duration:?}");
-                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-            }
-        }
-        // // Send enough messages to trigger a log scale up.
-        // for _ in 0..100 {
-        //     let (resp_msg, resp_payload) = mc.send_message(req_msg, &req_payload).await.unwrap();
-        //     println!("Resp: ({resp_msg:?}, {resp_payload:?})");
-        //     let duration_ms: u64 = resp_msg.parse().unwrap();
-        //     let duration = std::time::Duration::from_millis(duration_ms);
-        //     println!("Duration: {duration:?}");
-        //     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        // }
+        let resp1 = mc.send_message(req_msg, &req_payload);
+        let resp2 = mc.send_message(req_msg, &req_payload);
+        let resp3 = mc.send_message(req_msg, &req_payload);
+        let resp4 = mc.send_message(req_msg, &req_payload);
+        let resp5 = mc.send_message(req_msg, &req_payload);
+        let resp6 = mc.send_message(req_msg, &req_payload);
+        let resp7 = mc.send_message(req_msg, &req_payload);
+        let resp8 = mc.send_message(req_msg, &req_payload);
+
+        let resp = tokio::join!(resp1, resp2, resp3, resp4, resp5, resp6, resp7, resp8);
+        println!("Resp: {resp:?}");
     }
 
-    #[tokio::test]
-    async fn basic_counter_test() {
-        run_basic_counter_test().await;
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    async fn parallel_scaling_test() {
+        run_parallel_scaling_test().await;
     }
 }
