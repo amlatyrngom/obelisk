@@ -6,12 +6,12 @@ use crate::{clean_die, full_scaler_name, full_scaling_queue_name, scaling_table_
 use aws_sdk_dynamodb::model::AttributeValue;
 use aws_sdk_sqs::model::QueueAttributeName;
 use serde_json::Value;
-use std::sync::Arc;
+use std::sync::{atomic, Arc};
 use tokio::signal::unix;
 use tokio::sync::RwLock;
 
 pub const MAX_SQS_SIZE_KB: usize = 256 - 64; // Subtract 64 to give user some leeway.
-pub const MAX_METRIC_SIZE_KB: usize = 4;
+pub const MAX_METRIC_SIZE_KB: usize = 1;
 pub const MAX_METRIC_BUFFER: usize = MAX_SQS_SIZE_KB / MAX_METRIC_SIZE_KB;
 pub const MAX_METRIC_PUSH_INTERVAL: u64 = 5;
 const NUM_RETRIES: u64 = 30;
@@ -25,6 +25,7 @@ pub struct AdapterFrontend {
     inner: Arc<RwLock<AdapterFrontendInner>>,
     pub clients: Option<FrontendClients>,
     pub dynamo_client: aws_sdk_dynamodb::Client,
+    pub closed: Arc<atomic::AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -128,6 +129,7 @@ impl AdapterFrontend {
                 inner,
                 has_external_access,
                 dynamo_client,
+                closed: Arc::new(atomic::AtomicBool::new(false)),
             };
 
             {
@@ -401,6 +403,9 @@ impl AdapterFrontend {
             tokio::time::interval(std::time::Duration::from_secs(RESCALING_INTERVAL));
         refresh_interval.tick().await;
         loop {
+            if self.closed.load(atomic::Ordering::Acquire) {
+                return;
+            }
             let terminate_signal = unix::SignalKind::terminate();
             let mut sigterm = unix::signal(terminate_signal).unwrap();
             let sigint = tokio::signal::ctrl_c();

@@ -129,13 +129,6 @@ impl AdapterScaling {
         let queue_name = full_scaling_queue_name(&self.subsystem, &req.namespace, &req.name);
         // Get scaling state.
         let mut scaling_state = self.get_scaling_state(req).await;
-        // Check if only running scaler.
-        let has_lease = self.leaser.renew(&queue_name, false).await;
-        if !has_lease {
-            println!("No lease: {}!", self.leaser.lease_id());
-            return scaling_state;
-        }
-        println!("Has lease: {}!", self.leaser.lease_id());
         // Try to initialize.
         if !scaling_state.initialized {
             println!("Initializing!");
@@ -151,6 +144,13 @@ impl AdapterScaling {
             .signed_duration_since(scaling_state.last_rescale);
         if since_last_scaling < chrono::Duration::seconds(RESCALING_INTERVAL as i64) {
             println!("Since last scaling: {since_last_scaling:?}!");
+            return scaling_state;
+        }
+        // Check if only running scaler.
+        println!("Has lease: {}!", self.leaser.lease_id());
+        let has_lease = self.leaser.renew(&queue_name, false).await;
+        if !has_lease {
+            println!("No lease: {}!", self.leaser.lease_id());
             return scaling_state;
         }
         // Read and apply metrics.
@@ -265,6 +265,7 @@ impl AdapterScaling {
             .last_rescale
             .checked_add_signed(chrono::Duration::minutes(10));
         let gc_ttl = gc_ttl.unwrap().timestamp().to_string();
+        println!("Writing scaling state: {scaling_state:?}!");
         let mut put = self
             .dynamo_client
             .put_item()
@@ -290,6 +291,7 @@ impl AdapterScaling {
         let resp = put.send().await;
         if resp.is_err() {
             let err = format!("{resp:?}");
+            println!("Dynamodb err: {err}");
             if !err.contains("ConditionalCheckFailedException") {
                 return clean_die(&format!("Unhandled dynamo error: {err}")).await;
             }

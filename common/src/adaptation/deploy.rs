@@ -40,6 +40,7 @@ pub struct MessagingSpec {
     pub cpus: i32,
     pub mem: i32,
     pub fn_mem: i32,
+    pub caller_mem: i32,
     pub timeout: i32,
 }
 
@@ -69,6 +70,7 @@ pub struct MessagingDeploymentInfo {
     pub cpus: i32,
     pub mem: i32,
     pub fn_mem: i32,
+    pub caller_mem: i32,
     pub timeout: i32,
 }
 

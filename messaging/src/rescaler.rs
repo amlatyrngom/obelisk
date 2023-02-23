@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Factor for moving average.
-const MOVING_FACTOR: f64 = 0.25;
+const MOVING_FACTOR: f64 = 0.1;
 /// Value to force spin up.
 const FORCE_THRESHOLD: f64 = 1e-4;
 
@@ -11,6 +11,7 @@ const FORCE_THRESHOLD: f64 = 1e-4;
 #[derive(Serialize, Deserialize)]
 struct MessagingScalingInfo {
     activity: f64,
+    waiting: f64,
 }
 
 /// Rescaler for functions.
@@ -36,20 +37,23 @@ impl Rescaler for MessagingRescaler {
         let deployed_actor: DeploymentInfo =
             serde_json::from_value(scaling_state.deployment.clone()).unwrap();
         let deployed_actor = deployed_actor.msg_info.unwrap();
-        let mem_ratio = (deployed_actor.fn_mem as f64) / (deployed_actor.mem as f64);
+        let ecs_vcpu = deployed_actor.mem as f64 / 2048.0;
+        let lambda_mem = deployed_actor.fn_mem as f64 / 1024.0;
+        let caller_mem = deployed_actor.caller_mem as f64 / 1024.0;
         // Get old activity.
-        let mut activity = if let Some(scaling_info) = &scaling_state.scaling_info {
+        let (mut activity, mut waiting) = if let Some(scaling_info) = &scaling_state.scaling_info {
             let scaling_info: MessagingScalingInfo =
                 serde_json::from_value(scaling_info.clone()).unwrap();
-            scaling_info.activity
+            (scaling_info.activity, scaling_info.waiting)
         } else {
-            0.0
+            (0.0, 0.0)
         };
         // Compute the total activity of the new metrics.
         let total_interval = curr_timestamp
             .signed_duration_since(scaling_state.last_rescale)
             .num_seconds() as f64;
         let mut total_active_secs: f64 = 0.0;
+        let mut total_waiting_secs: f64 = 0.0;
         let mut force_spin_up = false;
         println!("Num metrics: {}", metrics.len());
         for m in metrics.iter() {
@@ -58,7 +62,14 @@ impl Rescaler for MessagingRescaler {
                 // Hacky way to signal forcible spin up.
                 force_spin_up = true;
             }
-            total_active_secs += duration_secs;
+            // Time spent active.
+            let active_secs = duration_secs - 0.010; // Subtract indirect time.
+            if active_secs < 0.001 {
+                total_active_secs += 0.001; // Minimum 1ms.
+            } else {
+                total_active_secs += active_secs;
+            }
+            total_waiting_secs += 0.010; // Extra time spent waiting by caller.
         }
         // Compute moving average.
         let new_activity = if !force_spin_up {
@@ -70,16 +81,19 @@ impl Rescaler for MessagingRescaler {
                 new_activity
             }
         } else {
-            10.0 // Forcibly spins up a new instance. From 100, the activity will slowly decrease if inactive.
+            10.0 // Forcibly spins up a new instance.
         };
+        let new_waiting = total_waiting_secs / total_interval;
         activity = (1.0 - MOVING_FACTOR) * activity + MOVING_FACTOR * new_activity;
+        waiting = (1.0 - MOVING_FACTOR) * waiting + MOVING_FACTOR * new_waiting;
         // Compute price ratio.
-        let ecs_cost = 0.012144 + 2.0 * 0.0013335; // Cost of 1vcpu and 2GB of RAM.
-        let lambda_cost = 2.0 * 0.0000166667 * 3600.0 * mem_ratio; // Cost of 2GB of RAM.
-        let price_ratio = ecs_cost / lambda_cost;
+        let ecs_cost = 0.015 * ecs_vcpu;
+        let lambda_cost = 0.0000166667 * 3600.0 * lambda_mem * activity;
+        let waiting_cost = 0.0000166667 * 3600.0 * caller_mem * waiting;
+        let price_ratio = (lambda_cost + waiting_cost) / ecs_cost;
         // Set new scale.
-        let new_scale = u64::from(activity >= price_ratio);
-        let new_scaling_info = MessagingScalingInfo { activity };
+        let new_scale = u64::from(price_ratio >= 1.0);
+        let new_scaling_info = MessagingScalingInfo { activity, waiting };
         (new_scale, serde_json::to_value(&new_scaling_info).unwrap())
     }
 }
@@ -182,7 +196,10 @@ mod tests {
             let scaling_info = if let Some(scaling_info) = scaling_state.scaling_info {
                 serde_json::from_value(scaling_info).unwrap()
             } else {
-                MessagingScalingInfo { activity: 0.0 }
+                MessagingScalingInfo {
+                    activity: 0.0,
+                    waiting: 0.0,
+                }
             };
             println!("Checking: lo={activity_lo}; hi={activity_hi};");
             assert!(scaling_info.activity > activity_lo);

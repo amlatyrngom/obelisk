@@ -48,6 +48,7 @@ pub struct Messaging {
     path: String,
     mem_size: i32,
     fn_mem: Option<i32>,
+    caller_mem: Option<i32>,
     timeout: i32,
 }
 

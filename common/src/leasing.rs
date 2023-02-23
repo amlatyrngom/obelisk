@@ -5,12 +5,12 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 /// Within is time period, no need to recheck state store.
-const LEASE_GUARANTEE_DURATION: i64 = 6;
+const LEASE_GUARANTEE_DURATION: i64 = 18;
 /// After this time period without renewal, the lease is lost.
-const LEASE_GRACE_DURATION: i64 = 18;
+const LEASE_GRACE_DURATION: i64 = 30;
 /// Lease will be refreshed in the background if owned for this long.
 /// Keep this lower than `LEASE_GUARANTEE_DURATION - 1`.
-const LEASE_REFRESH_DURATION: i64 = 4;
+const LEASE_REFRESH_DURATION: i64 = 12;
 
 /// Tracks ownership of leases locally.
 #[derive(Clone, Debug)]
@@ -237,6 +237,7 @@ impl Leaser {
         // Lease content:
         // lease_id: id of lease.
         // value: same as lease_id to allow user to read lease.
+        println!("Writing lease.");
         let resp = self
             .dynamo_client
             .put_item()
@@ -265,6 +266,7 @@ impl Leaser {
         let owns = if resp.is_err() {
             let err = format!("{resp:?}");
             if err.contains("ConditionalCheckFailedException") {
+                println!("Lease condition fail: {err:?}");
                 false
             } else {
                 // We don't allow arbitrary dynamo errors.

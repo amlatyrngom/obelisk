@@ -4,13 +4,13 @@ use common::adaptation::frontend::AdapterFrontend;
 use common::{full_messaging_name, has_external_access};
 
 const NUM_RECEIVE_RETRIES: i32 = 50; // ~3 seconds.
-const NUM_INDIRECT_RETRIES: i32 = 5; // ~500ms.
+const _NUM_INDIRECT_RETRIES: i32 = 5; // ~500ms.
 
 #[derive(Clone)]
 pub struct MessagingClient {
     direct_client: reqwest::Client,
     lambda_client: aws_sdk_lambda::Client,
-    s3_client: aws_sdk_s3::Client,
+    _s3_client: aws_sdk_s3::Client,
     frontend: AdapterFrontend,
     actor_function_name: String,
 }
@@ -38,7 +38,7 @@ impl MessagingClient {
         )
         .await;
         MessagingClient {
-            s3_client,
+            _s3_client: s3_client,
             lambda_client,
             frontend,
             actor_function_name,
@@ -219,7 +219,7 @@ impl MessagingClient {
     }
 
     /// Wake up the messaging function.
-    async fn wake_up_messaging_function(lambda_client: aws_sdk_lambda::Client, fn_name: String) {
+    async fn _wake_up_messaging_function(lambda_client: aws_sdk_lambda::Client, fn_name: String) {
         let msg_id = super::handler::LambdaReq::IndirectMsg;
         let msg_id = serde_json::to_vec(&msg_id).unwrap();
         let fn_arg = aws_smithy_types::Blob::new(msg_id);
@@ -232,14 +232,14 @@ impl MessagingClient {
     }
 
     /// Indirect message.
-    async fn indirect_message(&self, msg: &str, payload: &[u8]) -> Option<(String, Vec<u8>)> {
+    async fn _indirect_message(&self, msg: &str, payload: &[u8]) -> Option<(String, Vec<u8>)> {
         let msg_id = uuid::Uuid::new_v4().to_string();
         {
             // Wake up messaging function.
             let lambda_client = self.lambda_client.clone();
             let lambda_name = self.actor_function_name.clone();
             tokio::spawn(async move {
-                Self::wake_up_messaging_function(lambda_client, lambda_name).await;
+                Self::_wake_up_messaging_function(lambda_client, lambda_name).await;
             });
         }
 
@@ -253,7 +253,7 @@ impl MessagingClient {
         });
         let body = aws_sdk_s3::types::ByteStream::from(body);
         let resp = self
-            .s3_client
+            ._s3_client
             .put_object()
             .bucket(&common::bucket_name())
             .key(&s3_send_key)
@@ -269,12 +269,12 @@ impl MessagingClient {
         };
 
         // Repeatedly try reading response and waking up messaging function if response not found.
-        for _n in 0..NUM_INDIRECT_RETRIES {
+        for _n in 0.._NUM_INDIRECT_RETRIES {
             // Wait for processing.
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             // Try reading.
             let resp = self
-                .s3_client
+                ._s3_client
                 .get_object()
                 .bucket(&common::bucket_name())
                 .key(&s3_recv_key)
@@ -283,7 +283,7 @@ impl MessagingClient {
             match resp {
                 Ok(resp) => {
                     // Delete response and return it.
-                    let s3_client = self.s3_client.clone();
+                    let s3_client = self._s3_client.clone();
                     tokio::spawn(async move {
                         let _ = s3_client
                             .delete_object()
@@ -301,7 +301,7 @@ impl MessagingClient {
                     // Wake up messaging function in case it is not active.
                     let lambda_client = self.lambda_client.clone();
                     let lambda_name = self.actor_function_name.clone();
-                    Self::wake_up_messaging_function(lambda_client, lambda_name).await;
+                    Self::_wake_up_messaging_function(lambda_client, lambda_name).await;
                 }
             }
         }
@@ -345,7 +345,7 @@ impl MessagingClient {
                 None => None,
                 Some(url) => match self.message_with_http(url, msg, payload).await {
                     Some(resp) => Some(resp),
-                    None => self.indirect_message(msg, payload).await,
+                    None => None,
                 },
             };
 
@@ -365,7 +365,7 @@ impl MessagingClient {
                     // Try slow path.
                     let resp = match self.lambda_message(msg, payload).await {
                         Some(resp) => Some(resp),
-                        None => self.indirect_message(msg, payload).await,
+                        None => None,
                     };
                     (resp, false)
                 }
@@ -380,7 +380,7 @@ impl MessagingClient {
                 if is_direct {
                     // Add overhead of a lambda call.
                     // This is to prevent unecessary scale downs followed by scale up.
-                    duration += 0.012;
+                    duration += 0.010;
                 }
                 self.frontend
                     .collect_metric(serde_json::to_value(duration).unwrap())

@@ -86,6 +86,7 @@ impl AdapterBackend {
             let old_id = scaling_state.state_id.clone();
             scaling_state.state_id = uuid::Uuid::new_v4().to_string();
             scaling_state.peers.remove(&self.svc_info.id);
+            println!("Writing scaling state for deregister!");
             let updated = self
                 .adapter_scaling
                 .write_scaling_state(&mut scaling_state, &old_id)
@@ -105,6 +106,7 @@ impl AdapterBackend {
         };
         let req = serde_json::to_vec(&req).unwrap();
         let req = aws_smithy_types::Blob::new(req);
+        println!("Invoking scaler!");
         let resp = self
             .lambda_client
             .invoke()
@@ -152,6 +154,7 @@ impl AdapterBackend {
                 let mut inner = self.inner.write().await;
                 inner.scaling_state = Some(scaling_state.clone());
             };
+            println!("Writing scaling state for refresh!");
             let updated = self
                 .adapter_scaling
                 .write_scaling_state(&mut scaling_state, &old_id)
