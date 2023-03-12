@@ -20,7 +20,8 @@ const MAX_REPLICATION_FAILURES: usize = 100;
 pub struct PersistentLog {
     inner: Arc<Mutex<PersistentLogInner>>,
     replication_lock: Arc<RwLock<()>>,
-    flush_lock: Arc<Mutex<()>>,
+    db_lock: Arc<Mutex<()>>,
+    flush_lock: Arc<RwLock<()>>,
     failed_replications: Arc<atomic::AtomicUsize>,
     owner_id: usize,
     direct_client: reqwest::Client,
@@ -40,6 +41,7 @@ struct PersistentLogInner {
     new_entries_size: usize,            // Total size of enqueued entries.
     instances: Vec<ServerfulInstance>,  // Instances to replicate to.
     terminating: bool,                  // Actor terminating.
+    db_queue: Vec<(usize, usize, Bytes, mpsc::Sender<PersistedMode>)>, // Waiting to be written.
 }
 
 #[derive(Debug)]
@@ -55,7 +57,14 @@ impl PersistentLog {
         let actor_function_name = common::full_messaging_name(namespace, name);
         tokio::spawn(async move {
             let shared_config = aws_config::load_from_env().await;
-            let lambda_client = aws_sdk_lambda::Client::new(&shared_config);
+            let lambda_config = aws_sdk_lambda::config::Builder::from(&shared_config)
+                .retry_config(
+                    aws_sdk_lambda::config::retry::RetryConfig::standard()
+                        .with_initial_backoff(std::time::Duration::from_millis(10))
+                        .with_max_attempts(10),
+                )
+                .build();
+            let lambda_client = aws_sdk_lambda::Client::from_conf(lambda_config);
             let arg = serde_json::json!("ReleaseLock");
             let arg = serde_json::to_vec(&arg).unwrap();
             let arg = aws_smithy_types::Blob::new(arg);
@@ -83,7 +92,7 @@ impl PersistentLog {
     }
 
     /// Create a new persistent log.
-    pub async fn new(namespace: &str, name: &str) -> Self {
+    pub async fn new(namespace: &str, name: &str) -> Result<Self, String> {
         let mode = std::env::var("EXECUTION_MODE").unwrap_or_else(|_| "".into());
         if mode == ECS_MODE {
             // Remove potential lambda's lock.
@@ -95,7 +104,7 @@ impl PersistentLog {
     }
 
     /// Sync version of new.
-    fn new_sync(handle: Handle, namespace: &str, name: &str) -> Self {
+    fn new_sync(handle: Handle, namespace: &str, name: &str) -> Result<Self, String> {
         println!("Creating persistent log!");
         let mode = std::env::var("EXECUTION_MODE").unwrap_or_else(|_| ECS_MODE.into());
         let shared_dir = common::shared_storage_prefix();
@@ -110,6 +119,10 @@ impl PersistentLog {
         // }
 
         let db = Database::new(&storage_dir, "main", true);
+        if db.is_err() {
+            return Err(db.err().unwrap());
+        }
+        let db = db.unwrap();
         // First, use db to retrieve and update ownership and quorum information
         println!("Setting up persistent log!");
         let mut conn = db.pool.get().unwrap();
@@ -199,6 +212,7 @@ impl PersistentLog {
             new_entries: Vec::new(),
             instances: Vec::new(), // Will be set in initialize().
             terminating: false,
+            db_queue: Vec::new(),
         }));
         println!("Creating frontend");
         let front_end = handle
@@ -207,11 +221,12 @@ impl PersistentLog {
             inner,
             db,
             owner_id: my_owner_id,
-            flush_lock: Arc::new(Mutex::new(())),
+            flush_lock: Arc::new(RwLock::new(())),
+            db_lock: Arc::new(Mutex::new(())),
             replication_lock: Arc::new(RwLock::new(())),
             direct_client: reqwest::ClientBuilder::new()
-                .connect_timeout(std::time::Duration::from_secs(2))
-                .timeout(std::time::Duration::from_secs(10))
+                .connect_timeout(std::time::Duration::from_millis(100)) // Short on purpose.
+                .timeout(std::time::Duration::from_millis(50)) // Short on purpose.
                 .build()
                 .unwrap(),
             handle,
@@ -224,7 +239,7 @@ impl PersistentLog {
         plog.handle.block_on(async {
             plog.initialize(old_instances).await;
         });
-        plog
+        Ok(plog)
     }
 
     /// Get current flush lsn.
@@ -251,12 +266,16 @@ impl PersistentLog {
         lsn
     }
 
-    /// Flush log entries.
-    pub async fn flush(&self) -> usize {
+    pub async fn flush_at(&self, at_lsn: Option<usize>) -> usize {
         // Only allow one flush at a time, but also allow enqueues while flushing.
-        let _l = self.flush_lock.lock().await;
+        let _l = self.flush_lock.write().await;
         let (entries, entries_size, curr_lsn, persisted_lsn, instances) = {
             let mut inner = self.inner.lock().await;
+            if let Some(at_lsn) = at_lsn {
+                if inner.flush_lsn >= at_lsn {
+                    return inner.flush_lsn;
+                }
+            }
             // Get and reset size.
             let entries_size = inner.new_entries_size;
             inner.new_entries_size = 0;
@@ -289,6 +308,11 @@ impl PersistentLog {
             });
         }
         curr_lsn
+    }
+
+    /// Flush log entries.
+    pub async fn flush(&self) -> usize {
+        self.flush_at(None).await
     }
 
     /// Deserialize in a predictable manner.
@@ -333,6 +357,7 @@ impl PersistentLog {
         let entries = fast_serialize(&entries, entries_size).await;
         let entries = bytes::Bytes::from(entries);
         // Send to database and to replicas.
+        // let start_time = std::time::Instant::now();
         let (tx, mut rx) = mpsc::channel(2);
         {
             let tx = tx.clone();
@@ -350,12 +375,18 @@ impl PersistentLog {
         match persisted {
             PersistedMode::Database => {
                 // On db, persistence is guaranteed. So async recv remaining.
+                // let end_time = std::time::Instant::now();
+                // let duration = end_time.duration_since(start_time);
+                // println!("Persisted on DB. Duration: {duration:?}.");
                 tokio::spawn(async move {
                     let _persisted = rx.recv().await;
                 });
             }
             PersistedMode::Replicas(replicated) => {
                 if replicated {
+                    // let end_time = std::time::Instant::now();
+                    // let duration = end_time.duration_since(start_time);
+                    // println!("Persisted on replicas. Duration: {duration:?}.");
                     // When replicated on a quorum, persistence is guaranteed. So async drain.
                     tokio::spawn(async move {
                         let _persisted = rx.recv().await;
@@ -363,6 +394,9 @@ impl PersistentLog {
                 } else {
                     // Without a quorum, we have to wait for database.
                     let _persisted = rx.recv().await;
+                    // let end_time = std::time::Instant::now();
+                    // let duration = end_time.duration_since(start_time);
+                    // println!("Persisted on DB after replica failure. Duration: {duration:?}.");
                 }
             }
         }
@@ -452,7 +486,7 @@ impl PersistentLog {
                     }
                 };
                 let mut stmt = match conn.prepare(
-                    "SELECT entries FROM system__logs WHERE lo_lsn > ? ORDER BY lo_lsn LIMIT 2",
+                    "SELECT entries FROM system__logs WHERE lo_lsn > ? ORDER BY lo_lsn LIMIT 10",
                 ) {
                     Ok(stmt) => stmt,
                     Err(x) => {
@@ -567,17 +601,59 @@ impl PersistentLog {
         let db = self.db.clone();
         let owner_id = self.owner_id;
         let inner = self.inner.clone(); // To modify persisted lsn.
+        {
+            // Add write to queue.
+            let mut inner = inner.lock().await;
+            inner.db_queue.push((lo_lsn, hi_lsn, entries, tx));
+        }
+
+        let db_lock = self.db_lock.clone();
         tokio::spawn(async move {
-            // Write in DB.
-            tokio::task::block_in_place(move || {
-                let entries: &[u8] = &entries;
+            // Prevent too many concurrent blocking calls.
+            // That happens when replication is available.
+            let _db_lock = db_lock.lock().await;
+            // Perform all pending writes.
+            let pending_writes: Vec<_> = {
+                let mut inner = inner.lock().await;
+                if hi_lsn <= inner.persisted_lsn {
+                    // Done already.
+                    println!("Hi Lsn: {hi_lsn}. Persisted lsn: {}", inner.persisted_lsn);
+                    return;
+                }
+                // println!("DB Write batch size: {}", inner.db_queue.len());
+                inner.db_queue.drain(..).collect()
+            };
+            let mut values_params = Vec::new();
+            let mut values_clause = Vec::new();
+            let mut txs = Vec::new();
+            let mut highest_lsn = hi_lsn;
+            for (lo_lsn, hi_lsn, entries, tx) in pending_writes {
+                values_params.push(rusqlite::types::Value::Integer(lo_lsn as i64));
+                values_params.push(rusqlite::types::Value::Integer(hi_lsn as i64));
+                values_params.push(rusqlite::types::Value::Blob(entries.to_vec()));
+                values_clause.push("(?, ?, ?)");
+                if hi_lsn > highest_lsn {
+                    highest_lsn = hi_lsn;
+                }
+                txs.push(tx);
+            }
+            // Push owner id.
+            values_params.push(rusqlite::types::Value::Integer(owner_id as i64));
+            let values_clause = values_clause.join(", ");
+            let values_stmt = format!("(VALUES {values_clause})");
+            let select_stmt = format!(
+                "SELECT v.* FROM {values_stmt} as v, system__logs_ownership WHERE new_owner_id=?"
+            );
+            let replace_stmt =
+                format!("REPLACE INTO system__logs(lo_lsn, hi_lsn, entries) {select_stmt}");
+            tokio::task::spawn_blocking(move || {
                 for _ in 0..NUM_DB_RETRIES {
+                    let values_params = rusqlite::params_from_iter(values_params.iter());
                     // let start_time = std::time::Instant::now();
                     let conn = db.pool.get().unwrap();
                     let executed = conn.execute(
-                        "REPLACE INTO system__logs(lo_lsn, hi_lsn, entries) \
-                        SELECT ?, ?, ? FROM system__logs_ownership WHERE new_owner_id=?",
-                        rusqlite::params![lo_lsn, hi_lsn, entries, owner_id],
+                        &replace_stmt,
+                        values_params,
                     );
                     // let end_time = std::time::Instant::now();
                     // let duration = end_time.duration_since(start_time);
@@ -601,13 +677,15 @@ impl PersistentLog {
                 }
                 eprintln!("Cannot access db. Fast exiting...");
                 std::process::exit(1);
-            });
+            }).await.unwrap();
             // Respond.
-            tx.send(PersistedMode::Database).await.unwrap();
+            for tx in txs {
+                tx.send(PersistedMode::Database).await.unwrap();
+            }
             // Update persisted lsn.
             let mut inner = inner.lock().await;
-            if hi_lsn > inner.persisted_lsn {
-                inner.persisted_lsn = hi_lsn;
+            if highest_lsn > inner.persisted_lsn {
+                inner.persisted_lsn = highest_lsn;
             }
         });
     }
@@ -663,6 +741,7 @@ impl PersistentLog {
                         replica_id: instance.id.clone(),
                     };
                     let meta = serde_json::to_string(&meta).unwrap();
+                    // let start_time = std::time::Instant::now();
                     let resp = client
                         .post(&instance.url)
                         .header("obelisk-meta", meta)
@@ -670,6 +749,9 @@ impl PersistentLog {
                         .body(entries)
                         .send()
                         .await;
+                    // let end_time = std::time::Instant::now();
+                    // let duration = end_time.duration_since(start_time);
+                    // println!("Replica send duration: {duration:?}");
                     // Parse resp.
                     if resp.is_err() {
                         println!("Resp err: {resp:?}");
@@ -730,8 +812,8 @@ impl PersistentLog {
         // Assuming no more than AZ+1 uncontolled failures, when drain_instances is done,
         // All accepted writes have made it to disk.
         println!("Old Instances: {old_instances:?}");
+        let replicated_logs = self.drain_instances(&old_instances, 0).await;
         let mut persisted_lsn = self.fetch_persisted_lsn().await;
-        let replicated_logs = self.drain_instances(&old_instances, persisted_lsn).await;
         if !replicated_logs.is_empty() {
             // Recover and refetch persistent lsn.
             self.recover_replicated_logs(replicated_logs).await;
@@ -1152,7 +1234,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
     async fn test_bench_log() {
-        let plog = Arc::new(PersistentLog::new("test", "test").await);
+        let plog = Arc::new(PersistentLog::new("test", "test").await.unwrap());
         // 1KB of data.
         let content: Vec<u8> = (0..1024).map(|i| (i % 256) as u8).collect();
         let num_writes = 50_000;
@@ -1170,19 +1252,27 @@ mod tests {
     }
 
     async fn run_content_test() {
-        let plog = Arc::new(PersistentLog::new("messaging", "echo").await);
+        let plog = Arc::new(PersistentLog::new("messaging", "echo").await.unwrap());
         let flush_lsn = plog.get_flush_lsn().await;
         println!("Flush Lsn: {flush_lsn}");
         plog.truncate(flush_lsn).await.unwrap();
         let mut num_entries = 0;
         let mut expected_entries = vec![];
+        let mut ts = Vec::new();
         for i in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             for j in 0..10 {
                 num_entries += 1;
                 expected_entries.push(vec![i, j]);
                 plog.enqueue(vec![i, j]).await;
             }
-            plog.flush().await;
+            let plog = plog.clone();
+            ts.push(tokio::spawn(async move {
+                plog.flush().await;
+            }))
+        }
+        for t in ts {
+            t.await.unwrap();
         }
         println!("Num entries: {num_entries}");
         let mut num_found_entries = 0;
@@ -1209,7 +1299,7 @@ mod tests {
     }
 
     async fn run_scaling_test() {
-        let plog = Arc::new(PersistentLog::new("messaging", "echo").await);
+        let plog = Arc::new(PersistentLog::new("messaging", "echo").await.unwrap());
         // Make 100 empty flushes per seconds for 100 seconds to trigger a scale up.
         // Note that the code is written to push metrics even for empty flushes.
         for i in 0..100 {

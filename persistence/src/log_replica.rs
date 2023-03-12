@@ -11,7 +11,6 @@ use tokio::sync::Mutex;
 pub struct LogReplica {
     inner: Arc<Mutex<LogReplicaInner>>,
     svc_info: ServiceInfo,
-    messaging_frontend: Arc<AdapterFrontend>,
 }
 
 struct LogReplicaInner {
@@ -59,9 +58,6 @@ impl LogReplica {
         let replica = LogReplica {
             svc_info: svc_info.as_ref().clone(),
             inner,
-            messaging_frontend: Arc::new(
-                AdapterFrontend::new("messaging", &svc_info.namespace, &svc_info.name).await,
-            ),
         };
         replica
     }
@@ -175,6 +171,9 @@ impl LogReplica {
             inner.terminating = true;
         }
         // Make sure to spin a new instance.
+        let messaging_frontend = Arc::new(
+            AdapterFrontend::new("messaging", &self.svc_info.namespace, &self.svc_info.name).await,
+        );
         loop {
             let no_pending_logs = {
                 let inner = self.inner.lock().await;
@@ -185,7 +184,7 @@ impl LogReplica {
             }
             // Hacky way to signal spin up.
             let duration = 0.0;
-            self.messaging_frontend
+            messaging_frontend
                 .collect_metric(serde_json::to_value(duration).unwrap())
                 .await;
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;

@@ -53,28 +53,26 @@ enum PersistenceRespMeta {
 }
 
 async fn fast_serialize(entries: &[(usize, Vec<u8>)], entries_size: usize) -> Vec<u8> {
-    tokio::task::block_in_place(move || {
-        // Output format: (len_1: usize, lsn_1: u64, entry_1: Vec<u8>) ..., (len_n, lsn_n, entry_n).
-        let total_size = 2 * entries.len() * 8 + entries_size;
-        let mut output: Vec<u8> = Vec::new();
-        output.resize(total_size, 0);
-        let mut curr_offset = 0;
-        for (lsn, entry) in entries {
-            let len_lo = curr_offset;
-            let len_hi = len_lo + 8;
-            let lsn_lo = len_hi;
-            let lsn_hi = lsn_lo + 8;
-            let entry_lo = lsn_hi;
-            let entry_hi = entry_lo + entry.len();
-            let len = entry.len().to_be_bytes();
-            output[len_lo..len_hi].copy_from_slice(&len);
-            let lsn = lsn.to_be_bytes();
-            output[lsn_lo..lsn_hi].copy_from_slice(&lsn);
-            output[entry_lo..entry_hi].copy_from_slice(entry);
-            curr_offset = entry_hi;
-        }
-        output
-    })
+    // Output format: (len_1: usize, lsn_1: u64, entry_1: Vec<u8>) ..., (len_n, lsn_n, entry_n).
+    let total_size = 2 * entries.len() * 8 + entries_size;
+    let mut output: Vec<u8> = Vec::new();
+    output.resize(total_size, 0);
+    let mut curr_offset = 0;
+    for (lsn, entry) in entries {
+        let len_lo = curr_offset;
+        let len_hi = len_lo + 8;
+        let lsn_lo = len_hi;
+        let lsn_hi = lsn_lo + 8;
+        let entry_lo = lsn_hi;
+        let entry_hi = entry_lo + entry.len();
+        let len = entry.len().to_be_bytes();
+        output[len_lo..len_hi].copy_from_slice(&len);
+        let lsn = lsn.to_be_bytes();
+        output[lsn_lo..lsn_hi].copy_from_slice(&lsn);
+        output[entry_lo..entry_hi].copy_from_slice(entry);
+        curr_offset = entry_hi;
+    }
+    output
 }
 
 /// Deserialize in a predictable manner.

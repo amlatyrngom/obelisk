@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
 const UNLOCK_SLEEP_TIME_MS: u64 = 100;
+const INDIRECT_WAIT_TIME_MS: u64 = 40;
 
 #[derive(Clone)]
 pub struct MessagingHandler {
@@ -15,22 +16,23 @@ pub struct MessagingHandler {
     plog: Arc<PersistentLog>,
     terminating: Arc<Mutex<bool>>,
     db_lock: Arc<RwLock<usize>>,
-    namespace: String,
-    name: String,
+    // namespace: String,
+    // name: String,
 }
 
 #[derive(Serialize, Deserialize)]
-pub enum LambdaReq {
+pub enum HandlerReq {
     ReleaseLock,
-    Msg(String, Vec<u8>),
+    DirectMsg(String), // Payload is encoded in HTTP body.
+    LambdaMsg(String, Vec<u8>),
     IndirectMsg,
 }
 
 #[derive(Serialize, Deserialize)]
-pub enum LambdaResp {
+pub enum HandlerResp {
     ReleaseLock,
     IndirectMsg,
-    Msg(Option<(String, Vec<u8>)>),
+    LambdaMsg(String, Vec<u8>),
 }
 
 #[async_trait::async_trait]
@@ -39,20 +41,24 @@ impl FunctionInstance for MessagingHandler {
     /// Use this to process messages in batch then go to sleep.
     async fn invoke(&self, arg: Value) -> Value {
         // Parse message.
-        let lambda_msg: LambdaReq = serde_json::from_value(arg).unwrap();
+        let lambda_msg: HandlerReq = serde_json::from_value(arg).unwrap();
         let resp = match lambda_msg {
-            LambdaReq::ReleaseLock => {
+            HandlerReq::ReleaseLock => {
                 // Release lock.
-                let mut db_lock = self.db_lock.clone().write_owned().await;
-                *db_lock = 0;
                 println!("Releasing lock.");
-                self.actor_instance.checkpoint(false).await;
+                let db_lock = self.db_lock.clone().write_owned().await;
+                tokio::spawn(async move {
+                    // Die after responding.
+                    let _db_lock = db_lock;
+                    tokio::time::sleep(std::time::Duration::from_millis(UNLOCK_SLEEP_TIME_MS))
+                        .await;
+                    std::process::exit(1);
+                });
                 self.plog.db.release().await;
                 println!("Lock released. Sleeping...");
-                tokio::time::sleep(std::time::Duration::from_millis(UNLOCK_SLEEP_TIME_MS)).await;
-                LambdaResp::ReleaseLock
+                HandlerResp::ReleaseLock
             }
-            LambdaReq::Msg(msg, payload) => {
+            HandlerReq::LambdaMsg(msg, payload) => {
                 let mut db_lock = self.db_lock.clone().write_owned().await;
                 println!("DBLock: {}", *db_lock);
                 let has_lock = if *db_lock == 0 {
@@ -62,15 +68,15 @@ impl FunctionInstance for MessagingHandler {
                 };
                 if has_lock {
                     *db_lock += 1;
-                    let resp = self.actor_instance.message(msg, payload).await;
-                    LambdaResp::Msg(Some(resp))
+                    let (meta, payload) = self.actor_instance.message(msg, payload).await;
+                    HandlerResp::LambdaMsg(meta, payload)
                 } else {
                     println!("Lost lock ownership. Dying...");
                     std::process::exit(1);
                 }
             }
-            LambdaReq::IndirectMsg => {
-                let db_lock = self.db_lock.clone().read_owned().await;
+            HandlerReq::IndirectMsg => {
+                let mut db_lock = self.db_lock.clone().write_owned().await;
                 println!("DBLock: {}", *db_lock);
                 let has_lock = if *db_lock == 0 {
                     self.plog.db.acquire(false).await
@@ -78,17 +84,22 @@ impl FunctionInstance for MessagingHandler {
                     true
                 };
                 if has_lock {
+                    *db_lock += 1;
                     let handled = self.handle_message_batch().await;
                     if !handled {
                         // Tentatively wait for message to be available.
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(INDIRECT_WAIT_TIME_MS))
+                            .await;
                         self.handle_message_batch().await;
                     }
                 } else {
                     println!("Lost lock ownership. Dying...");
                     std::process::exit(1);
                 }
-                LambdaResp::IndirectMsg
+                HandlerResp::IndirectMsg
+            }
+            _ => {
+                panic!("Impossible Message for Lambda");
             }
         };
         // Return
@@ -100,24 +111,41 @@ impl FunctionInstance for MessagingHandler {
 impl ServiceInstance for MessagingHandler {
     /// Direct calls.
     async fn call(&self, meta: String, arg: Vec<u8>) -> (String, Vec<u8>) {
-        // On first call, acquire db lock.
-        let already_locked = {
-            let db_lock = self.db_lock.read().await;
-            *db_lock > 0
-        };
-        if !already_locked {
-            let mut db_lock = self.db_lock.write().await;
-            if *db_lock == 0 {
-                *db_lock = 1;
-                PersistentLog::pause_lambda_lock(&self.namespace, &self.name).await;
-                let acquired = self.plog.db.acquire(true).await;
-                if !acquired {
-                    std::process::exit(1);
+        // // On first call, acquire db lock.
+        // let already_locked = {
+        //     let db_lock = self.db_lock.read().await;
+        //     *db_lock > 0
+        // };
+        // if !already_locked {
+        //     let mut db_lock = self.db_lock.write().await;
+        //     if *db_lock == 0 {
+        //         *db_lock = 1;
+        //         PersistentLog::pause_lambda_lock(&self.namespace, &self.name).await;
+        //         let acquired = self.plog.db.acquire(true).await;
+        //         if !acquired {
+        //             std::process::exit(1);
+        //         }
+        //     }
+        // }
+        let req: HandlerReq = serde_json::from_str(&meta).unwrap();
+        match req {
+            HandlerReq::IndirectMsg => {
+                println!("Received request for indirect message!");
+                let handled = self.handle_message_batch().await;
+                if !handled {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    self.handle_message_batch().await;
                 }
+                ("".into(), vec![])
+            }
+            HandlerReq::DirectMsg(meta) => {
+                // Process request.
+                self.actor_instance.message(meta, arg).await
+            }
+            _ => {
+                panic!("Impossible message for container!");
             }
         }
-        // Process request.
-        self.actor_instance.message(meta, arg).await
     }
 
     async fn custom_info(&self, _scaling_state: &ServerfulScalingState) -> Value {
@@ -126,7 +154,6 @@ impl ServiceInstance for MessagingHandler {
 
     async fn terminate(&self) {
         self.actor_instance.checkpoint(true).await;
-        self.plog.terminate().await;
         let mut terminating = self.terminating.lock().await;
         *terminating = true;
     }
@@ -136,8 +163,8 @@ impl MessagingHandler {
     pub async fn new(
         plog: Arc<PersistentLog>,
         actor_instance: Arc<dyn ActorInstance>,
-        namespace: &str,
-        name: &str,
+        _namespace: &str,
+        _name: &str,
     ) -> Self {
         let mode = std::env::var("EXECUTION_MODE").unwrap_or_else(|_| "messaging_lambda".into());
         let shared_config = aws_config::load_from_env().await;
@@ -148,8 +175,8 @@ impl MessagingHandler {
             actor_instance,
             terminating: Arc::new(Mutex::new(false)),
             db_lock: Arc::new(RwLock::new(0)),
-            namespace: namespace.into(),
-            name: name.into(),
+            // namespace: namespace.into(),
+            // name: name.into(),
         };
         if mode != "messaging_lambda" {
             // ECS takes ~10s before becoming available. So do indirect messaging.
@@ -157,16 +184,20 @@ impl MessagingHandler {
             tokio::spawn(async move {
                 handler.message_queue_thread().await;
             });
-        } else {
-            handler.plog.db.release().await;
         }
         handler
     }
 
     async fn message_queue_thread(&self) {
-        let mut should_wait = true;
-        let mut last_checkpoint = std::time::Instant::now();
+        println!("Running message queue thread for 5 minutes!");
+        let starting_time = std::time::Instant::now();
         loop {
+            let current_time = std::time::Instant::now();
+            let since = current_time.duration_since(starting_time);
+            if since > std::time::Duration::from_secs(60 * 5) {
+                println!("Exiting message queue thread after");
+                return;
+            }
             let terminating: bool = {
                 let terminating = self.terminating.lock().await;
                 *terminating
@@ -174,19 +205,12 @@ impl MessagingHandler {
             if terminating {
                 return;
             }
-            if should_wait {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-            let processed = self.handle_message_batch().await;
-            should_wait = !processed;
-            // Try checkpoint every 10 seconds.
-            let now = std::time::Instant::now();
-            if now.duration_since(last_checkpoint).as_secs() >= 10 {
-                last_checkpoint = now;
-                let actor_instance = self.actor_instance.clone();
-                tokio::spawn(async move {
-                    actor_instance.checkpoint(false).await;
-                });
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            // Handle all available messages.
+            let mut handled = self.handle_message_batch().await;
+            while handled {
+                // While last batch not empty.
+                handled = self.handle_message_batch().await;
             }
         }
     }
@@ -246,6 +270,15 @@ impl MessagingHandler {
                     .key(&key)
                     .send()
                     .await;
+                // Delete
+                tokio::spawn(async move {
+                    let _ = s3_client
+                        .delete_object()
+                        .bucket(&common::bucket_name())
+                        .key(&key)
+                        .send()
+                        .await;
+                });
                 match resp {
                     Ok(resp) => {
                         let body: Vec<u8> =
@@ -296,29 +329,9 @@ impl MessagingHandler {
                 resp.map_or(None, |_| Some(s3_send_key))
             }));
         }
-        // Wait for writes, then delete.
-        let mut to_delete: Vec<String> = Vec::new();
+        // Wait for writes.
         for t in s3_writes {
-            let resp = t.await.unwrap();
-            if let Some(delete_key) = resp {
-                to_delete.push(delete_key);
-            }
-        }
-        // Delete messages.
-        let mut s3_deletes = Vec::new();
-        for key in to_delete {
-            let s3_client = self.s3_client.clone();
-            s3_deletes.push(tokio::spawn(async move {
-                let _ = s3_client
-                    .delete_object()
-                    .bucket(&common::bucket_name())
-                    .key(&key)
-                    .send()
-                    .await;
-            }));
-        }
-        for t in s3_deletes {
-            let _ = t.await;
+            let _ = t.await.unwrap();
         }
     }
 }

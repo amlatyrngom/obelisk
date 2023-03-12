@@ -20,15 +20,20 @@ pub fn gen_messaging_static_code(deployments: &[Deployment]) -> TokenStream {
     }
 
     let result = quote! {
-        static ref MESSAGING_FUNCTION: async_once::AsyncOnce<Arc<dyn FunctionInstance>> = async_once::AsyncOnce::new(async {
+        static ref MESSAGING_FUNCTION: async_once::AsyncOnce<Option<Arc<dyn FunctionInstance>>> = async_once::AsyncOnce::new(async {
             // This will fail if lock is ever lost.
             let namespace = std::env::var("NAMESPACE").unwrap();
             let name = std::env::var("NAME").unwrap();
-            let plog = Arc::new(persistence::PersistentLog::new(&namespace, &name).await);
-            let mut x: Option<Arc<dyn ActorInstance>> = None;
-            #all_messaging_checks
-            let handler: Arc<dyn FunctionInstance> = Arc::new(MessagingHandler::new(plog.clone(), x.unwrap(), &namespace, &name).await);
-            handler
+            let plog = persistence::PersistentLog::new(&namespace, &name).await;
+            if let Ok(plog) = plog {
+                let plog = Arc::new(plog);
+                let mut x: Option<Arc<dyn ActorInstance>> = None;
+                #all_messaging_checks
+                let handler: Arc<dyn FunctionInstance> = Arc::new(MessagingHandler::new(plog.clone(), x.unwrap(), &namespace, &name).await);
+                Some(handler)
+            } else {
+                None
+            }
         });
 
         static ref MESSAGING_BACKEND: async_once::AsyncOnce<Arc<AdapterBackend>> = async_once::AsyncOnce::new(async {
@@ -36,10 +41,16 @@ pub fn gen_messaging_static_code(deployments: &[Deployment]) -> TokenStream {
             let svc_info = Arc::new(ServiceInfo::new().await.unwrap());
             let namespace = svc_info.namespace.clone();
             let name = svc_info.name.clone();
-            let plog = Arc::new(persistence::PersistentLog::new(&namespace, &name).await);
-            let mut x: Option<Arc<dyn ActorInstance>> = None;
-            #all_messaging_checks
-            let handler = Arc::new(MessagingHandler::new(plog.clone(), x.unwrap(), &namespace, &name).await);
+            let plog = persistence::PersistentLog::new(&namespace, &name).await;
+            let handler = if let Ok(plog) = plog {
+                let plog = Arc::new(plog);
+                let mut x: Option<Arc<dyn ActorInstance>> = None;
+                #all_messaging_checks
+                let handler = Arc::new(MessagingHandler::new(plog.clone(), x.unwrap(), &namespace, &name).await);
+                handler
+            } else {
+                std::process::exit(1);
+            };
             Arc::new(AdapterBackend::new(svc_info, handler).await)
         });
     };
@@ -70,7 +81,15 @@ pub fn gen_messaging_aux() -> TokenStream {
         async fn messaging_lambda_handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
             let (event, _context) = event.into_parts();
             let function = MESSAGING_FUNCTION.get().await.clone();
-            Ok(function.invoke(event).await)
+            if let Some(function) = function {
+                Ok(function.invoke(event).await)
+            } else {
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    std::process::exit(1);
+                });
+                Err("Not Main Lambda!".into())
+            }
         }
     };
 

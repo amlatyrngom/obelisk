@@ -5,7 +5,7 @@ use std::sync::{atomic, Arc};
 /// Time between retries.
 const MAX_NUM_RETRIES: usize = 100;
 const MAX_NUM_RETRIES_LAMBDA: usize = 1;
-const BUSY_TIMEOUT_MS: u64 = 1000;
+const BUSY_TIMEOUT_MS: u64 = 300;
 
 #[derive(Clone)]
 pub struct Database {
@@ -17,7 +17,7 @@ pub struct Database {
 impl Database {
     /// Opening a database, or exits if the lock is already owned.
     /// If the the retry flag is set, will retry for a while and then exit.
-    pub fn new(storage_dir: &str, filename: &str, with_retry: bool) -> Database {
+    pub fn new(storage_dir: &str, filename: &str, with_retry: bool) -> Result<Self, String> {
         let create_dir_resp = std::fs::create_dir_all(storage_dir);
         println!("Create Dir ({storage_dir}) Resp: {create_dir_resp:?}");
         let db_file = format!("{storage_dir}/{filename}.db");
@@ -99,22 +99,21 @@ impl Database {
                 Ok(_) => {
                     println!("Successfully opened database!");
                     let acquired = Arc::new(atomic::AtomicBool::new(true));
-                    return Database {
+                    return Ok(Database {
                         pool,
                         db_id,
                         acquired,
-                    };
+                    });
                 }
                 _ => {
                     continue;
                 }
             }
         }
-        eprintln!(
+        Err(format!(
             "Could not acquire database lock. Pid {}.",
             std::process::id()
-        );
-        std::process::exit(1);
+        ))
     }
 
     /// Return number of attempts to make.
@@ -317,6 +316,8 @@ mod tests {
                         let _parent_db: Option<Database> = {
                             // Open a database and write a few values.
                             let db = Database::new(&common::shared_storage_prefix(), "test", false);
+                            assert!(db.is_ok());
+                            let db = db.unwrap();
                             println!("Parent: {}", db.db_id);
                             if test_release {
                                 // Fake release and reaquire.
@@ -357,8 +358,9 @@ mod tests {
                         std::thread::sleep(std::time::Duration::from_secs(2));
                         // Unlike the other child, retrying ensures this does not crash.
                         let db = Database::new(&common::shared_storage_prefix(), "test", true);
-                        println!("Child 2: {}", db.db_id); // Should not be reached.
-                        std::process::exit(0);
+                        assert!(db.is_ok());
+                        println!("Child 2: Err({:?}, should be None)", db.clone().err());
+                        std::process::exit(db.is_err() as i32);
                     }
                     Err(_) => println!("Fork failed"),
                 }
@@ -368,7 +370,9 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 // Should crash trying to open database.
                 let db = Database::new(&common::shared_storage_prefix(), "test", false);
-                println!("Child 1: {}", db.db_id); // Should not be reached.
+                assert!(db.is_err());
+                println!("Child 1: Err({:?}, should be Some)", db.clone().err());
+                std::process::exit(db.is_err() as i32);
             }
             Err(_) => println!("Fork failed"),
         }

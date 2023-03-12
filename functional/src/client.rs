@@ -17,7 +17,7 @@ impl FunctionalClient {
     pub async fn new(namespace: &str) -> Self {
         let direct_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10)) // TODO: set to correct value.
-            .connect_timeout(std::time::Duration::from_secs(2))
+            .connect_timeout(std::time::Duration::from_millis(100)) // Short on purpose.
             .build()
             .unwrap();
         let front_end = Arc::new(AdapterFrontend::new("functional", namespace, "fn").await);
@@ -41,8 +41,24 @@ impl FunctionalClient {
     pub async fn pick_random_url(&self) -> Option<String> {
         // TODO: Have more sophisticated client side load balancing.
         let serverful_instances = self.front_end.serverful_instances().await;
+        let now = chrono::Utc::now();
         let instance = serverful_instances.choose(&mut rand::thread_rng());
-        instance.map(|instance| instance.url.clone())
+        if let Some(instance) = instance {
+            let url = instance.url.clone();
+            let since = now.signed_duration_since(instance.join_time);
+            if since.num_seconds() < 10 {
+                // Just try connecting.
+                let direct_client = self.direct_client.clone();
+                tokio::spawn(async move {
+                    let _ = direct_client.get(url).send().await;
+                });
+                None
+            } else {
+                Some(url)
+            }
+        } else {
+            None
+        }
     }
 
     /// Invoke a lambda.

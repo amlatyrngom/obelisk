@@ -2,8 +2,8 @@ namespace = "persistence"
 
 [subsystem]
 service_path = "persistence::LogReplica"
-service_mem = 1024
-service_cpus = 512
+service_mem = 512
+service_cpus = 256
 service_grace = 60
 rescaler_path = "persistence::LogRescaler"
 rescaler_mem = 512

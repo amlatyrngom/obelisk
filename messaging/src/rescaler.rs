@@ -3,9 +3,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Factor for moving average.
-const MOVING_FACTOR: f64 = 0.1;
+const MOVING_FACTOR: f64 = 0.25;
 /// Value to force spin up.
 const FORCE_THRESHOLD: f64 = 1e-4;
+/// Lambda overheads
+const MIN_LAMBDA_OVERHEAD: f64 = 0.007;
+const MAX_LAMBDA_OVERHEAD: f64 = 0.020;
+/// Hourly price of 1vcpu and 2GB.
+const ECS_BASE_PRICE: f64 = 0.015;
 
 /// Info to maintain for scaling functions.
 #[derive(Serialize, Deserialize)]
@@ -59,17 +64,18 @@ impl Rescaler for MessagingRescaler {
         for m in metrics.iter() {
             let duration_secs: f64 = serde_json::from_value(m.clone()).unwrap();
             if duration_secs < FORCE_THRESHOLD {
-                // Hacky way to signal forcible spin up.
+                // Very hacky way to signal forcible spin up.
                 force_spin_up = true;
             }
             // Time spent active.
-            let active_secs = duration_secs - 0.010; // Subtract indirect time.
-            if active_secs < 0.001 {
-                total_active_secs += 0.001; // Minimum 1ms.
-            } else {
-                total_active_secs += active_secs;
+            let mut active_duration_secs = duration_secs - MIN_LAMBDA_OVERHEAD;
+            if active_duration_secs < 0.001 {
+                // Bound by 1ms
+                active_duration_secs = 0.001;
             }
-            total_waiting_secs += 0.010; // Extra time spent waiting by caller.
+            total_active_secs += active_duration_secs;
+            // Average Extra time spent waiting by caller in lambda mode.
+            total_waiting_secs += MAX_LAMBDA_OVERHEAD;
         }
         // Compute moving average.
         let new_activity = if !force_spin_up {
@@ -87,7 +93,7 @@ impl Rescaler for MessagingRescaler {
         activity = (1.0 - MOVING_FACTOR) * activity + MOVING_FACTOR * new_activity;
         waiting = (1.0 - MOVING_FACTOR) * waiting + MOVING_FACTOR * new_waiting;
         // Compute price ratio.
-        let ecs_cost = 0.015 * ecs_vcpu;
+        let ecs_cost = ECS_BASE_PRICE * ecs_vcpu;
         let lambda_cost = 0.0000166667 * 3600.0 * lambda_mem * activity;
         let waiting_cost = 0.0000166667 * 3600.0 * caller_mem * waiting;
         let price_ratio = (lambda_cost + waiting_cost) / ecs_cost;
