@@ -1,5 +1,6 @@
 use crate::time_service::TimeService;
 use crate::ServiceInstance;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::signal::unix;
 use tokio::sync::RwLock;
@@ -21,6 +22,12 @@ pub struct ServiceInfo {
     pub name: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ServiceStats {
+    pub mem_usage: f64,
+    // pub disk_reads: f64,
+}
+
 #[derive(Clone)]
 pub struct AdapterBackend {
     join_time: chrono::DateTime<chrono::Utc>,
@@ -34,6 +41,7 @@ pub struct AdapterBackend {
 
 pub struct AdapterBackerInner {
     scaling_state: Option<ServerfulScalingState>,
+    curr_stats: ServiceStats,
 }
 
 impl AdapterBackend {
@@ -43,8 +51,10 @@ impl AdapterBackend {
         let join_time = time_service.current_time().await;
         let shared_config = aws_config::load_from_env().await;
         let lambda_client = aws_sdk_lambda::Client::new(&shared_config);
+        let curr_stats = svc_info.read_stats().await.unwrap();
         let inner = Arc::new(RwLock::new(AdapterBackerInner {
             scaling_state: None,
+            curr_stats,
         }));
         let adapter_scaling = Arc::new(AdapterScaling::new(None, &svc_info.subsystem).await);
 
@@ -134,10 +144,18 @@ impl AdapterBackend {
                 name: self.svc_info.name.clone(),
                 timestamp: self.time_service.current_time().await,
             };
+            let stats = {
+                let mut inner = self.inner.write().await;
+                let stats = self.svc_info.read_stats().await.unwrap();
+                inner.curr_stats.mem_usage = stats.mem_usage;
+                // inner.curr_stats.disk_reads = stats.disk_reads - inner.curr_stats.disk_reads;
+                inner.curr_stats.clone()
+            };
             let mut scaling_state = self.adapter_scaling.get_scaling_state(&req).await;
             cleanup_instances(&mut scaling_state);
             let old_id = scaling_state.state_id.clone();
             scaling_state.state_id = uuid::Uuid::new_v4().to_string();
+
             scaling_state.peers.insert(
                 self.svc_info.id.clone(),
                 ServerfulInstance {
@@ -148,13 +166,13 @@ impl AdapterBackend {
                     active_time: req.timestamp,
                     join_time: self.join_time,
                     custom_info: self.svc.custom_info(&scaling_state).await,
+                    stats,
                 },
             );
             {
                 let mut inner = self.inner.write().await;
                 inner.scaling_state = Some(scaling_state.clone());
             };
-            println!("Writing scaling state for refresh!");
             let updated = self
                 .adapter_scaling
                 .write_scaling_state(&mut scaling_state, &old_id)
@@ -272,6 +290,29 @@ impl ServiceInfo {
             namespace: namespace.into(),
             name: name.into(),
             private_url,
+        })
+    }
+
+    pub async fn read_stats(&self) -> Result<ServiceStats, String> {
+        let uri = std::env::var("ECS_CONTAINER_METADATA_URI_V4").map_err(|x| format!("{x:?}"))?;
+        let uri = format!("{uri}/stats");
+        let resp = reqwest::get(uri).await.map_err(|x| format!("{x:?}"))?;
+        let task: serde_json::Value = resp.json().await.map_err(|x| format!("{x:?}"))?;
+        let mem_stats = task.get("memory_stats").unwrap();
+        let mem_usage = mem_stats.get("usage").unwrap().as_f64().unwrap() / 1e6;
+        // let disk_stats = task.get("blkio_stats").unwrap();
+        // let disk_ios = disk_stats.get("io_serviced_recursive").unwrap().as_array().unwrap();
+        // let mut disk_reads = 0.0;
+        // for disk_io in disk_ios {
+        //     let op = disk_io.get("op").unwrap().as_str().unwrap();
+        //     if op == "Read" {
+        //         disk_reads += disk_io.get("value").unwrap().as_f64().unwrap();
+        //     }
+        // }
+        println!("Mem usage: {mem_usage}");
+        Ok(ServiceStats {
+            mem_usage,
+            // disk_reads,
         })
     }
 }

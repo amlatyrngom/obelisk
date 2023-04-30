@@ -29,6 +29,9 @@ fn gen_main_file_content(deployments: &[Deployment], for_system: bool) -> String
         let functional_code = functional::gen_functional_main(for_system);
         let messaging_code = messaging::gen_messaging_main();
         quote! {
+            #[global_allocator]
+            static GLOBAL: Jemalloc = Jemalloc;
+
             #[tokio::main]
             async fn main() -> Result<(), Error> {
                 println!("Main Started!");
@@ -110,6 +113,9 @@ pub(crate) fn gen_cargo(mut cargo_config: CargoConfig) {
                 features = ["full"]
             ),
         );
+    }
+    if !deps.contains_key("jemallocator") {
+        deps.insert("jemallocator".into(), toml::Value::String("*".into()));
     }
 
     // Write out

@@ -3,6 +3,8 @@
 FROM rust:slim AS chef
 WORKDIR /app
 RUN cargo install cargo-chef
+RUN apt-get update
+RUN apt-get install make
 
 FROM chef AS planner
 WORKDIR /app

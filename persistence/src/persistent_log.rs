@@ -486,7 +486,7 @@ impl PersistentLog {
                     }
                 };
                 let mut stmt = match conn.prepare(
-                    "SELECT entries FROM system__logs WHERE lo_lsn > ? ORDER BY lo_lsn LIMIT 10",
+                    "SELECT entries FROM system__logs WHERE lo_lsn > ? ORDER BY lo_lsn LIMIT 100",
                 ) {
                     Ok(stmt) => stmt,
                     Err(x) => {

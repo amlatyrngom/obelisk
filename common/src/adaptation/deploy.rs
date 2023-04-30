@@ -1545,6 +1545,13 @@ impl AdapterDeployment {
                     .build(),
             )
             .name(&service_def_name)
+            .ulimits(
+                aws_sdk_ecs::model::Ulimit::builder()
+                    .name(aws_sdk_ecs::model::UlimitName::Nofile)
+                    .soft_limit(10000)
+                    .hard_limit(10000)
+                    .build(),
+            )
             .mount_points(
                 aws_sdk_ecs::model::MountPoint::builder()
                     .container_path(crate::messaging_mnt_path())

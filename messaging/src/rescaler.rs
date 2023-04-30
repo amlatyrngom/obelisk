@@ -17,6 +17,7 @@ const ECS_BASE_PRICE: f64 = 0.015;
 struct MessagingScalingInfo {
     activity: f64,
     waiting: f64,
+    // mem_usage: f64,
 }
 
 /// Rescaler for functions.

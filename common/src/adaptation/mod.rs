@@ -39,6 +39,7 @@ pub struct ServerfulInstance {
     pub az: String,
     pub id: String,
     pub custom_info: Value,
+    pub stats: backend::ServiceStats,
 }
 
 /// Information about a particular service.
@@ -265,7 +266,6 @@ impl AdapterScaling {
             .last_rescale
             .checked_add_signed(chrono::Duration::minutes(10));
         let gc_ttl = gc_ttl.unwrap().timestamp().to_string();
-        println!("Writing scaling state: {scaling_state:?}!");
         let mut put = self
             .dynamo_client
             .put_item()

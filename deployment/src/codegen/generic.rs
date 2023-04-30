@@ -30,6 +30,7 @@ pub fn gen_imports(for_system: bool) -> TokenStream {
         use warp::Filter;
         use std::convert::Infallible;
         use tokio::signal::unix;
+        use jemallocator::Jemalloc;
     };
 
     imports
