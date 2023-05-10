@@ -1,5 +1,5 @@
 use crate::{clean_die, time_service::TimeService};
-use aws_sdk_dynamodb::model::AttributeValue;
+use aws_sdk_dynamodb::types::AttributeValue;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -288,8 +288,8 @@ impl Leaser {
 mod tests {
     use super::Leaser;
     use super::{LEASE_GRACE_DURATION, LEASE_GUARANTEE_DURATION};
-    use aws_sdk_dynamodb::model::{AttributeDefinition, ScalarAttributeType};
-    use aws_sdk_dynamodb::model::{
+    use aws_sdk_dynamodb::types::{AttributeDefinition, ScalarAttributeType};
+    use aws_sdk_dynamodb::types::{
         BillingMode, KeySchemaElement, KeyType, TimeToLiveSpecification,
     };
     const TEST_LEASING_TABLE: &str = "obk__test__leasing";

@@ -105,10 +105,10 @@ impl MessagingClient {
                 Ok(actor_function) => {
                     let st = actor_function.configuration().unwrap().state().unwrap();
                     match st {
-                        aws_sdk_lambda::model::State::Inactive => {
+                        aws_sdk_lambda::types::State::Inactive => {
                             return;
                         }
-                        aws_sdk_lambda::model::State::Active => {
+                        aws_sdk_lambda::types::State::Active => {
                             return;
                         }
                         _ => {
@@ -140,7 +140,7 @@ impl MessagingClient {
                     }
                     if let Some(vpc_config) = config.vpc_config() {
                         create_function = create_function.vpc_config(
-                            aws_sdk_lambda::model::VpcConfig::builder()
+                            aws_sdk_lambda::types::VpcConfig::builder()
                                 .security_group_ids(
                                     vpc_config.security_group_ids().unwrap().first().unwrap(),
                                 )
@@ -150,7 +150,7 @@ impl MessagingClient {
                     }
                     let role = config.role().unwrap();
                     create_function = create_function.role(role);
-                    let mut env_vars = aws_sdk_lambda::model::Environment::builder();
+                    let mut env_vars = aws_sdk_lambda::types::Environment::builder();
                     for (var_name, var_value) in config.environment().unwrap().variables().unwrap()
                     {
                         env_vars = env_vars.variables(var_name, var_value);
@@ -159,7 +159,7 @@ impl MessagingClient {
                     create_function = create_function.environment(env_vars.build());
                     create_function =
                         create_function.package_type(config.package_type().unwrap().clone());
-                    let function_code = aws_sdk_lambda::model::FunctionCode::builder()
+                    let function_code = aws_sdk_lambda::types::FunctionCode::builder()
                         .image_uri(template.code().unwrap().image_uri().unwrap())
                         .build();
                     create_function = create_function.code(function_code);
@@ -321,7 +321,7 @@ impl MessagingClient {
             let body: (String, String, Vec<u8>) = (msg_id.into(), msg.into(), payload.into());
             bincode::serialize(&body).unwrap()
         });
-        let body = aws_sdk_s3::types::ByteStream::from(body);
+        let body = aws_sdk_s3::primitives::ByteStream::from(body);
         let resp = self
             .s3_client
             .put_object()

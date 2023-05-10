@@ -3,8 +3,8 @@ use super::{
 };
 use crate::time_service::TimeService;
 use crate::{clean_die, full_scaler_name, full_scaling_queue_name, scaling_table_name};
-use aws_sdk_dynamodb::model::AttributeValue;
-use aws_sdk_sqs::model::QueueAttributeName;
+use aws_sdk_dynamodb::types::AttributeValue;
+use aws_sdk_sqs::types::QueueAttributeName;
 use serde_json::Value;
 use std::sync::{atomic, Arc};
 use tokio::signal::unix;

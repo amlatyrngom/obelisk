@@ -318,7 +318,7 @@ impl MessagingHandler {
                     let body: (String, String, Vec<u8>) = (msg_id, msg, payload);
                     bincode::serialize(&body).unwrap()
                 });
-                let body = aws_sdk_s3::types::ByteStream::from(body);
+                let body = aws_sdk_s3::primitives::ByteStream::from(body);
                 let resp = s3_client
                     .put_object()
                     .bucket(&common::bucket_name())

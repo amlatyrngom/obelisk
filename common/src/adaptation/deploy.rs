@@ -7,13 +7,13 @@ use crate::{
 
 // use crate::{messaging_name_prefix, service_name_prefix};
 
-use aws_sdk_dynamodb::model::AttributeValue;
-use aws_sdk_dynamodb::model::{AttributeDefinition, ScalarAttributeType, TimeToLiveSpecification};
-use aws_sdk_dynamodb::model::{BillingMode, KeySchemaElement, KeyType};
-use aws_sdk_ecs::model::{ContainerDefinition, KeyValuePair, PortMapping};
-use aws_sdk_efs::model::FileSystemDescription;
-use aws_sdk_lambda::model::{function_code, PackageType};
-use aws_sdk_sqs::model::QueueAttributeName;
+use aws_sdk_dynamodb::types::AttributeValue;
+use aws_sdk_dynamodb::types::{AttributeDefinition, ScalarAttributeType, TimeToLiveSpecification};
+use aws_sdk_dynamodb::types::{BillingMode, KeySchemaElement, KeyType};
+use aws_sdk_ecs::types::{ContainerDefinition, KeyValuePair, PortMapping};
+use aws_sdk_efs::types::FileSystemDescription;
+use aws_sdk_lambda::types::{FunctionCode, PackageType};
+use aws_sdk_sqs::types::QueueAttributeName;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
@@ -156,7 +156,7 @@ impl AdapterDeployment {
             .ec2_client
             .describe_vpcs()
             .filters(
-                aws_sdk_ec2::model::Filter::builder()
+                aws_sdk_ec2::types::Filter::builder()
                     .name("isDefault")
                     .values("true")
                     .build(),
@@ -171,7 +171,7 @@ impl AdapterDeployment {
             .ec2_client
             .describe_subnets()
             .filters(
-                aws_sdk_ec2::model::Filter::builder()
+                aws_sdk_ec2::types::Filter::builder()
                     .name("defaultForAz")
                     .values("true")
                     .build(),
@@ -190,13 +190,13 @@ impl AdapterDeployment {
             .ec2_client
             .describe_security_groups()
             .filters(
-                aws_sdk_ec2::model::Filter::builder()
+                aws_sdk_ec2::types::Filter::builder()
                     .name("vpc-id")
                     .values(vpc_id)
                     .build(),
             )
             .filters(
-                aws_sdk_ec2::model::Filter::builder()
+                aws_sdk_ec2::types::Filter::builder()
                     .name("group-name")
                     .values("default")
                     .build(),
@@ -211,13 +211,13 @@ impl AdapterDeployment {
             .ec2_client
             .describe_route_tables()
             .filters(
-                aws_sdk_ec2::model::Filter::builder()
+                aws_sdk_ec2::types::Filter::builder()
                     .name("vpc-id")
                     .values(vpc_id)
                     .build(),
             )
             .filters(
-                aws_sdk_ec2::model::Filter::builder()
+                aws_sdk_ec2::types::Filter::builder()
                     .name("association.main")
                     .values("true")
                     .build(),
@@ -241,13 +241,13 @@ impl AdapterDeployment {
                     .ec2_client
                     .describe_vpc_endpoints()
                     .filters(
-                        aws_sdk_ec2::model::Filter::builder()
+                        aws_sdk_ec2::types::Filter::builder()
                             .name("vpc-id")
                             .values(vpc_id)
                             .build(),
                     )
                     .filters(
-                        aws_sdk_ec2::model::Filter::builder()
+                        aws_sdk_ec2::types::Filter::builder()
                             .name("service-name")
                             .values(&svc_name)
                             .build(),
@@ -268,11 +268,11 @@ impl AdapterDeployment {
                     .service_name(&svc_name);
                 if is_gateway {
                     req = req
-                        .vpc_endpoint_type(aws_sdk_ec2::model::VpcEndpointType::Gateway)
+                        .vpc_endpoint_type(aws_sdk_ec2::types::VpcEndpointType::Gateway)
                         .route_table_ids(&rt_id);
                 } else {
                     req = req
-                        .vpc_endpoint_type(aws_sdk_ec2::model::VpcEndpointType::Interface)
+                        .vpc_endpoint_type(aws_sdk_ec2::types::VpcEndpointType::Interface)
                         .security_group_ids(&sg_id);
                     for subnet_id in subnet_ids.iter() {
                         req = req.subnet_ids(subnet_id)
@@ -293,7 +293,7 @@ impl AdapterDeployment {
             .ec2_client
             .describe_vpcs()
             .filters(
-                aws_sdk_ec2::model::Filter::builder()
+                aws_sdk_ec2::types::Filter::builder()
                     .name("isDefault")
                     .values("true")
                     .build(),
@@ -314,13 +314,13 @@ impl AdapterDeployment {
                 .ec2_client
                 .describe_vpc_endpoints()
                 .filters(
-                    aws_sdk_ec2::model::Filter::builder()
+                    aws_sdk_ec2::types::Filter::builder()
                         .name("vpc-id")
                         .values(vpc_id)
                         .build(),
                 )
                 .filters(
-                    aws_sdk_ec2::model::Filter::builder()
+                    aws_sdk_ec2::types::Filter::builder()
                         .name("service-name")
                         .values(&svc_name)
                         .build(),
@@ -572,10 +572,10 @@ impl AdapterDeployment {
         self.delete_scaler_function(&spec.subsystem).await;
         // Create scaler function.
         let scaler_name = full_scaler_name(&spec.subsystem);
-        let code = function_code::Builder::default()
+        let code = FunctionCode::builder()
             .image_uri(format!("{private_image_uri}:latest"))
             .build();
-        let environ = aws_sdk_lambda::model::Environment::builder()
+        let environ = aws_sdk_lambda::types::Environment::builder()
             .variables("SUBSYSTEM", &spec.subsystem)
             .variables("EXECUTION_MODE", "rescaler")
             .variables("MEMORY", spec.scl_mem.to_string());
@@ -633,8 +633,8 @@ impl AdapterDeployment {
         } else {
             full_service_definition_name(subsystem)
         };
-        let mut vpc_config = aws_sdk_ecs::model::AwsVpcConfiguration::builder()
-            .assign_public_ip(aws_sdk_ecs::model::AssignPublicIp::Enabled)
+        let mut vpc_config = aws_sdk_ecs::types::AwsVpcConfiguration::builder()
+            .assign_public_ip(aws_sdk_ecs::types::AssignPublicIp::Enabled)
             .security_groups(&sg_id);
         for subnet_id in subnet_ids {
             vpc_config = vpc_config.subnets(subnet_id);
@@ -648,12 +648,12 @@ impl AdapterDeployment {
             .task_definition(&service_def_name)
             .desired_count(0)
             .network_configuration(
-                aws_sdk_ecs::model::NetworkConfiguration::builder()
+                aws_sdk_ecs::types::NetworkConfiguration::builder()
                     .awsvpc_configuration(vpc_config.clone())
                     .build(),
             )
             .capacity_provider_strategy(
-                aws_sdk_ecs::model::CapacityProviderStrategyItem::builder()
+                aws_sdk_ecs::types::CapacityProviderStrategyItem::builder()
                     .capacity_provider("FARGATE_SPOT")
                     .weight(1)
                     .base(0)
@@ -678,7 +678,7 @@ impl AdapterDeployment {
                 .force_new_deployment(true)
                 .desired_count(0)
                 .network_configuration(
-                    aws_sdk_ecs::model::NetworkConfiguration::builder()
+                    aws_sdk_ecs::types::NetworkConfiguration::builder()
                         .awsvpc_configuration(vpc_config.clone())
                         .build(),
                 )
@@ -742,8 +742,8 @@ impl AdapterDeployment {
             .execution_role_arn(role_arn)
             .cpu(format!("{}", spec.svc_cpus))
             .memory(format!("{}", spec.svc_mem))
-            .requires_compatibilities(aws_sdk_ecs::model::Compatibility::Fargate)
-            .network_mode(aws_sdk_ecs::model::NetworkMode::Awsvpc)
+            .requires_compatibilities(aws_sdk_ecs::types::Compatibility::Fargate)
+            .network_mode(aws_sdk_ecs::types::NetworkMode::Awsvpc)
             .family(&service_def_name);
 
         let container_def = ContainerDefinition::builder()
@@ -759,8 +759,8 @@ impl AdapterDeployment {
             )
             .name(&service_def_name)
             .log_configuration(
-                aws_sdk_ecs::model::LogConfiguration::builder()
-                    .log_driver(aws_sdk_ecs::model::LogDriver::Awslogs)
+                aws_sdk_ecs::types::LogConfiguration::builder()
+                    .log_driver(aws_sdk_ecs::types::LogDriver::Awslogs)
                     .options("awslogs-group", format!("service-{service_def_name}"))
                     .options("awslogs-create-group", "true")
                     .options("awslogs-region", &self.region)
@@ -803,10 +803,10 @@ impl AdapterDeployment {
         spec: &FunctionalSpec,
     ) {
         let function_name = full_function_name(&spec.namespace);
-        let code = function_code::Builder::default()
+        let code = FunctionCode::builder()
             .image_uri(format!("{private_image_uri}:latest"))
             .build();
-        let environ = aws_sdk_lambda::model::Environment::builder()
+        let environ = aws_sdk_lambda::types::Environment::builder()
             .variables("NAME", "fn")
             .variables("NAMESPACE", spec.namespace.clone())
             .variables("EXECUTION_MODE", "functional_lambda")
@@ -862,8 +862,8 @@ impl AdapterDeployment {
             .execution_role_arn(role_arn)
             .cpu(format!("{total_ecs_cpus}"))
             .memory(format!("{total_ecs_mem}"))
-            .requires_compatibilities(aws_sdk_ecs::model::Compatibility::Fargate)
-            .network_mode(aws_sdk_ecs::model::NetworkMode::Awsvpc)
+            .requires_compatibilities(aws_sdk_ecs::types::Compatibility::Fargate)
+            .network_mode(aws_sdk_ecs::types::NetworkMode::Awsvpc)
             .family(&function_name);
         let mut invoker_def = ContainerDefinition::builder()
             .cpu(*invoker_cpu)
@@ -878,8 +878,8 @@ impl AdapterDeployment {
             )
             .name("invoker")
             .log_configuration(
-                aws_sdk_ecs::model::LogConfiguration::builder()
-                    .log_driver(aws_sdk_ecs::model::LogDriver::Awslogs)
+                aws_sdk_ecs::types::LogConfiguration::builder()
+                    .log_driver(aws_sdk_ecs::types::LogDriver::Awslogs)
                     .options("awslogs-group", format!("invoker-{function_name}"))
                     .options("awslogs-create-group", "true")
                     .options("awslogs-region", &self.region)
@@ -946,8 +946,8 @@ impl AdapterDeployment {
                     )
                     .name(&container_name)
                     .log_configuration(
-                        aws_sdk_ecs::model::LogConfiguration::builder()
-                            .log_driver(aws_sdk_ecs::model::LogDriver::Awslogs)
+                        aws_sdk_ecs::types::LogConfiguration::builder()
+                            .log_driver(aws_sdk_ecs::types::LogDriver::Awslogs)
                             .options("awslogs-group", format!("worker-{function_name}"))
                             .options("awslogs-create-group", "true")
                             .options("awslogs-region", &self.region)
@@ -999,9 +999,9 @@ impl AdapterDeployment {
                     .build(),
             );
             invoker_def = invoker_def.depends_on(
-                aws_sdk_ecs::model::ContainerDependency::builder()
+                aws_sdk_ecs::types::ContainerDependency::builder()
                     .container_name(&container_name)
-                    .condition(aws_sdk_ecs::model::ContainerCondition::Start)
+                    .condition(aws_sdk_ecs::types::ContainerCondition::Start)
                     .build(),
             )
         }
@@ -1078,8 +1078,8 @@ impl AdapterDeployment {
             .create_bucket()
             .bucket(&bucket_name())
             .create_bucket_configuration(
-                aws_sdk_s3::model::CreateBucketConfiguration::builder()
-                    .location_constraint(aws_sdk_s3::model::BucketLocationConstraint::from(
+                aws_sdk_s3::types::CreateBucketConfiguration::builder()
+                    .location_constraint(aws_sdk_s3::types::BucketLocationConstraint::from(
                         self.region.as_str(),
                     ))
                     .build(),
@@ -1095,17 +1095,17 @@ impl AdapterDeployment {
             .put_bucket_lifecycle_configuration()
             .bucket(&bucket_name())
             .lifecycle_configuration(
-                aws_sdk_s3::model::BucketLifecycleConfiguration::builder()
+                aws_sdk_s3::types::BucketLifecycleConfiguration::builder()
                     .rules(
-                        aws_sdk_s3::model::LifecycleRule::builder()
+                        aws_sdk_s3::types::LifecycleRule::builder()
                             .id("obelisk-expiration")
                             .expiration(
-                                aws_sdk_s3::model::LifecycleExpiration::builder()
+                                aws_sdk_s3::types::LifecycleExpiration::builder()
                                     .days(1)
                                     .build(),
                             )
-                            .filter(aws_sdk_s3::model::LifecycleRuleFilter::Prefix(tmp_s3_dir()))
-                            .status(aws_sdk_s3::model::ExpirationStatus::Enabled)
+                            .filter(aws_sdk_s3::types::LifecycleRuleFilter::Prefix(tmp_s3_dir()))
+                            .status(aws_sdk_s3::types::ExpirationStatus::Enabled)
                             .build(),
                     )
                     .build(),
@@ -1163,7 +1163,7 @@ impl AdapterDeployment {
                 for mt in mts.mount_targets().unwrap() {
                     let lf = mt.life_cycle_state().unwrap();
                     match lf {
-                        aws_sdk_efs::model::LifeCycleState::Available => {}
+                        aws_sdk_efs::types::LifeCycleState::Available => {}
                         _ => {
                             avail = false;
                             break;
@@ -1205,10 +1205,10 @@ impl AdapterDeployment {
             .create_access_point()
             .file_system_id(fs_id)
             .root_directory(
-                aws_sdk_efs::model::RootDirectory::builder()
+                aws_sdk_efs::types::RootDirectory::builder()
                     .path("/obelisk")
                     .creation_info(
-                        aws_sdk_efs::model::CreationInfo::builder()
+                        aws_sdk_efs::types::CreationInfo::builder()
                             .owner_gid(1001)
                             .owner_uid(1001)
                             .permissions("755")
@@ -1217,7 +1217,7 @@ impl AdapterDeployment {
                     .build(),
             )
             .posix_user(
-                aws_sdk_efs::model::PosixUser::builder()
+                aws_sdk_efs::types::PosixUser::builder()
                     .uid(1001)
                     .gid(1001)
                     .build(),
@@ -1241,7 +1241,7 @@ impl AdapterDeployment {
                 .unwrap()
                 .clone();
             match ap_info.life_cycle_state().unwrap() {
-                aws_sdk_efs::model::LifeCycleState::Available => {
+                aws_sdk_efs::types::LifeCycleState::Available => {
                     let ap_id = ap_info.access_point_id().unwrap();
                     let ap_arn = ap_info.access_point_arn().unwrap();
                     return (ap_id.into(), ap_arn.into());
@@ -1290,12 +1290,12 @@ impl AdapterDeployment {
             .efs_client
             .create_file_system()
             .tags(
-                aws_sdk_efs::model::Tag::builder()
+                aws_sdk_efs::types::Tag::builder()
                     .key("Name")
                     .value(&fs_name)
                     .build(),
             )
-            .performance_mode(aws_sdk_efs::model::PerformanceMode::GeneralPurpose)
+            .performance_mode(aws_sdk_efs::types::PerformanceMode::GeneralPurpose)
             .creation_token(&fs_name)
             .send()
             .await
@@ -1316,7 +1316,7 @@ impl AdapterDeployment {
                 .clone();
             let state = fs_info.life_cycle_state().unwrap();
             match state {
-                aws_sdk_efs::model::LifeCycleState::Available => {
+                aws_sdk_efs::types::LifeCycleState::Available => {
                     return fs_info.file_system_id().unwrap().into();
                 }
                 _ => {
@@ -1371,10 +1371,10 @@ impl AdapterDeployment {
             }
         }
 
-        let code = function_code::Builder::default()
+        let code = FunctionCode::builder()
             .image_uri(format!("{private_image_uri}:latest"))
             .build();
-        let environ = aws_sdk_lambda::model::Environment::builder()
+        let environ = aws_sdk_lambda::types::Environment::builder()
             .variables("NAME", "placeholder")
             .variables("NAMESPACE", &spec.namespace)
             .variables("EXECUTION_MODE", "messaging_lambda")
@@ -1388,7 +1388,7 @@ impl AdapterDeployment {
             .send()
             .await;
         println!("Creating messaging function: {function_name}");
-        let mut vpc_config = aws_sdk_lambda::model::VpcConfig::builder().security_group_ids(sg_id);
+        let mut vpc_config = aws_sdk_lambda::types::VpcConfig::builder().security_group_ids(sg_id);
         for subnet_id in subnet_ids {
             vpc_config = vpc_config.subnet_ids(subnet_id);
         }
@@ -1403,7 +1403,7 @@ impl AdapterDeployment {
             .timeout(spec.timeout)
             .role(role_arn)
             .file_system_configs(
-                aws_sdk_lambda::model::FileSystemConfig::builder()
+                aws_sdk_lambda::types::FileSystemConfig::builder()
                     .arn(ap_arn)
                     .local_mount_path(crate::messaging_mnt_path())
                     .build(),
@@ -1457,12 +1457,12 @@ impl AdapterDeployment {
             }
         }
 
-        let code = function_code::Builder::default()
+        let code = FunctionCode::builder()
             .image_uri(format!("{private_image_uri}:latest"))
             .build();
         let receiver_mem: i32 = 512;
         let receiver_timeout: i32 = 1;
-        let environ = aws_sdk_lambda::model::Environment::builder()
+        let environ = aws_sdk_lambda::types::Environment::builder()
             .variables("NAME", "placeholder")
             .variables("NAMESPACE", &spec.namespace)
             .variables("EXECUTION_MODE", "messaging_recv")
@@ -1512,22 +1512,22 @@ impl AdapterDeployment {
             .execution_role_arn(role_arn)
             .cpu(format!("{}", spec.cpus))
             .memory(format!("{}", spec.mem))
-            .requires_compatibilities(aws_sdk_ecs::model::Compatibility::Fargate)
-            .network_mode(aws_sdk_ecs::model::NetworkMode::Awsvpc)
+            .requires_compatibilities(aws_sdk_ecs::types::Compatibility::Fargate)
+            .network_mode(aws_sdk_ecs::types::NetworkMode::Awsvpc)
             .family(&service_def_name)
             .volumes(
-                aws_sdk_ecs::model::Volume::builder()
+                aws_sdk_ecs::types::Volume::builder()
                     .name("obelisk_volume")
                     .efs_volume_configuration(
-                        aws_sdk_ecs::model::EfsVolumeConfiguration::builder()
+                        aws_sdk_ecs::types::EfsVolumeConfiguration::builder()
                             .file_system_id(fs_id)
                             .authorization_config(
-                                aws_sdk_ecs::model::EfsAuthorizationConfig::builder()
+                                aws_sdk_ecs::types::EfsAuthorizationConfig::builder()
                                     .access_point_id(ap_id)
-                                    .iam(aws_sdk_ecs::model::EfsAuthorizationConfigIam::Enabled)
+                                    .iam(aws_sdk_ecs::types::EfsAuthorizationConfigIam::Enabled)
                                     .build(),
                             )
-                            .transit_encryption(aws_sdk_ecs::model::EfsTransitEncryption::Enabled)
+                            .transit_encryption(aws_sdk_ecs::types::EfsTransitEncryption::Enabled)
                             .build(),
                     )
                     .build(),
@@ -1546,21 +1546,21 @@ impl AdapterDeployment {
             )
             .name(&service_def_name)
             .ulimits(
-                aws_sdk_ecs::model::Ulimit::builder()
-                    .name(aws_sdk_ecs::model::UlimitName::Nofile)
+                aws_sdk_ecs::types::Ulimit::builder()
+                    .name(aws_sdk_ecs::types::UlimitName::Nofile)
                     .soft_limit(10000)
                     .hard_limit(10000)
                     .build(),
             )
             .mount_points(
-                aws_sdk_ecs::model::MountPoint::builder()
+                aws_sdk_ecs::types::MountPoint::builder()
                     .container_path(crate::messaging_mnt_path())
                     .source_volume("obelisk_volume")
                     .build(),
             )
             .log_configuration(
-                aws_sdk_ecs::model::LogConfiguration::builder()
-                    .log_driver(aws_sdk_ecs::model::LogDriver::Awslogs)
+                aws_sdk_ecs::types::LogConfiguration::builder()
+                    .log_driver(aws_sdk_ecs::types::LogDriver::Awslogs)
                     .options("awslogs-group", format!("service-{service_def_name}"))
                     .options("awslogs-create-group", "true")
                     .options("awslogs-region", &self.region)

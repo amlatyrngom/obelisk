@@ -3,8 +3,8 @@ pub mod deploy;
 pub mod frontend;
 
 use crate::{clean_die, leasing::Leaser};
-use aws_sdk_dynamodb::model::{AttributeAction, AttributeValue, AttributeValueUpdate};
-use aws_sdk_sqs::model::DeleteMessageBatchRequestEntry;
+use aws_sdk_dynamodb::types::{AttributeAction, AttributeValue, AttributeValueUpdate};
+use aws_sdk_sqs::types::DeleteMessageBatchRequestEntry;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;

@@ -164,7 +164,7 @@ pub async fn build_user_deployment(project_name: &str, system_img: &str, deploym
     build_image(false);
     let (private_uri, public_uri) = aws.create_repos(project_name).await;
     push_images(&private_uri, &public_uri, false);
-    // Do deployment.
+    // // Do deployment.
     for deployment in deployments {
         aws.deploy(system_img, &private_uri, &public_uri, &deployment)
             .await;

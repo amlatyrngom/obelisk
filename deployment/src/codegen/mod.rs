@@ -108,10 +108,13 @@ pub(crate) fn gen_cargo(mut cargo_config: CargoConfig) {
     if !deps.contains_key("tokio") {
         deps.insert(
             "tokio".into(),
-            toml::toml!(
+            toml::from_str(
+                r#"
                 version = "*"
                 features = ["full"]
-            ),
+            "#,
+            )
+            .unwrap(),
         );
     }
     if !deps.contains_key("jemallocator") {
