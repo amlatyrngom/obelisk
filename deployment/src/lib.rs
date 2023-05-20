@@ -41,6 +41,8 @@ pub struct Functional {
     mem_size: i32,
     timeout: i32,
     concurrency: i32,
+    ephemeral: Option<i32>,
+    caller_mem: Option<i32>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

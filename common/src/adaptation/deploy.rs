@@ -33,6 +33,8 @@ pub struct FunctionalSpec {
     pub mem: i32,
     pub timeout: i32,
     pub concurrency: i32,
+    pub ephemeral: i32,
+    pub caller_mem: i32,
 }
 
 pub struct MessagingSpec {
@@ -63,6 +65,7 @@ pub struct FunctionalDeploymentInfo {
     pub function_mem: i32,
     pub function_cpu: i32,
     pub concurrency: i32,
+    pub caller_mem: i32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -90,7 +93,11 @@ pub struct DeploymentInfo {
     pub msg_info: Option<MessagingDeploymentInfo>,
 }
 
-pub fn make_function_info(function_mem: i32, concurrency: i32) -> FunctionalDeploymentInfo {
+pub fn make_function_info(
+    function_mem: i32,
+    concurrency: i32,
+    caller_mem: i32,
+) -> FunctionalDeploymentInfo {
     let invoker_mem = 256;
     let invoker_cpu = 256;
     let function_cpu = (((function_mem as f64) / 1769.0) * 1024.0) as i32;
@@ -124,6 +131,7 @@ pub fn make_function_info(function_mem: i32, concurrency: i32) -> FunctionalDepl
         function_mem,
         function_cpu,
         concurrency,
+        caller_mem,
     }
 }
 
@@ -825,6 +833,11 @@ impl AdapterDeployment {
             .function_name(&function_name)
             .code(code)
             .memory_size(spec.mem)
+            .ephemeral_storage(
+                aws_sdk_lambda::types::EphemeralStorage::builder()
+                    .size(spec.ephemeral)
+                    .build(),
+            )
             .package_type(PackageType::Image)
             .timeout(spec.timeout)
             .role(role_arn)
@@ -844,7 +857,7 @@ impl AdapterDeployment {
     ) -> FunctionalDeploymentInfo {
         // Create.
         let function_name = full_function_name(&spec.namespace);
-        let deployment_info = make_function_info(spec.mem, spec.concurrency);
+        let deployment_info = make_function_info(spec.mem, spec.concurrency, spec.caller_mem);
         let FunctionalDeploymentInfo {
             invoker_cpu,
             invoker_mem,
@@ -854,6 +867,7 @@ impl AdapterDeployment {
             function_mem,
             function_cpu,
             concurrency,
+            caller_mem: _,
         } = &deployment_info;
         let mut task_def = self
             .ecs_client

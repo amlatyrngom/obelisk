@@ -5,6 +5,8 @@ use rand::seq::SliceRandom;
 use serde_json::Value;
 use std::sync::Arc;
 
+const NUM_DIRECT_RETRIES: u64 = 2;
+
 /// FunctionalClient.
 #[derive(Clone)]
 pub struct FunctionalClient {
@@ -82,12 +84,16 @@ impl FunctionalClient {
         Ok(resp)
     }
 
-    /// Internal invoke. Also returns whether a direct call as made.
-    pub async fn invoke_internal(&self, arg: &[u8]) -> Result<(Value, bool), String> {
-        // Find url for direct call.
-        let url = self.pick_random_url().await;
-        // Try direct call.
-        let resp: Option<FunctionResp> = if let Some(url) = url {
+    /// Try direct invocation.
+    pub async fn invoke_direct(&self, arg: &[u8]) -> Option<FunctionResp> {
+        for _ in 0..NUM_DIRECT_RETRIES {
+            // Find random url. TODO: Better load balancing.
+            let url = self.pick_random_url().await;
+            if url.is_none() {
+                break;
+            }
+            let url = url.unwrap();
+            // Send request.
             let resp = self
                 .direct_client
                 .post(&url)
@@ -96,6 +102,7 @@ impl FunctionalClient {
                 .body(arg.to_vec())
                 .send()
                 .await;
+            // Return in case of success.
             if let Ok(resp) = resp {
                 let valid = resp.headers().get("obelisk-meta").unwrap();
                 let valid: bool = valid.to_str().unwrap().parse().unwrap();
@@ -104,19 +111,23 @@ impl FunctionalClient {
                         let body = resp.bytes().await.unwrap();
                         body.to_vec()
                     };
-                    Some(serde_json::from_slice(&body).unwrap())
+                    return Some(serde_json::from_slice(&body).unwrap());
                 } else {
                     println!("Contacted full invoker");
-                    None
+                    continue;
                 }
             } else {
                 println!("HTTP error: {resp:?}");
-                None
+                break;
             }
-        } else {
-            None
-        };
+        }
+        None
+    }
 
+    /// Internal invoke. Also returns whether a direct call as made.
+    pub async fn invoke_internal(&self, arg: &[u8]) -> Result<(Value, bool), String> {
+        // Try direct call.
+        let resp = self.invoke_direct(arg).await;
         // If direct not success, try lambda.
         let (resp, direct_call) = if let Some(resp) = resp {
             (resp, true)

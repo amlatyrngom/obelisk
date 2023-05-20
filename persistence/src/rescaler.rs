@@ -10,7 +10,7 @@ const ECS_BASE_COST: f64 = 0.015;
 /// Ecs vcpus.
 const ECS_VCPUS: f64 = 0.25;
 /// Time saved with replication.
-const REPLICATION_GAIN: f64 = 0.005;
+const REPLICATION_GAIN: f64 = 0.010;
 
 /// Info to maintain for scaling functions.
 #[derive(Serialize, Deserialize)]

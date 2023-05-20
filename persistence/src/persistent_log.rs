@@ -13,6 +13,9 @@ use crate::database::Database;
 use crate::log_replica::PendingLog;
 use crate::{PersistenceReqMeta, PersistenceRespMeta};
 const MAX_REPLICATION_FAILURES: usize = 100;
+/// For some reason, Fargate is not deploying to us-east-2a anymore. Figure this out.
+/// Keep this false for now, which means that replicas will be on two availability zones instead of three.
+const USE_AZ_PLUS_1: bool = false;
 
 /// A lockful implementation of persistent log.
 /// Probably should not have more than two concurrent flushers.
@@ -32,6 +35,7 @@ pub struct PersistentLog {
 }
 
 /// Modifyable internal state.
+/// TODO: Fix first log entry issues. The current implementation seems to start at 2, which is fine correctness-wise, but should be 1.
 struct PersistentLogInner {
     curr_lsn: usize,                    // curr_lsn+1 is the lsn of the next enqueue.
     flush_lsn: usize,                   // Highest lsn known to be persisted or replicated.
@@ -248,7 +252,7 @@ impl PersistentLog {
         inner.flush_lsn
     }
 
-    /// Get current flush lsn.
+    /// Get current start lsn.
     pub async fn get_start_lsn(&self) -> usize {
         let inner = self.inner.lock().await;
         inner.start_lsn
@@ -486,7 +490,7 @@ impl PersistentLog {
                     }
                 };
                 let mut stmt = match conn.prepare(
-                    "SELECT entries FROM system__logs WHERE lo_lsn > ? ORDER BY lo_lsn LIMIT 100",
+                    "SELECT entries FROM system__logs WHERE hi_lsn > ? ORDER BY lo_lsn LIMIT 100",
                 ) {
                     Ok(stmt) => stmt,
                     Err(x) => {
@@ -703,6 +707,7 @@ impl PersistentLog {
         // Check if quorum can be achieved.
         // changes_instances ensures that num_total is 0 when quorum is not safe.
         let num_total = instances.len();
+        // println!("Persist on replicas: {num_total} instances.");
         let failed_replications = self.failed_replications.clone();
         if num_total == 0 {
             failed_replications.fetch_add(1, atomic::Ordering::Relaxed);
@@ -869,7 +874,9 @@ impl PersistentLog {
     /// When set_ownership is set, will also set self as owner.
     async fn change_instances(&self, set_ownership: bool) {
         // Prevent concurrent changes.
+        // println!("Changing instances.");
         let mut _replication_lock = self.replication_lock.write().await;
+        // println!("Changing instances. Lock acquired.");
         let curr_instances = {
             // No change if terminating.
             let inner = self.inner.lock().await;
@@ -891,6 +898,7 @@ impl PersistentLog {
         // Read instances.
         let mut new_instances = Vec::new();
         let mut all_instances = self.front_end.serverful_instances().await;
+        // println!("Changing instances. Found: {all_instances:?}.");
         // Order join_time. This to maximize reuse.
         all_instances.sort_by(|x1, x2| {
             match x1.join_time.cmp(&x2.join_time) {
@@ -907,19 +915,25 @@ impl PersistentLog {
             .collect();
         // We want to tolerate AZ + 1 failures, so we need at least three AZs.
         // We need 6 nodes across 3 AZs, or 5 nodes across 5 AZs.
+        // TODO(Amadou): Fargate is not using us-east-2a anymore. Figure this out.
         let mut num_azs = 0;
         let mut is_safe = false;
         for instance in all_instances {
-            let az_count = az_counts.get_mut(&instance.az).unwrap();
-            // Have no more than two nodes per az.
-            if *az_count < 2 {
-                // If this az is not yet considered, add it to the list.
-                if *az_count == 0 {
-                    num_azs += 1;
+            if USE_AZ_PLUS_1 {
+                let az_count = az_counts.get_mut(&instance.az).unwrap();
+                // Have no more than two nodes per az.
+                if *az_count < 2 {
+                    // If this az is not yet considered, add it to the list.
+                    if *az_count == 0 {
+                        num_azs += 1;
+                    }
+                    *az_count += 1;
+                    new_instances.push(instance);
                 }
-                *az_count += 1;
+            } else {
                 new_instances.push(instance);
             }
+
             // Check if replication is safe for AZ+1 failure.
             if new_instances.len() == 6 || num_azs == 5 {
                 is_safe = true;

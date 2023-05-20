@@ -250,7 +250,7 @@ impl AWS {
             let messaging_spec = MessagingSpec {
                 mem: messaging.mem_size,
                 fn_mem: messaging.fn_mem.unwrap_or(messaging.mem_size),
-                caller_mem: messaging.caller_mem.unwrap_or(512),
+                caller_mem: messaging.caller_mem.unwrap_or(0),
                 cpus: messaging.mem_size / 2,
                 timeout: messaging.timeout,
                 namespace: deployment.namespace.clone(),
@@ -294,6 +294,8 @@ impl AWS {
                 timeout: functional.timeout,
                 namespace: deployment.namespace.clone(),
                 concurrency: functional.concurrency,
+                ephemeral: functional.ephemeral.unwrap_or(512),
+                caller_mem: functional.caller_mem.unwrap_or(512),
             };
             let deployed_fn = self
                 .deployer

@@ -10,12 +10,20 @@ const MOVING_FACTOR: f64 = 0.25;
 const EXTRA_COMPUTE: f64 = 1.2;
 /// Maximum number of services per function.
 /// Increase if necessary.
-const MAXIMUM_FUNCTION_SCALE: u64 = 10;
+const MAXIMUM_FUNCTION_SCALE: u64 = 20;
+/// Overhead of lambda.
+const MAX_LAMBDA_OVERHEAD: f64 = 0.020;
+/// Safe scale at which internal concurrency can be relied on (AZ+1 failure).
+const SAFE_SCALE: f64 = 3.0;
+/// Seek greater performance within this percentage of the optimal cost.
+/// Set to 0 for cost-only optimization.
+const PERF_OPTIMIZATION: f64 = 0.0;
 
 /// Info to maintain for scaling functions.
 #[derive(Serialize, Deserialize)]
 struct FunctionalScalingInfo {
     activity: f64,
+    waiting: f64,
 }
 
 /// Metrics for scaling functions.
@@ -48,44 +56,53 @@ impl Rescaler for FunctionalRescaler {
             serde_json::from_value(scaling_state.deployment.clone()).unwrap();
         let deployed_fn = deployed_fn.fn_info.unwrap();
         // Read current activity from scaling info.
-        let mut activity = if let Some(scaling_info) = &scaling_state.scaling_info {
+        let (mut activity, mut waiting) = if let Some(scaling_info) = &scaling_state.scaling_info {
             let scaling_info: FunctionalScalingInfo =
                 serde_json::from_value(scaling_info.clone()).unwrap();
-            scaling_info.activity
+            (scaling_info.activity, scaling_info.waiting)
         } else {
-            0.0
+            (0.0, 0.0)
         };
         // Compute the total activity of the new metrics.
         let total_interval = curr_timestamp
             .signed_duration_since(scaling_state.last_rescale)
             .num_seconds() as f64;
         let mut total_active_secs: f64 = 0.0;
+        let mut total_waiting_secs: f64 = 0.0;
         println!("Num metrics: {}", metrics.len());
         for m in metrics.iter() {
             let m: FunctionalMetric = serde_json::from_value(m.clone()).unwrap();
             total_active_secs += m.duration.as_secs_f64();
+            total_waiting_secs += MAX_LAMBDA_OVERHEAD;
         }
-        // Compute moving average.
+        // Compute moving averages.
         let new_activity = total_active_secs / total_interval;
+        let new_waiting = total_waiting_secs / total_interval;
         activity = (1.0 - MOVING_FACTOR) * activity + MOVING_FACTOR * new_activity;
+        waiting = (1.0 - MOVING_FACTOR) * waiting + MOVING_FACTOR * new_waiting;
         // Compute target scale.
         let ecs_cost: f64 = ((deployed_fn.total_ecs_cpus as f64) / 1024.0) * 0.012144
             + ((deployed_fn.total_ecs_mem as f64) / 1024.0) * 0.0013335;
         let lambda_cost: f64 =
-            ((deployed_fn.function_mem as f64) / 1024.0) * (0.0000166667 * 3600.0);
+            ((deployed_fn.function_mem as f64) / 1024.0) * (0.0000166667 * 3600.0) * activity;
+        let waiting_cost: f64 =
+            ((deployed_fn.caller_mem as f64) / 1024.0) * (0.0000166667 * 3600.0) * waiting;
         println!("Costs. lambda={lambda_cost}; ecs={ecs_cost}; Activity={activity}");
-        let mut target_scale: f64 = activity * lambda_cost / ecs_cost;
+        let mut target_scale: f64 = (lambda_cost + waiting_cost) / ecs_cost;
         println!("Target Scale: {target_scale}");
         // Avoid allocated more than extra despite cost savings.
         if target_scale.floor() > activity * EXTRA_COMPUTE {
             target_scale = (activity * EXTRA_COMPUTE).ceil();
         }
         println!("Target Scale: {target_scale}");
-        // After three nodes are deployed to different AZs, internal concurrency can safely handle requests.
-        if target_scale > 3.0 {
-            target_scale = 3.0
-                + (target_scale - 3.0)
+        // After enough nodes are deployed, internal concurrency can safely handle requests.
+        if target_scale > SAFE_SCALE {
+            target_scale = SAFE_SCALE
+                + (target_scale - SAFE_SCALE)
                     / ((deployed_fn.concurrency * deployed_fn.num_workers) as f64);
+        }
+        if PERF_OPTIMIZATION > 1e-4 {
+            target_scale = target_scale + PERF_OPTIMIZATION * target_scale;
         }
         // Set new scale.
         let mut new_scale = target_scale.floor() as u64;
@@ -93,7 +110,7 @@ impl Rescaler for FunctionalRescaler {
             new_scale = MAXIMUM_FUNCTION_SCALE;
         }
         println!("New Scale: {target_scale}");
-        let new_scaling_info = FunctionalScalingInfo { activity };
+        let new_scaling_info = FunctionalScalingInfo { activity, waiting };
         (new_scale, serde_json::to_value(&new_scaling_info).unwrap())
     }
 }
@@ -193,7 +210,10 @@ mod tests {
             let scaling_info = if let Some(scaling_info) = scaling_state.scaling_info {
                 serde_json::from_value(scaling_info).unwrap()
             } else {
-                FunctionalScalingInfo { activity: 0.0 }
+                FunctionalScalingInfo {
+                    activity: 0.0,
+                    waiting: 0.0,
+                }
             };
             let activity_lo = expected_activity - expected_activity / 10.0;
             let activity_hi = expected_activity + expected_activity / 10.0;
