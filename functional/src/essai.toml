@@ -1,27 +1,30 @@
-namespace = "wal"
+namespace = "functional"
 
 [subsystem]
 [subsystem.rescaler] # Will become a lambda function.
-path = "persistence::WalRescaler"
+path = "functional::rescaler::FunctionalRescaler"
 mem = 512
 timeout = 10
 
 [[subsystem.services]] # Will become a docker container.
-name = "replica"
-path = "persistence::LogReplica"
+name = "invoker"
+path = "functional::invoker::Invoker"
 # cpus should be [256, 512, 1024, 2048, 4096, 8192]
-cpus = 256
+cpus = 512
 # mem should be either 2xcpus, 4xcpus, or 8xcpus.
 mem = 1024
-# Timeout should be <= than 100 seconds.
-timeout = 100
+# Timeout should be less than 1 minute.
+timeout = 30
+# Unique should be true if only one instance with a given identifier is to be allowed.
+unique = false
+
 
 [[handlers]] # Can have many handlers with unique names within a namespace.
 # Must be unique within the namespace.
-name = "echolog"
+name = "echofn"
 subsystem = "functional"
 # Points to handler class.
-path = "persistence::Echo"
+path = "functional::echo::Echo"
 # Memory must be one of [512MB, 1024MB, 2048MB, 4096MB, 8196MB]
 # This value should be the minimum required to execute the handler.
 # The underlying system will autoscale it.
@@ -32,10 +35,8 @@ timeout = 3
 # Warning: Lambdas attached to a filesystem do not have access to the wider internet.
 # They only have access to DynamoDB, S3, and to the filesystem. 
 # Default: False.
-persistent = true
+persistent = false
 # How many requests an instance can simultanously handle. Default: 1.
 concurrency = 2
 # Amount of memory on the caller. Used to calculate user cost. Default: 512
 caller = 512
-# Unique 
-unique = true

@@ -3,6 +3,10 @@ mod codegen;
 
 const BUILD_DIR: &str = ".obelisk_build";
 
+use common::{
+    deployment::{self, HandlerSpec, NamespaceSpec, ServiceSpec, SubsystemSpec},
+    RescalerSpec,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -70,6 +74,41 @@ pub struct DeployedFunction {
     pub workers: i32,
 }
 
+/// Service Rescaler.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub(crate) struct Rescaler {
+    path: String,
+    mem: i32,
+    timeout: i32,
+}
+
+/// Service Rescaler.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub(crate) struct Service {
+    name: String,
+    path: String,
+    mem: i32,
+    cpus: i32,
+    timeout: i32,
+    unique: Option<bool>,
+}
+
+/// VISC handler.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub(crate) struct Handler {
+    subsystem: String,
+    name: String,
+    path: String,
+    mem: i32,
+    timeout: i32,
+    persistent: Option<bool>,
+    concurrency: Option<i32>,
+    caller: Option<i32>,
+    unique: Option<bool>,
+    ephemeral: Option<i32>,
+}
+
+/// A VISC subsystem.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub(crate) struct Subsystem {
     service_path: String,
@@ -79,6 +118,23 @@ pub(crate) struct Subsystem {
     service_grace: i32,
     rescaler_mem: i32,
     rescaler_timeout: i32,
+}
+
+/// A VISC subsystem.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub(crate) struct Subsystem1 {
+    rescaler: Rescaler,
+    services: Vec<Service>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Deployment1 {
+    /// Everything within a namespace has the same filesystem, s3 bucket, ecs cluster, etc.
+    namespace: String,
+    /// A subsystem allows implementing VISC for an API.
+    subsystem: Option<Subsystem1>,
+    /// A subsystem allows implementing VISC
+    handlers: Option<Vec<Handler>>,
 }
 
 fn exec_cmd(program: &str, args: Vec<&str>) {
@@ -115,60 +171,133 @@ fn push_images(private_uri: &str, public_uri: &str, for_system: bool) {
     exec_cmd("docker", vec!["push", public_uri]);
 }
 
+fn make_specs(
+    deployments: &[Deployment1],
+    public_uri: &str,
+    private_uri: &str,
+) -> Vec<NamespaceSpec> {
+    deployments
+        .iter()
+        .map(|deployment| {
+            let subsystem_spec = deployment.subsystem.as_ref().map(|s| {
+                let rescaler_spec = RescalerSpec {
+                    namespace: deployment.namespace.clone(),
+                    timeout: s.rescaler.timeout,
+                    mem: s.rescaler.mem,
+                };
+                let service_specs = s
+                    .services
+                    .iter()
+                    .map(|s| {
+                        (
+                            s.name.clone(),
+                            ServiceSpec {
+                                namespace: deployment.namespace.clone(),
+                                name: s.name.clone(),
+                                timeout: s.timeout,
+                                mem: s.mem,
+                                cpus: s.cpus,
+                                unique: s.unique.unwrap_or(false),
+                            },
+                        )
+                    })
+                    .collect();
+                SubsystemSpec {
+                    rescaler_spec,
+                    service_specs,
+                }
+            });
+            let handler_specs = deployment
+                .handlers
+                .clone()
+                .unwrap_or(vec![])
+                .iter()
+                .map(|h| {
+                    (
+                        h.name.clone(),
+                        HandlerSpec {
+                            subsystem: h.subsystem.clone(),
+                            namespace: deployment.namespace.clone(),
+                            name: h.name.clone(),
+                            timeout: h.timeout,
+                            default_mem: h.mem,
+                            concurrency: h.concurrency.unwrap_or(1),
+                            ephemeral: h.ephemeral.unwrap_or(512),
+                            persistent: h.persistent.unwrap_or(false),
+                            unique: h.unique.unwrap_or(false),
+                        },
+                    )
+                })
+                .collect();
+            NamespaceSpec {
+                namespace: deployment.namespace.clone(),
+                public_img_url: public_uri.into(),
+                private_img_url: private_uri.into(),
+                subsystem_spec,
+                handler_specs,
+            }
+        })
+        .collect()
+}
+
 pub async fn build_system(deployments: &[String]) {
     // Gen main file.
-    let deployments: Vec<Deployment> = deployments
+    let deployments: Vec<Deployment1> = deployments
         .iter()
         .map(|s| toml::from_str(s).unwrap())
         .collect();
-    codegen::gen_main(&deployments, true);
+    println!("Deployments: {deployments:?}");
     // Gen cargo file.
     let system_cargo = include_str!("SystemCargo.toml");
     let system_cargo: CargoConfig = toml::from_str(system_cargo).unwrap();
     codegen::gen_cargo(system_cargo);
-    // Create repos and push image.
-    let aws = aws::AWS::new().await;
-    aws.deployer.create_cluster().await;
-    aws.deployer.create_bucket().await;
-    aws.deployer.get_subnet_with_endpoints(true).await;
+    // Gen main file.
+    codegen::gen_main(&deployments, true);
     // Build image.
+    let aws = aws::AWS::new().await;
     build_image(true);
     let (private_uri, public_uri) = aws.create_repos("system").await;
+    println!("URLS: {private_uri}; {public_uri}");
     push_images(&private_uri, &public_uri, true);
-    for deployment in deployments {
-        aws.deploy(&public_uri, &private_uri, &public_uri, &deployment)
-            .await;
+    // Make specs.
+    let namespace_specs = make_specs(&deployments, &public_uri, &private_uri);
+    let deployer = deployment::Deployment::new().await;
+    for spec in &namespace_specs {
+        deployer.setup_namespace(spec).await.unwrap();
+    }
+    for spec in &namespace_specs {
+        deployer.redeploy_subsystems(spec).await;
     }
 }
 
-pub async fn teardown_deployment() {
-    let aws = aws::AWS::new().await;
-    aws.deployer.teardown_vpc_endpoints().await;
-}
+// pub async fn teardown_deployment() {
+//     let aws = aws::AWS::new().await;
+//     aws.deployer.teardown_vpc_endpoints().await;
+// }
 
-pub async fn build_user_deployment(project_name: &str, system_img: &str, deployments: &[String]) {
-    // Gen main file.
-    let deployments: Vec<Deployment> = deployments
-        .iter()
-        .map(|s| toml::from_str(s).unwrap())
-        .collect();
-    codegen::gen_main(&deployments, false);
-    // Gen cargo file.
-    let user_cargo = std::fs::read_to_string("Cargo.toml").unwrap();
-    let user_cargo: CargoConfig = toml::from_str(&user_cargo).unwrap();
-    codegen::gen_cargo(user_cargo);
-    // Create repos and push image.
-    let aws = aws::AWS::new().await;
-    aws.deployer.create_cluster().await;
-    aws.deployer.create_bucket().await;
-    aws.deployer.get_subnet_with_endpoints(true).await;
-    // Make user repos.
-    build_image(false);
-    let (private_uri, public_uri) = aws.create_repos(project_name).await;
-    push_images(&private_uri, &public_uri, false);
-    // // Do deployment.
-    for deployment in deployments {
-        aws.deploy(system_img, &private_uri, &public_uri, &deployment)
-            .await;
-    }
-}
+// pub async fn build_user_deployment(project_name: &str, system_img: &str, deployments: &[String]) {
+//     // Gen main file.
+//     let deployments: Vec<Deployment> = deployments
+//         .iter()
+//         .map(|s| toml::from_str(s).unwrap())
+//         .collect();
+//     codegen::gen_main(&deployments, false);
+//     // Gen cargo file.
+//     let user_cargo = std::fs::read_to_string("Cargo.toml").unwrap();
+//     let user_cargo: CargoConfig = toml::from_str(&user_cargo).unwrap();
+//     codegen::gen_cargo(user_cargo);
+//     // Create repos and push image.
+//     let aws = aws::AWS::new().await;
+//     aws.deployer.create_cluster().await;
+//     aws.deployer.create_bucket().await;
+//     aws.deployer.get_subnet_with_endpoints(true).await;
+//     // Make user repos.
+//     build_image(false);
+//     let (private_uri, public_uri) = aws.create_repos(project_name).await;
+//     push_images(&private_uri, &public_uri, false);
+//     // // Do deployment.
+//     for deployment in deployments {
+//         aws.deploy(system_img, &private_uri, &public_uri, &deployment)
+//             .await;
+//     }
+// }

@@ -19,6 +19,6 @@ aws-types = "*"
 serde = {version="*", features=["derive"]}
 common = {path="../common"}
 functional = {path="../functional"}
-messaging = {path="../messaging"}
+# messaging = {path="../messaging"}
 persistence = {path="../persistence"}
-microbench = {path="../microbench"}
+# microbench = {path="../microbench"}

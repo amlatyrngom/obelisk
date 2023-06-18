@@ -1,8 +1,8 @@
-use super::Deployment;
+use super::Deployment1;
 use proc_macro2::TokenStream;
 use quote::quote;
 
-pub fn gen_functional_static_code(deployments: &[Deployment]) -> TokenStream {
+pub fn gen_functional_static_code(deployments: &[Deployment1]) -> TokenStream {
     let mut all_functional_checks = quote! {};
     for deployment in deployments.iter() {
         if let Some(functional) = &deployment.functional {

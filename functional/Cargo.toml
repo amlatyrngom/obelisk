@@ -14,6 +14,8 @@ aws-smithy-types = "*"
 aws-types = "*"
 async-trait = "*"
 serde_json = "*"
+bincode = "*"
+base64 = "0.21"
 rand = "*"
 serde = {version="*", features=["derive"]}
 chrono = {version="*", features=["serde"]}

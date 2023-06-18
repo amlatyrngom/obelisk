@@ -1,8 +1,8 @@
-use super::Deployment;
+use super::Deployment1;
 use proc_macro2::TokenStream;
 use quote::quote;
 
-pub fn gen_messaging_static_code(deployments: &[Deployment]) -> TokenStream {
+pub fn gen_messaging_static_code(deployments: &[Deployment1]) -> TokenStream {
     let mut all_messaging_checks = quote! {};
     // Add services and rescalers.
     for deployment in deployments.iter() {

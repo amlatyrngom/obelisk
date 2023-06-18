@@ -1,33 +1,61 @@
-mod functional;
-mod generic;
-mod messaging;
+// mod functional;
+// mod generic;
+// mod messaging;
 mod rescaling;
+mod wrapper;
 
 use super::{exec_cmd, BUILD_DIR};
-use super::{Binary, CargoConfig, Deployment};
+use super::{Binary, CargoConfig, Deployment1};
+use proc_macro2::TokenStream;
 use quote::quote;
 
-fn gen_main_file_content(deployments: &[Deployment], for_system: bool) -> String {
-    let imports = generic::gen_imports(for_system);
+pub fn make_system_path(path: &str, for_system: bool) -> syn::Path {
+    let path = if for_system {
+        path.into()
+    } else {
+        format!("obelisk::{path}")
+    };
+    syn::parse_str(&path).unwrap()
+}
+
+pub fn gen_imports(for_system: bool) -> TokenStream {
+    let common_path = make_system_path("common", for_system);
+    // let messaging_path = make_system_path("messaging", for_system);
+    // let persistence_path = make_system_path("persistence", for_system);
+    let imports = quote! {
+        use lambda_runtime::{service_fn, LambdaEvent, Error};
+        use serde_json::Value;
+        use #common_path;
+        // Used by rescaler.
+        use #common_path::{ScalingStateRescaler, Rescaler, RescalerSpec};
+        // Used by handlers.
+        use #common_path::{ServerlessHandler, ServerlessWrapper, InstanceInfo, HandlerKit, ServerlessStorage};
+        use lazy_static::lazy_static;
+        use std::sync::Arc;
+        use warp::Filter;
+        use std::convert::Infallible;
+        use tokio::signal::unix;
+        use jemallocator::Jemalloc;
+    };
+
+    imports
+}
+
+fn gen_main_file_content(deployments: &[Deployment1], for_system: bool) -> String {
+    let imports = gen_imports(for_system);
     let static_code = {
-        let generic_code = generic::gen_generic_static_code(deployments);
         let rescaling_code = rescaling::gen_rescaler_static_code(deployments);
-        let functional_code = functional::gen_functional_static_code(deployments);
-        let messaging_code = messaging::gen_messaging_static_code(deployments);
+        let wrapper_code = wrapper::gen_wrapper_static_code(deployments);
         quote! {
             lazy_static! {
-                #generic_code
                 #rescaling_code
-                #functional_code
-                #messaging_code
+                #wrapper_code
             }
         }
     };
     let main_code = {
-        let generic_code = generic::gen_generic_main();
         let rescaling_code = rescaling::gen_rescaler_main();
-        let functional_code = functional::gen_functional_main(for_system);
-        let messaging_code = messaging::gen_messaging_main();
+        let wrapper_code = wrapper::gen_wrapper_main();
         quote! {
             #[global_allocator]
             static GLOBAL: Jemalloc = Jemalloc;
@@ -35,27 +63,21 @@ fn gen_main_file_content(deployments: &[Deployment], for_system: bool) -> String
             #[tokio::main]
             async fn main() -> Result<(), Error> {
                 println!("Main Started!");
-                let mode = std::env::var("EXECUTION_MODE").unwrap();
+                let mode = std::env::var("OBK_EXECUTION_MODE").unwrap();
                 println!("Running mode: {mode}");
-                #generic_code
                 #rescaling_code
-                #functional_code
-                #messaging_code
+                #wrapper_code
                 panic!("Unknown mode!");
             }
         }
     };
 
     let aux_code = {
-        let generic_code = generic::gen_generic_aux();
         let rescaling_code = rescaling::gen_rescaler_aux();
-        let functional_code = functional::gen_functional_aux();
-        let messaging_code = messaging::gen_messaging_aux();
+        let wrapper_code = wrapper::gen_wrapper_aux();
         quote! {
-            #generic_code
             #rescaling_code
-            #functional_code
-            #messaging_code
+            #wrapper_code
         }
     };
 
@@ -68,7 +90,7 @@ fn gen_main_file_content(deployments: &[Deployment], for_system: bool) -> String
     result.to_string()
 }
 
-pub(crate) fn gen_main(deployments: &[Deployment], for_system: bool) {
+pub(crate) fn gen_main(deployments: &[Deployment1], for_system: bool) {
     let file_content = gen_main_file_content(deployments, for_system);
     // Write out
     let dir_path = std::path::Path::new(BUILD_DIR);

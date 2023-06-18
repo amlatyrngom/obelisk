@@ -1,4 +1,4 @@
-use super::Deployment;
+use super::Deployment1;
 use proc_macro2::TokenStream;
 use quote::quote;
 
@@ -13,18 +13,16 @@ pub fn make_system_path(path: &str, for_system: bool) -> syn::Path {
 
 pub fn gen_imports(for_system: bool) -> TokenStream {
     let common_path = make_system_path("common", for_system);
-    let messaging_path = make_system_path("messaging", for_system);
-    let persistence_path = make_system_path("persistence", for_system);
+    // let messaging_path = make_system_path("messaging", for_system);
+    // let persistence_path = make_system_path("persistence", for_system);
     let imports = quote! {
         use lambda_runtime::{service_fn, LambdaEvent, Error};
         use serde_json::Value;
         use #common_path;
-        use #common_path::{FunctionInstance, ServiceInstance, ActorInstance};
-        use #common_path::adaptation::{AdapterScaling, Rescaler};
-        use #common_path::adaptation::backend::{AdapterBackend, ServiceInfo};
-        use #messaging_path;
-        use #messaging_path::MessagingHandler;
-        use #persistence_path;
+        // Used by rescaler.
+        use #common_path::{ServerlessHandler, Rescaler, RescalerSpec};
+        // Used by handlers.
+        use #common_path::{ServerlessHandler, ServerlessHandler, InstanceInfo};
         use lazy_static::lazy_static;
         use std::sync::Arc;
         use warp::Filter;
@@ -36,20 +34,24 @@ pub fn gen_imports(for_system: bool) -> TokenStream {
     imports
 }
 
-pub fn gen_generic_static_code(deployments: &[Deployment]) -> TokenStream {
+pub fn gen_generic_static_code(deployments: &[Deployment1]) -> TokenStream {
     let mut all_generic_checks = quote! {};
     for deployment in deployments {
         if deployment.namespace != "messaging" && deployment.namespace != "functional" {
             if let Some(subsystem) = &deployment.subsystem {
                 let subsystem_name = &deployment.namespace;
-                // Add service check.
-                let path: syn::Path = syn::parse_str(&subsystem.service_path).unwrap();
-                all_generic_checks = quote! {
-                    #all_generic_checks
-                    if x.is_none() && subsystem == #subsystem_name {
-                        x = Some(Arc::new(#path::new(svc_info.clone()).await));
-                    }
-                };
+
+                // Add service checks.
+                for service in &subsystem.services {
+                    let service_name = &service.name;
+                    let path: syn::Path = syn::parse_str(&service.path).unwrap();
+                    all_generic_checks = quote! {
+                        #all_generic_checks
+                        if x.is_none() && subsystem == #subsystem_name && service == #service_name {
+                            x = Some(Arc::new(#path::new(svc_info.clone()).await));
+                        }
+                    };
+                }   
             }
         }
     }
@@ -57,8 +59,9 @@ pub fn gen_generic_static_code(deployments: &[Deployment]) -> TokenStream {
     let result = quote! {
         static ref GENERIC_BACKEND: async_once::AsyncOnce<Arc<AdapterBackend>> = async_once::AsyncOnce::new(async {
             let subsystem = std::env::var("SUBSYSTEM").unwrap();
+            let service = std::env::var("SERVICE").unwrap();
             let svc_info = Arc::new(ServiceInfo::new().await.unwrap());
-            let mut x: Option<Arc<dyn ServiceInstance>> = None;
+            let mut x: Option<Arc<dyn ServerlessHandler>> = None;
             #all_generic_checks
             Arc::new(AdapterBackend::new(svc_info, x.unwrap()).await)
         });

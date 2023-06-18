@@ -149,6 +149,7 @@ impl ServiceInstance for MessagingHandler {
     }
 
     async fn custom_info(&self, _scaling_state: &ServerfulScalingState) -> Value {
+        println!("Custom Info: {_scaling_state:?}");
         Value::Null
     }
 

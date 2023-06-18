@@ -242,8 +242,8 @@ impl Leaser {
             .dynamo_client
             .put_item()
             .table_name(&self.table_name)
-            .item("namespace", AttributeValue::S("system".into()))
-            .item("name", AttributeValue::S(name.into()))
+            .item("subsystem", AttributeValue::S("leasing".into()))
+            .item("identifier", AttributeValue::S(name.into()))
             .item("lease_id", AttributeValue::S(self.lease_id.clone()))
             .item("value", AttributeValue::S(self.lease_id.clone()))
             .item(

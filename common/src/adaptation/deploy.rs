@@ -1,6 +1,6 @@
 use crate::{
     bucket_name, clean_die, cluster_name, filesystem_name, full_function_name,
-    full_messaging_template_name, full_receiving_template_name, full_scaler_name,
+    full_messaging_template_name, full_scaler_name,
     full_scaling_queue_name, full_service_definition_name, full_service_name, scaling_queue_prefix,
     scaling_table_name, tmp_s3_dir,
 };
@@ -1428,79 +1428,6 @@ impl AdapterDeployment {
             .await
             .unwrap();
         println!("Resp: {resp:?}")
-    }
-
-    /// Create receiving lambda function.
-    pub async fn create_receiving_lambda_template(
-        &self,
-        private_image_uri: &str,
-        role_arn: &str,
-        spec: &MessagingSpec,
-    ) {
-        let function_name = full_receiving_template_name(&spec.namespace);
-        // Delete existiting functions. TODO: support more than 50.
-        let mut marker: Option<String> = None;
-        loop {
-            let mut curr_fns = self.lambda_client.list_functions().max_items(50);
-            if let Some(marker) = &marker {
-                curr_fns = curr_fns.marker(marker);
-            }
-            let curr_fns = curr_fns.send().await.unwrap();
-            marker = curr_fns.next_marker().map(|x| x.to_string());
-            let curr_fns = curr_fns.functions().map_or(vec![], |f| {
-                f.iter()
-                    .map(|f| f.function_name().unwrap().to_string())
-                    .collect()
-            });
-            if curr_fns.is_empty() {
-                break;
-            }
-            for curr_fn in curr_fns {
-                if curr_fn.contains(&function_name) {
-                    println!("Deleting {curr_fn}.");
-                    let _ = self
-                        .lambda_client
-                        .delete_function()
-                        .function_name(&curr_fn)
-                        .send()
-                        .await;
-                }
-            }
-            if marker.is_none() {
-                break;
-            }
-        }
-
-        let code = FunctionCode::builder()
-            .image_uri(format!("{private_image_uri}:latest"))
-            .build();
-        let receiver_mem: i32 = 512;
-        let receiver_timeout: i32 = 1;
-        let environ = aws_sdk_lambda::types::Environment::builder()
-            .variables("NAME", "placeholder")
-            .variables("NAMESPACE", &spec.namespace)
-            .variables("EXECUTION_MODE", "messaging_recv")
-            .variables("MEMORY", receiver_mem.to_string())
-            .variables("TIMEOUT", receiver_timeout.to_string());
-        let environ = environ.build();
-        let _ = self
-            .lambda_client
-            .delete_function()
-            .function_name(&function_name)
-            .send()
-            .await;
-        self.lambda_client
-            .create_function()
-            .function_name(&function_name)
-            .code(code)
-            .memory_size(receiver_mem)
-            .package_type(PackageType::Image)
-            .timeout(receiver_timeout)
-            .role(role_arn)
-            .environment(environ)
-            .send()
-            .await
-            .unwrap();
     }
 
     /// Register ecs task def for messaging service.

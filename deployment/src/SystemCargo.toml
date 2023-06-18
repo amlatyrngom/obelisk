@@ -8,15 +8,15 @@ edition = "2021"
 [dependencies]
 common = {path="./common"}
 functional = {path="./functional"}
-messaging = {path="./messaging"}
+# messaging = {path="./messaging"}
 persistence = {path="./persistence"}
-microbench = {path="./microbench"}
+# microbench = {path="./microbench"}
 
 [workspace]
 members = [
     "functional",
     "common",
-    "messaging",
+    # "messaging",
     "persistence",
-    "microbench",
+    # "microbench",
 ]

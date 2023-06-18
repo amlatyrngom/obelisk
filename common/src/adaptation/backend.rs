@@ -11,6 +11,7 @@ use super::{
 };
 use crate::full_scaler_name;
 
+/// Information about a service.
 #[derive(Clone, Debug)]
 pub struct ServiceInfo {
     pub id: String,
@@ -22,9 +23,11 @@ pub struct ServiceInfo {
     pub name: String,
 }
 
+/// Statistic about this instance.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ServiceStats {
     pub mem_usage: f64,
+    pub cpu_usage: f64,
     // pub disk_reads: f64,
 }
 
@@ -148,6 +151,7 @@ impl AdapterBackend {
                 let mut inner = self.inner.write().await;
                 let stats = self.svc_info.read_stats().await.unwrap();
                 inner.curr_stats.mem_usage = stats.mem_usage;
+                inner.curr_stats.cpu_usage = stats.cpu_usage;
                 // inner.curr_stats.disk_reads = stats.disk_reads - inner.curr_stats.disk_reads;
                 inner.curr_stats.clone()
             };
@@ -246,7 +250,8 @@ impl ServiceInfo {
     pub async fn new() -> Result<ServiceInfo, String> {
         let shared_config = aws_config::load_from_env().await;
         let ecs_client = aws_sdk_ecs::Client::new(&shared_config);
-        let service_url = crate::get_function_url().await?; // TODO: Get from metadata.
+        // Getting Task Metadata.
+        println!("Getting Task Metadata!");
         let uri = std::env::var("ECS_CONTAINER_METADATA_URI_V4").map_err(|x| format!("{x:?}"))?;
         let uri = format!("{uri}/task");
         let resp = reqwest::get(uri).await.map_err(|x| format!("{x:?}"))?;
@@ -270,7 +275,7 @@ impl ServiceInfo {
         let container = task.containers().unwrap().first().unwrap();
         let ni = container.network_interfaces().unwrap().first().unwrap();
         let private_address = ni.private_ipv4_address().unwrap();
-        let port = crate::get_port().unwrap();
+        let port = crate::get_port();
         let private_url = format!("http://{private_address}:{port}/invoke");
         println!("Private Url: {private_url}");
         // Get service namespace and name.
@@ -282,6 +287,23 @@ impl ServiceInfo {
         let (_, subsys_ns_name) = service.split_at(prefix.len());
         let (subsystem, ns_name) = subsys_ns_name.split_once("__").unwrap();
         let (namespace, name) = ns_name.split_once("__").unwrap();
+        // Get public url.
+        let mut service_url = String::new();
+        for _ in 0..10 {
+            let resp = crate::get_public_url().await;
+            if resp.is_err() {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                println!("Retrying public URL: {resp:?}");
+                continue;
+            } else {
+                service_url = resp.unwrap();
+                break;
+            }
+        }
+        if service_url.is_empty() {
+            return Err("Could not get public service url.".into());
+        }
+        println!("Public Url: {service_url:?}");
         Ok(ServiceInfo {
             id: uuid::Uuid::new_v4().to_string(),
             url: service_url,
@@ -293,6 +315,7 @@ impl ServiceInfo {
         })
     }
 
+    /// Read statistics.
     pub async fn read_stats(&self) -> Result<ServiceStats, String> {
         let uri = std::env::var("ECS_CONTAINER_METADATA_URI_V4").map_err(|x| format!("{x:?}"))?;
         let uri = format!("{uri}/stats");
@@ -300,6 +323,20 @@ impl ServiceInfo {
         let task: serde_json::Value = resp.json().await.map_err(|x| format!("{x:?}"))?;
         let mem_stats = task.get("memory_stats").unwrap();
         let mem_usage = mem_stats.get("usage").unwrap().as_f64().unwrap() / 1e6;
+        let cpu_stats = task.get("cpu_stats").unwrap();
+        let precpu_stats = task.get("precpu_stats").unwrap();
+        let extract_cpu_info = |cpu_stats: &serde_json::Value| {
+            let cpu_usage = cpu_stats.get("cpu_usage").unwrap();
+            let total_usage = cpu_usage.get("total_usage").unwrap().as_f64().unwrap();
+            let sys_cpu = cpu_stats.get("system_cpu_usage").unwrap().as_f64().unwrap();
+            (total_usage, sys_cpu)
+        };
+        let (total_usage, sys_cpu) = extract_cpu_info(cpu_stats);
+        let (pretotal_usage, presys_cpu) = extract_cpu_info(precpu_stats);
+        let cpu_delta = total_usage - pretotal_usage;
+        let sys_delta = sys_cpu - presys_cpu;
+        let cpu_usage = (cpu_delta / sys_delta) * 100.0;
+
         // let disk_stats = task.get("blkio_stats").unwrap();
         // let disk_ios = disk_stats.get("io_serviced_recursive").unwrap().as_array().unwrap();
         // let mut disk_reads = 0.0;
@@ -310,9 +347,10 @@ impl ServiceInfo {
         //     }
         // }
         println!("Mem usage: {mem_usage}");
+        println!("CPU usage: {cpu_usage}. (Total, Sys) = ({total_usage}, {sys_cpu})");
         Ok(ServiceStats {
             mem_usage,
-            // disk_reads,
+            cpu_usage,
         })
     }
 }

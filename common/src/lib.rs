@@ -1,90 +1,79 @@
-pub mod adaptation;
+// pub mod adaptation;
+pub mod deployment;
 pub mod leasing;
+pub mod metrics;
+pub mod rescaler;
+pub mod scaling_state;
+pub mod storage;
 pub mod time_service;
+pub mod wrapper;
 
-use adaptation::ServerfulScalingState;
+pub use deployment::RescalerSpec;
+pub use metrics::MetricsManager;
+pub use rescaler::{Rescaler, RescalingResult, ScalingStateRescaler};
+pub use scaling_state::{HandlerScalingState, ScalingState, SubsystemScalingState};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
+pub use storage::ServerlessStorage;
+pub use wrapper::{InstanceInfo, ServerlessWrapper, WrapperMessage};
 
-/// Signature of a function.
-#[async_trait::async_trait]
-pub trait FunctionInstance: Send + Sync {
-    /// Invoke.
-    /// Input and output must be valid json.
-    async fn invoke(&self, arg: Value) -> Value;
+/// Input to a handler.
+pub struct HandlerKit {
+    /// Contains information about the present instance.
+    pub instance_info: Arc<InstanceInfo>,
+    /// Allows access to shared storage.
+    pub serverless_storage: Option<Arc<ServerlessStorage>>,
 }
 
-/// Signature of a service.
+/// A serverless handler.
+/// The class has to have a new function with the following signature: new(instance_info: Arc<InstanceInfo>)
 #[async_trait::async_trait]
-pub trait ServiceInstance: Send + Sync {
-    /// Call a service.
-    /// Use `meta` to avoid encoding small metadata into `arg`.
-    /// The number indicates an http code.
-    async fn call(&self, meta: String, arg: Vec<u8>) -> (String, Vec<u8>);
+pub trait ServerlessHandler: Send + Sync {
+    /// Call handler with the given metadata and payload.
+    async fn handle(&self, meta: String, payload: Vec<u8>) -> (String, Vec<u8>);
 
-    /// Use this to easily pass custom information to the front-end.
-    async fn custom_info(&self, scaling_state: &ServerfulScalingState) -> Value;
-
-    /// When called, the service will shutdown within the grace perior.
-    async fn terminate(&self);
-}
-
-/// An actor not only has access to shared storage, but can also send direct messages.
-/// Try having less than 10000 concurrently active actors. Beyond this, you may start seeing unrecoverable errors.
-/// The actor should also implement a new(name: &str, Arc<PersistentLog>)->Self method.
-#[async_trait::async_trait]
-pub trait ActorInstance: Send + Sync {
-    /// Input and output must be valid json.
-    /// The msg itself has to be less than 8KB. The payload can be up to 64MB.
-    /// Use `msg` to encode metadata or small items and avoid excessive (de)serialization.
-    /// If payload is empty, delivery will be faster.
-    async fn message(&self, msg: String, payload: Vec<u8>) -> (String, Vec<u8>);
-
-    /// Trigger checkpoint to allow faster restart.
-    /// Can be called by the runtime at any time to allow faster restarts.
-    /// Roughly called every 100 messages, or every ~1 seconds when there are no messages.
-    /// When terminating is set, it means the instance is about to terminate.
-    async fn checkpoint(&self, terminating: bool);
+    /// Periodic checkpoint.
+    /// If terminating is set to true, this instance of the handler will terminate after this call finishes.
+    async fn checkpoint(&self, scaling_state: &ScalingState, terminating: bool);
 }
 
 /// Raw function resp.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct FunctionResp {
-    pub resp: Value,
-    pub duration_ms: i64,
+pub struct HandlingResp {
+    pub meta: String,
+    pub duration: std::time::Duration,
     pub mem_size_mb: i32,
+    pub cpus: i32,
+    pub mem_usage: Option<f64>,
+    pub cpu_usage: Option<f64>,
+    pub is_lambda: bool,
+}
+
+/// Macro to debug format.
+#[macro_export]
+macro_rules! debug_format {
+    () => {
+        |e| format!("{e:?}")
+    };
 }
 
 /// Return the port of this node.
-pub fn get_port() -> Option<u16> {
-    let mode = std::env::var("EXECUTION_MODE").unwrap();
-    if mode == "backend" {
-        Some(37000)
-    } else if mode == "lambda" {
-        None
-    } else if let Ok(worker_idx) = std::env::var("WORKER_INDEX") {
-        let worker_idx: u16 = worker_idx.parse().unwrap();
-        Some(37001 + worker_idx)
-    } else {
-        Some(37000)
-    }
+pub fn get_port() -> u16 {
+    37000
 }
 
-/// Return the url of this node.
-pub async fn get_function_url() -> Result<String, String> {
-    if let Some(port) = get_port() {
-        let resp = reqwest::get("https://httpbin.org/ip")
-            .await
-            .map_err(|x| format!("{x:?}"))?
-            .json::<HashMap<String, String>>()
-            .await
-            .map_err(|x| format!("{x:?}"))?;
-        let host = resp.get("origin").unwrap().clone();
-        Ok(format!("http://{host}:{port}/invoke"))
-    } else {
-        Err("not in fargate/ecs".into())
-    }
+/// Return the public url of this node.
+pub async fn get_public_url() -> Result<String, String> {
+    let port = get_port();
+    let resp = reqwest::get("https://httpbin.org/ip")
+        .await
+        .map_err(|x| format!("{x:?}"))?
+        .json::<HashMap<String, String>>()
+        .await
+        .map_err(|x| format!("{x:?}"))?;
+    let host = resp.get("origin").unwrap().clone();
+    Ok(format!("http://{host}:{port}/invoke"))
 }
 
 /// Cleanly die.
@@ -107,47 +96,20 @@ pub async fn clean_die(msg: &str) -> ! {
     }
 }
 
-/// Call service and get response back.
-pub async fn call_service(
-    client: &reqwest::Client,
-    url: &str,
-    meta: String,
-    arg: Vec<u8>,
-) -> Result<(String, Vec<u8>), String> {
-    let url = format!("{url}/{meta}");
-    let resp = client.post(url).body(arg).send().await;
-    let resp = resp.map_err(|e| format!("{e:?}"))?;
-    let meta = {
-        let meta = resp.headers().get("obelisk-meta").unwrap();
-        let meta = meta.to_str().unwrap();
-        meta.into()
-    };
-    let body = {
-        let body = resp.bytes().await.map_err(|e| format!("{e:?}"))?;
-        body.to_vec()
-    };
-    Ok((meta, body))
-}
-
 /// Return directory for shared storage.
 /// Actors and services are responsible for coordination internal directory structure.
 pub fn shared_storage_prefix() -> String {
-    if let Ok(mode) = std::env::var("EXECUTION_MODE") {
-        if mode == "messaging_lambda" || mode == "messaging_ecs" || mode == "generic_ecs" {
-            return messaging_mnt_path();
+    if let Ok(v) = std::env::var("OBK_EXECUTION_MODE") {
+        if !v.contains("local") {
+            return persistence_mnt_path();
         }
     }
     // For local tests.
     "obelisk_shared_data".into()
 }
 
-pub fn messaging_mnt_path() -> String {
+pub fn persistence_mnt_path() -> String {
     "/mnt/obelisk_shared_data".into()
-}
-
-/// Name of the cluster.
-pub fn cluster_name() -> String {
-    "obelisk".into()
 }
 
 /// Name of s3 bucket. TODO: set to `obelisk` once existing bucket is deleted.
@@ -160,16 +122,11 @@ pub fn tmp_s3_dir() -> String {
 }
 
 pub fn has_external_access() -> bool {
-    if let Ok(mode) = std::env::var("EXECUTION_MODE") {
-        mode != "messaging_lambda"
+    if let Ok(external_access) = std::env::var("OBK_EXTERNAL_ACCESS") {
+        external_access.parse().unwrap()
     } else {
         true
     }
-}
-
-/// Name of file system.
-pub fn filesystem_name(namespace: &str) -> String {
-    format!("obk__{namespace}")
 }
 
 /// Full name of a function with namespace.
@@ -185,16 +142,6 @@ pub fn full_messaging_template_name(namespace: &str) -> String {
 /// Full messaging name
 pub fn full_messaging_name(namespace: &str, name: &str) -> String {
     format!("obk__msg__{namespace}__{name}")
-}
-
-/// Full receiver template name.
-pub fn full_receiving_template_name(namespace: &str) -> String {
-    format!("obk__rcv__{namespace}")
-}
-
-/// Full messaging name
-pub fn full_receiving_name(namespace: &str, name: &str) -> String {
-    format!("obk__rcv__{namespace}__{name}")
 }
 
 /// Prefix of services for lookups.
