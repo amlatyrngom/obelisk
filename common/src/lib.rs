@@ -19,6 +19,7 @@ pub use storage::ServerlessStorage;
 pub use wrapper::{InstanceInfo, ServerlessWrapper, WrapperMessage};
 
 /// Input to a handler.
+#[derive(Clone)]
 pub struct HandlerKit {
     /// Contains information about the present instance.
     pub instance_info: Arc<InstanceInfo>,

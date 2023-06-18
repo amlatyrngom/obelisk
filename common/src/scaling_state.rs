@@ -112,11 +112,15 @@ impl ScalingState {
             .iter()
             .map(|(service_name, _)| (service_name.clone(), 0))
             .collect();
+        let peers = service_specs
+            .iter()
+            .map(|(service_name, _)| (service_name.clone(), HashMap::new()))
+            .collect();
         let subsys_state = SubsystemScalingState {
             subsystem: subsystem.into(),
             namespace: namespace.into(),
             identifier: identifier.into(),
-            peers: HashMap::new(),
+            peers,
             service_scales,
             scaling_info: None,
             service_specs,

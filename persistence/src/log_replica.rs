@@ -109,14 +109,14 @@ impl LogReplica {
         println!("Handle Log: lo_lsn={lo_lsn}, hi_lsn={hi_lsn}, owner_id={owner_id}");
         let mut inner = self.inner.lock().await;
         println!("Handle Log: Locked.");
+        if persisted_lsn > inner.persisted_lsn {
+            inner.persisted_lsn = persisted_lsn;
+            inner.pending_logs.retain(|p| p.hi_lsn > persisted_lsn);
+        }
         if owner_id < inner.max_seen_owner_id {
             return PersistenceRespMeta::Outdated;
         } else {
             inner.max_seen_owner_id = owner_id;
-        }
-        if persisted_lsn > inner.persisted_lsn {
-            inner.persisted_lsn = persisted_lsn;
-            inner.pending_logs.retain(|p| p.hi_lsn > persisted_lsn);
         }
         if inner.terminating {
             return PersistenceRespMeta::Terminating;
@@ -150,7 +150,7 @@ impl LogReplica {
         if persisted_lsn > inner.persisted_lsn {
             inner.persisted_lsn = persisted_lsn;
             inner.pending_logs.retain(|p| p.hi_lsn > persisted_lsn);
-        }        
+        }
         // Check incarnation number.
         if owner_id < inner.max_seen_owner_id {
             return (PersistenceRespMeta::Outdated, vec![]);
@@ -173,8 +173,14 @@ impl LogReplica {
         }
         // Write all log entries.
         // Let drain happen.
-        println!("Termination waiting!");
-        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        let exec_mode = std::env::var("OBK_EXECUTION_MODE").unwrap_or("local".into());
+        let sleep_time_secs = if exec_mode.contains("local") {
+            5
+        } else {
+            60
+        };
+        println!("Termination waiting: {sleep_time_secs}secs!");
+        tokio::time::sleep(std::time::Duration::from_secs(sleep_time_secs)).await;
         loop {
             // Sleep for a while to allow to the handle to pass in persistent_lsn.
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -202,26 +208,27 @@ impl LogReplica {
                 let txn = conn.transaction().unwrap();
                 // TODO: Recheck if blind write (without checking start and persistent lsn) really is correct.
                 // I think it should be, but I am not sure.
-                let start_lsn = txn.query_row(
-                    "SELECT start_lsn FROM system__log_ownership",
-                    [],
-                    |r| r.get::<usize ,usize>(0)
-                ).unwrap();
-                let highest_lsn = txn.query_row(
-                    "SELECT MAX(hi_lsn) FROM system__logs",
-                    [],
-                    |r| r.get::<usize, usize>(0)
-                );
+                let start_lsn = txn
+                    .query_row("SELECT start_lsn FROM system__logs_ownership", [], |r| {
+                        r.get::<usize, usize>(0)
+                    })
+                    .unwrap();
+                let highest_lsn = txn.query_row("SELECT MAX(hi_lsn) FROM system__logs", [], |r| {
+                    r.get::<usize, usize>(0)
+                });
                 let highest_lsn = match highest_lsn {
                     Ok(l) => l,
                     Err(rusqlite::Error::QueryReturnedNoRows) => start_lsn,
+                    Err(rusqlite::Error::InvalidColumnType(_, _, rusqlite::types::Type::Null)) => {
+                        start_lsn
+                    },
                     Err(e) => {
                         println!("{e:?}");
                         return false;
                     }
                 };
                 for pending_log in &inner.pending_logs {
-                    if pending_log.hi_lsn <=  highest_lsn {
+                    if pending_log.hi_lsn <= highest_lsn {
                         // Already persisted somehow.
                         continue;
                     }
@@ -247,19 +254,17 @@ impl LogReplica {
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use common::{HandlerKit, InstanceInfo, ServerlessStorage};
 
-    use crate::{LogReplica, PersistenceRespMeta, log_replica::PendingLog, PersistentLog};
+    use crate::{log_replica::PendingLog, LogReplica, PersistenceRespMeta, PersistentLog};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
     async fn basic_replica_test() {
-        run_basic_replica_test().await;        
+        run_basic_replica_test().await;
     }
 
     fn make_test_replica_kit() -> HandlerKit {
@@ -302,7 +307,9 @@ mod tests {
             persistent: true,
         });
 
-        let serverless_storage = ServerlessStorage::new_from_info(instance_info.clone()).await.unwrap();
+        let serverless_storage = ServerlessStorage::new_from_info(instance_info.clone())
+            .await
+            .unwrap();
 
         HandlerKit {
             instance_info,
@@ -312,16 +319,22 @@ mod tests {
 
     async fn run_basic_replica_test() {
         let dir = common::shared_storage_prefix();
-        let _ = std::fs::remove_dir_all(&dir).unwrap();
+        let r = std::fs::remove_dir_all(&dir);
+        println!("RM: {r:?}");
         std::env::set_var("OBK_EXECUTION_MODE", "local_ecs");
         let echo_kit = make_test_echo_kit().await;
-        let echolog = PersistentLog::new(echo_kit.instance_info.clone(), echo_kit.serverless_storage.unwrap()).await.unwrap();
+        let echolog = PersistentLog::new(
+            echo_kit.instance_info.clone(),
+            echo_kit.serverless_storage.unwrap(),
+        )
+        .await
+        .unwrap();
         let replica_kit = make_test_replica_kit();
         let replica = LogReplica::new(replica_kit).await;
         // Send lsns[0, 1], persist=0, owner=1.
         let resp = replica.handle_log(0, 1, 0, 1, vec![37]).await;
         assert!(matches!(resp, PersistenceRespMeta::Ok));
-        // Try with owner = 0, persist=1. Should reject, and also clean up previous entries. 
+        // Try with owner = 0, persist=1. Should reject, and also clean up previous entries.
         let resp = replica.handle_log(2, 3, 1, 0, vec![1]).await;
         assert!(matches!(resp, PersistenceRespMeta::Outdated));
         {
@@ -339,12 +352,12 @@ mod tests {
         let resp = replica.handle_log(11, 15, 1, 2, vec![77, 78]).await;
         assert!(matches!(resp, PersistenceRespMeta::Ok));
         // Drain with owner=2, persist=7. Should return lsns[8, 10], lsns[11, 15].
-        let (resp, payload) = replica.handle_drain(2, 5).await;
+        let (resp, payload) = replica.handle_drain(2, 7).await;
         assert!(matches!(resp, PersistenceRespMeta::Ok));
         let logs: Vec<PendingLog> = bincode::deserialize(&payload).unwrap();
         assert_eq!(logs.len(), 2);
         let logs1 = &logs[0];
-        let logs2 = &logs[0];
+        let logs2 = &logs[1];
         assert_eq!(logs1.lo_lsn, 8);
         assert_eq!(logs1.hi_lsn, 10);
         assert_eq!(logs2.lo_lsn, 11);
@@ -356,7 +369,7 @@ mod tests {
         let (resp, payload) = replica.handle_drain(2, 10).await;
         assert!(matches!(resp, PersistenceRespMeta::Ok));
         let logs: Vec<PendingLog> = bincode::deserialize(&payload).unwrap();
-        assert!(logs.is_empty());
+        assert_eq!(logs.len(), 1);
         // Drop log, and terminate. Should write last log entry[11, 15] to log.
         {
             // Drop
@@ -364,26 +377,22 @@ mod tests {
         }
         replica.handle_termination().await;
         // Check log file.
-        let pool = ServerlessStorage::try_exclusive_file(&storage_dir, 1);
-        let pool = match pool {
-            Ok(pool) => pool,
-            Err(e) => {
-                println!("Open Err: {e:?}");
-                drop(inner);
-                return false;
-            }
-        };
+        let storage_dir = ServerlessStorage::get_storage_dir("wal", "echolog0", false);
+
+        let pool = ServerlessStorage::try_exclusive_file(&storage_dir, 5).unwrap();
         let conn = pool.get().unwrap();
-        let (count, hi_lsn, lo_lsn) = conn.query_row(
-            "SELECT COUNT(*), MAX(hi_lsn), MAX(lo_lsn) FROM system__logs",
-            [],
-            |r| {
-                let count = r.get::<usize, usize>(0).unwrap();
-                let hi_lsn = r.get::<usize, usize>(1).unwrap();
-                let lo_lsn = r.get::<usize, usize>(2).unwrap();
-                Ok((count, hi_lsn, lo_lsn))
-            }
-        );
+        let (count, hi_lsn, lo_lsn) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(hi_lsn), MAX(lo_lsn) FROM system__logs",
+                [],
+                |r| {
+                    let count = r.get::<usize, usize>(0).unwrap();
+                    let hi_lsn = r.get::<usize, usize>(1).unwrap();
+                    let lo_lsn = r.get::<usize, usize>(2).unwrap();
+                    Ok((count, hi_lsn, lo_lsn))
+                },
+            )
+            .unwrap();
         assert_eq!(count, 1);
         assert_eq!(lo_lsn, 11);
         assert_eq!(hi_lsn, 15);

@@ -98,16 +98,16 @@ impl ServerlessStorage {
 
     pub fn get_storage_dir(namespace: &str, identifier: &str, is_svc: bool) -> String {
         let shared_dir = crate::shared_storage_prefix();
-        let s = if is_svc {
-            "service"
-        } else {
-            "handler"
-        };
+        let s = if is_svc { "service" } else { "handler" };
         format!("{shared_dir}/{s}/{namespace}/{identifier}/")
     }
 
     /// New shared storage.
-    pub async fn new_shared(namespace: &str, identifier: &str, is_svc: bool) -> Result<Self, String> {
+    pub async fn new_shared(
+        namespace: &str,
+        identifier: &str,
+        is_svc: bool,
+    ) -> Result<Self, String> {
         let storage_dir = Self::get_storage_dir(namespace, identifier, is_svc);
         println!("Storage Dir: {storage_dir}");
         let _ = std::fs::create_dir_all(&storage_dir);
@@ -124,7 +124,11 @@ impl ServerlessStorage {
     }
 
     /// New exclusive storage.
-    pub async fn new_exclusive(namespace: &str, identifier: &str, is_svc: bool) -> Result<Self, String> {
+    pub async fn new_exclusive(
+        namespace: &str,
+        identifier: &str,
+        is_svc: bool,
+    ) -> Result<Self, String> {
         let exec_mode = std::env::var("OBK_EXECUTION_MODE").unwrap();
         let storage_dir = Self::get_storage_dir(namespace, identifier, is_svc);
         println!("Storage Dir: {storage_dir}");
@@ -169,7 +173,7 @@ impl ServerlessStorage {
         identifier: &str,
         persistent: bool,
         unique: bool,
-        is_svc: bool
+        is_svc: bool,
     ) -> Result<Option<Self>, String> {
         if !persistent && !unique {
             return Ok(None);

@@ -1,13 +1,13 @@
 pub mod database;
+pub mod echo;
 pub mod log_replica;
 pub mod persistent_log;
 pub mod rescaler;
-pub mod echo;
 
+pub use echo::Echo;
 pub use log_replica::LogReplica;
 pub use persistent_log::PersistentLog;
 pub use rescaler::WalRescaler;
-pub use echo::Echo;
 
 use serde::{Deserialize, Serialize};
 

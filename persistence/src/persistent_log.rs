@@ -87,7 +87,6 @@ impl PersistentLog {
         Ok(plog)
     }
 
-
     /// Sync version of new.
     fn new_sync(
         handle: Handle,
@@ -841,6 +840,7 @@ impl PersistentLog {
         self.scaling_manager
             .cleanup_instances(&mut scaling_state)
             .await;
+        println!("SubsysState: {:?}", scaling_state.subsys_state);
         let all_instances = scaling_state.subsys_state.peers.get("replica").unwrap();
 
         let mut all_instances = all_instances.values().cloned().collect::<Vec<_>>();

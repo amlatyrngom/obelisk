@@ -21,7 +21,11 @@ impl Echo {
 impl ServerlessHandler for Echo {
     /// Handle message.
     async fn handle(&self, meta: String, payload: Vec<u8>) -> (String, Vec<u8>) {
-        println!("Echo Handler: {:?}. Meta={meta}. St={}", self.instance_info, self.serverless_storage.exclusive_pool.is_some());
+        println!(
+            "Echo Handler: {:?}. Meta={meta}. St={}",
+            self.instance_info,
+            self.serverless_storage.exclusive_pool.is_some()
+        );
         (meta, payload)
     }
 
