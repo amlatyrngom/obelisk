@@ -20,6 +20,7 @@ impl ServerlessStorage {
         storage_dir: &str,
         num_tries: i32,
     ) -> Result<Pool<SqliteConnectionManager>, String> {
+        println!("Opening Exclusive File!");
         let db_file = format!("{storage_dir}/lockfile.db");
         let manager = r2d2_sqlite::SqliteConnectionManager::file(db_file.clone());
         let pool = r2d2::Pool::builder()
@@ -140,10 +141,12 @@ impl ServerlessStorage {
         });
         if exclusive_pool.is_err() && exec_mode.contains("lambda") {
             // In Lambda mode, first acquisition attempt should be successful.
-            return Err(format!(
+            let e = Err(format!(
                 "Lambda could not acquire lock file first: {:?}!",
                 exclusive_pool.err()
             ));
+            println!("{e:?}!");
+            return e;
         }
         // Get seq num and notify current owner.
         let dir = storage_dir.clone();
@@ -221,6 +224,53 @@ impl ServerlessStorage {
             Err("Lost incarnation!".into())
         }
     }
+
+    pub fn release_exclusive_file(&self, num_tries: i32) -> Result<(), String> {
+        let pool = match self.exclusive_pool.clone() {
+            Some(pool) => pool,
+            None => return Ok(()),
+        };
+        let mut num_tries = num_tries;
+        loop {
+            if num_tries == 0 {
+                return Err("Could not release!".into());
+            }
+            num_tries -= 1;
+            let conn = match pool.get_timeout(std::time::Duration::from_secs(1)) {
+                Ok(conn) => conn,
+                Err(e) => {
+                    println!("Release Conn Err: {e:?}");
+                    continue;
+                }
+            };
+            match conn.pragma_update(None, "journal_mode", "delete") {
+                Ok(_) => {}
+                Err(x) => {
+                    println!("Cannot release: {x:?}");
+                    continue;
+                }
+            }
+            match conn.pragma_update(None, "locking_mode", "normal") {
+                Ok(_) => {}
+                Err(x) => {
+                    println!("Cannot release: {x:?}");
+                    continue;
+                }
+            }
+            // Actually release lock in sqlite.
+            match conn.query_row("SELECT * FROM sqlite_master LIMIT 1", [], |r| r.get(0)) {
+                Ok(res) => {
+                    let _res: usize = res;
+                }
+                Err(rusqlite::Error::QueryReturnedNoRows) => {}
+                Err(x) => {
+                    println!("Cannot release: {x:?}");
+                    continue;
+                }
+            }
+            return Ok(());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -253,5 +303,11 @@ mod tests {
         // Fake an ecs instance without dropping locks. Should wait for a long time before giving up.
         let incarnation3 = ServerlessStorage::new("test", "test0", true, true, false).await;
         assert!(matches!(incarnation3, Err(_)));
+        // Now release incarnation 2 and retry.
+        let incarnation2 = incarnation2.unwrap().unwrap();
+        let ok = incarnation2.release_exclusive_file(1);
+        assert!(matches!(ok, Ok(_)));
+        let incarnation3 = ServerlessStorage::new("test", "test0", true, true, false).await;
+        assert!(matches!(incarnation3, Ok(Some(_))));
     }
 }

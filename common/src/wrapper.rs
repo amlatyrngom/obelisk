@@ -122,7 +122,13 @@ impl ServerlessWrapper {
                 let _ = tokio::join!(t1, t2);
             });
         }
-
+        // If serverful, update peer list.
+        if wrapper.instance_info.private_url.is_some() {
+            let _ = wrapper
+                .state_manager
+                .update_peer(wrapper.instance_info.clone(), wrapper.join_time, false)
+                .await;
+        }
         wrapper
     }
 
@@ -214,20 +220,24 @@ impl ServerlessWrapper {
     /// Perform checkpointing.
     async fn checkpoint_handler(&self, terminating: bool) {
         // Check unique.
-        if let Some(ss) = &self.serverless_storage {
+        let lost_incarnation = if let Some(ss) = &self.serverless_storage {
             if ss.exclusive_pool.is_some() {
                 let x = ss.check_incarnation().await;
-                if x.is_err() {
-                    eprintln!("Incarnation error: {x:?}");
-                    std::process::exit(1);
-                }
+                println!("Incarnation Check: {x:?}");
+                x.is_err()
+            } else {
+                false
             }
-        }
+        } else {
+            false
+        };
+        let terminating = terminating || lost_incarnation;
         // Update stats.
         if let Ok(s) = self.instance_info.read_stats().await {
             let mut instance_stats = self.instance_stats.write().unwrap();
             *instance_stats = Some(s);
         }
+        // TODO: Think about whether put this before or after deregistering.
         let scaling_state = self.state_manager.current_scaling_state().await;
         self.handler.checkpoint(&scaling_state, terminating).await;
         if self.instance_info.private_url.is_some() {
@@ -238,6 +248,16 @@ impl ServerlessWrapper {
                 .await;
         }
         if terminating {
+            // Release exclusive file if held.
+            if let Some(ss) = &self.serverless_storage {
+                tokio::task::block_in_place(move || {
+                    let _ = ss.release_exclusive_file(10);
+                });
+            }
+            // If unique, wait to avoid spurrious ecs restarts.
+            if self.instance_info.unique && self.instance_info.private_url.is_some() {
+                tokio::time::sleep(std::time::Duration::from_secs(100)).await;
+            }
             std::process::exit(0);
         }
     }
@@ -288,6 +308,7 @@ impl ServerlessWrapper {
 
     /// Handle a specific indirect message.
     async fn handle_indirect_message(&self, key: String) -> Result<(), String> {
+        println!("Handling indirect message: {key}.");
         let start_time = std::time::Instant::now();
         let resp = self
             .s3_client
@@ -449,6 +470,7 @@ impl InstanceInfo {
     async fn function_new() -> Result<InstanceInfo, String> {
         // Read handler metadata
         let identifier = std::env::var("OBK_IDENTIFIER").unwrap();
+        println!("Starting up function: {identifier}");
         // Always a handler, so this environment variable must be set.
         let spec = std::env::var("OBK_HANDLER_SPEC").unwrap();
         let spec: deployment::HandlerSpec = serde_json::from_str(&spec).unwrap();

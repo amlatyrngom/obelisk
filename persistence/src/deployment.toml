@@ -39,3 +39,5 @@ concurrency = 2
 caller = 512
 # Unique 
 unique = true
+# No scaleup needed.
+scaleup = false

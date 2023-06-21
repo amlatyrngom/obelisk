@@ -21,4 +21,4 @@ common = {path="../common"}
 functional = {path="../functional"}
 # messaging = {path="../messaging"}
 persistence = {path="../persistence"}
-# microbench = {path="../microbench"}
+microbench = {path="../microbench"}

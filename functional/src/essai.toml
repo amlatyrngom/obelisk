@@ -38,5 +38,32 @@ timeout = 3
 persistent = false
 # How many requests an instance can simultanously handle. Default: 1.
 concurrency = 2
-# Amount of memory on the caller. Used to calculate user cost. Default: 512
-caller = 512
+# When scale up is true, will attempt to select the optimal amount of cpus and mem.
+# Default: false
+scaleup = true
+
+
+
+
+[[handlers]] # Can have many handlers with unique names within a namespace.
+# Must be unique within the namespace.
+name = "echoactor"
+subsystem = "functional"
+# Points to handler class.
+path = "functional::echo::Echo"
+# Memory must be one of [512MB, 1024MB, 2048MB, 4096MB, 8196MB]
+# This value should be the minimum required to execute the handler.
+# The underlying system will autoscale it.
+mem = 512
+# Timeout should be between 1 and 30 seconds.
+timeout = 3
+# Whether to attach to the filesystem of namespace.
+# Warning: Lambdas attached to a filesystem do not have access to the wider internet.
+# They only have access to DynamoDB, S3, and to the filesystem. 
+# Default: False.
+persistent = true
+# When unique is true, split brain logic is implemented.
+unique = true
+# When scale up is true, will attempt to select the optimal amount of cpus and mem.
+# Default: false
+scaleup = true

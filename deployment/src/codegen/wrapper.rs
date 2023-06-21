@@ -44,7 +44,14 @@ pub fn gen_wrapper_static_code(deployments: &[Deployment1]) -> TokenStream {
     let result = quote! {
         static ref HANDLER_WRAPPER: async_once::AsyncOnce<Arc<ServerlessWrapper>> = async_once::AsyncOnce::new(async {
             let instance_info = Arc::new(InstanceInfo::new().await.unwrap());
-            let serverless_storage = ServerlessStorage::new_from_info(instance_info.clone()).await.unwrap();
+            let serverless_storage = match ServerlessStorage::new_from_info(instance_info.clone()).await {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Storage Err: {e:?}");
+                    // Force a complete restart of the Lambda.
+                    std::process::exit(1);
+                }
+            };
             let (namespace, name) = if let Some(service_name) = &instance_info.service_name {
                 (&instance_info.subsystem, service_name)
             } else {
@@ -97,14 +104,12 @@ pub fn gen_wrapper_aux() -> TokenStream {
         }
 
         async fn wrapper_main() {
-            let wrapper = HANDLER_WRAPPER.get().await.clone();
             let meta = warp::header::<String>("obelisk-meta");
             let invoke_path = warp::path!("invoke")
                 .and(warp::post())
                 .and(meta)
                 .and(warp::body::content_length_limit(1024 * 1024 * 1024)) // 1GB.
                 .and(warp::body::bytes())
-                .and(with_wrapper(wrapper))
                 .and_then(warp_handler);
             let hello_world = warp::path::end().map(|| "Hello, World at root!");
             let routes = invoke_path.or(hello_world);
@@ -115,15 +120,18 @@ pub fn gen_wrapper_aux() -> TokenStream {
                 listen_info,
                 graceful_wait(60),
             );
+            // Initialize ~10 seconds after listening (due to weird ecs delay).
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                let _wrapper = HANDLER_WRAPPER.get().await.clone();
+            });
             server.await;
             println!("Done listening on port {port}");
         }
 
-        fn with_wrapper(wrapper: Arc<ServerlessWrapper>) -> impl Filter<Extract = (Arc<ServerlessWrapper>,), Error = std::convert::Infallible> + Clone {
-            warp::any().map(move || wrapper.clone())
-        }
 
-        pub async fn warp_handler(meta: String, payload: bytes::Bytes, wrapper: Arc<ServerlessWrapper>) -> Result<impl warp::Reply, Infallible> {
+        pub async fn warp_handler(meta: String, payload: bytes::Bytes) -> Result<impl warp::Reply, Infallible> {
+            let wrapper = HANDLER_WRAPPER.get().await.clone();
             let payload: Vec<u8> = payload.to_vec();
             let (resp_meta, resp_payload) = wrapper.handle_ecs_message(meta, payload).await;
             Ok(warp::http::Response::builder()

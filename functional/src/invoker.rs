@@ -124,6 +124,7 @@ impl Invoker {
             .direct_client
             .post(url)
             .header("Content-Type", "application/octect-stream")
+            .header("content-length", payload.len())
             .header("obelisk-meta", meta)
             .body(payload.to_vec())
             .send()

@@ -4,5 +4,5 @@ namespace = "microrunner"
 [functional]
 path = "microbench::BenchRunner"
 mem_size = 512
-timeout = 30
+timeout = 60
 concurrency = 100

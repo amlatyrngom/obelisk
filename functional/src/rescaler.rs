@@ -107,6 +107,7 @@ impl Rescaler for FunctionalRescaler {
                     ideal_mem,
                 );
             // If price is ok, break.
+            // TODO: Exclude invoker in unique calculation.
             if ecs_price + invoker_price <= lambda_price {
                 break;
             }
@@ -330,7 +331,7 @@ impl FunctionalRescaler {
             }
         }
         // Scale invoker appropriately.
-        if ideal_mem.is_some() {
+        if ideal_mem.is_some() && !handler_scaling_state.handler_spec.unique {
             println!("Setting service scales");
             rescaling_result.services_scales.insert("invoker".into(), 1);
         } else {
@@ -362,10 +363,15 @@ impl FunctionalRescaler {
         let ecs_mem_gb = ideal_mem as f64 / 1024.0;
         let ecs_cpus = cpus as f64 / 1024.0;
         let ecs_price = (0.01234398 * ecs_cpus) + (0.00135546 * ecs_mem_gb);
-        let invoker_specs = subsys_state.service_specs.get("invoker").unwrap();
-        let invoker_mem = invoker_specs.mem as f64 / 1024.0;
-        let invoker_cpus = invoker_specs.cpus as f64 / 1024.0;
-        let invoker_price = (0.01234398 * invoker_cpus) + (0.00135546 * invoker_mem);
+        // Invoker is only needed for non-unique functions (non-actors).
+        let invoker_price = if handler_scaling_state.handler_spec.unique {
+            0.0
+        } else {
+            let invoker_specs = subsys_state.service_specs.get("invoker").unwrap();
+            let invoker_mem = invoker_specs.mem as f64 / 1024.0;
+            let invoker_cpus = invoker_specs.cpus as f64 / 1024.0;
+            (0.01234398 * invoker_cpus) + (0.00135546 * invoker_mem)
+        };
         return (lambda_price, ecs_price, invoker_price, observed_concurrency);
     }
 
@@ -394,7 +400,7 @@ mod tests {
     use super::{HandlerScalingState, SubsystemScalingState};
 
     fn test_handler_state() -> HandlerScalingState {
-        let mems = container::ContainerDeployment::all_avail_mems(512);
+        let mems = container::ContainerDeployment::all_avail_mems(512, true);
         HandlerScalingState {
             subsystem: "functional".into(),
             namespace: "functional".into(),
@@ -411,6 +417,7 @@ mod tests {
                 ephemeral: 512,
                 persistent: false,
                 unique: false,
+                scaleup: true,
             },
             handler_scales: mems.into_iter().map(|m| (m, 0)).collect(),
         }

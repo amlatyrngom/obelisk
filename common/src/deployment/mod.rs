@@ -34,6 +34,7 @@ pub struct NamespaceSpec {
     pub private_img_url: String,
     pub subsystem_spec: Option<SubsystemSpec>,
     pub handler_specs: HashMap<String, HandlerSpec>,
+    pub dependencies: Vec<String>,
 }
 
 /// Specification for a handler.
@@ -74,6 +75,7 @@ pub struct HandlerSpec {
     pub ephemeral: i32,
     pub persistent: bool,
     pub unique: bool,
+    pub scaleup: bool,
 }
 
 pub struct NamespaceDeployment {}
@@ -202,12 +204,20 @@ impl Deployment {
         )
         .await;
         let mut redeployed_subsystems = HashSet::<String>::new();
+        let mut dependencies = namespace_spec.dependencies.clone();
+        // Always include self.
+        if namespace_spec.subsystem_spec.is_some() {
+            dependencies.push(namespace_spec.namespace.clone());
+        }
         for (_, handler_spec) in &namespace_spec.handler_specs {
-            let target_namespace = Some(handler_spec.namespace.clone());
-            if !redeployed_subsystems.contains(&handler_spec.subsystem) {
+            dependencies.push(handler_spec.subsystem.clone());
+        }
+        let target_namespace = Some(namespace_spec.namespace.clone());
+        for dependency in dependencies {
+            if !redeployed_subsystems.contains(&dependency) {
                 let (subsys_ns_spec, _) = dynamo::DynamoDeployment::fetch_namespace_spec(
                     &self.dynamo_client,
-                    &handler_spec.subsystem,
+                    &dependency,
                 )
                 .await
                 .unwrap();
@@ -223,7 +233,7 @@ impl Deployment {
                     )
                     .await;
                 }
-                redeployed_subsystems.insert(handler_spec.subsystem.clone());
+                redeployed_subsystems.insert(dependency.clone());
             }
         }
     }

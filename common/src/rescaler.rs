@@ -175,8 +175,10 @@ impl ScalingStateRescaler {
         new_state: &HandlerScalingState,
         initializing: bool,
     ) -> Result<(), String> {
-        let mems =
-            container::ContainerDeployment::all_avail_mems(new_state.handler_spec.default_mem);
+        let mems = container::ContainerDeployment::all_avail_mems(
+            new_state.handler_spec.default_mem,
+            new_state.handler_spec.scaleup,
+        );
         for mem in mems {
             let count = new_state.handler_scales.get(&mem).cloned().unwrap_or(0) as i32;
             if initializing {

@@ -126,7 +126,10 @@ impl ScalingState {
             service_specs,
         };
         let handler_state = if let Some(handler_spec) = handler_spec {
-            let mems = container::ContainerDeployment::all_avail_mems(handler_spec.default_mem);
+            let mems = container::ContainerDeployment::all_avail_mems(
+                handler_spec.default_mem,
+                handler_spec.scaleup,
+            );
             let handler_scales = mems.into_iter().map(|m| (m, 0)).collect();
             Some(HandlerScalingState {
                 subsystem: subsystem.into(),
@@ -246,6 +249,7 @@ impl ScalingStateManager {
         } else {
             let resp: Vec<u8> = resp.payload().unwrap().clone().into_inner();
             let resp: String = serde_json::from_slice(&resp).unwrap();
+            println!("Resp: {resp:?}.");
             Ok(resp)
         }
     }
@@ -349,7 +353,7 @@ impl ScalingStateManager {
             .get_item()
             .table_name(&self.scaling_table)
             .consistent_read(true)
-            .key("subsystem", AttributeValue::S(self.namespace.clone()))
+            .key("subsystem", AttributeValue::S(self.subsystem.clone()))
             .key("identifier", AttributeValue::S(self.identifier.clone()))
             .send()
             .await
@@ -473,6 +477,7 @@ impl ScalingStateManager {
                 Ok(true)
             }
             Err(e) => {
+                println!("Write err: {e:?}");
                 if e.contains("ConditionalCheckFailedException") {
                     Ok(false)
                 } else {

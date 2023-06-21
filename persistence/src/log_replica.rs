@@ -174,11 +174,7 @@ impl LogReplica {
         // Write all log entries.
         // Let drain happen.
         let exec_mode = std::env::var("OBK_EXECUTION_MODE").unwrap_or("local".into());
-        let sleep_time_secs = if exec_mode.contains("local") {
-            5
-        } else {
-            60
-        };
+        let sleep_time_secs = if exec_mode.contains("local") { 5 } else { 60 };
         println!("Termination waiting: {sleep_time_secs}secs!");
         tokio::time::sleep(std::time::Duration::from_secs(sleep_time_secs)).await;
         loop {
@@ -221,7 +217,7 @@ impl LogReplica {
                     Err(rusqlite::Error::QueryReturnedNoRows) => start_lsn,
                     Err(rusqlite::Error::InvalidColumnType(_, _, rusqlite::types::Type::Null)) => {
                         start_lsn
-                    },
+                    }
                     Err(e) => {
                         println!("{e:?}");
                         return false;
@@ -267,8 +263,8 @@ mod tests {
         run_basic_replica_test().await;
     }
 
-    fn make_test_replica_kit() -> HandlerKit {
-        let instance_info = InstanceInfo {
+    async fn make_test_replica_kit() -> HandlerKit {
+        let instance_info = Arc::new(InstanceInfo {
             peer_id: "111-222-333".into(),
             az: Some("af-sn-1".into()),
             mem: 1024,
@@ -280,13 +276,17 @@ mod tests {
             subsystem: "wal".into(),
             namespace: "wal".into(),
             identifier: "echolog0".into(),
-            unique: true,
+            unique: false,
             persistent: true,
-        };
+        });
+
+        let serverless_storage = ServerlessStorage::new_from_info(instance_info.clone())
+            .await
+            .unwrap();
 
         HandlerKit {
-            instance_info: Arc::new(instance_info),
-            serverless_storage: None, // Does not matter.
+            instance_info,
+            serverless_storage, // Does not matter.
         }
     }
 
@@ -317,20 +317,25 @@ mod tests {
         }
     }
 
-    async fn run_basic_replica_test() {
+    async fn make_log_and_replica() -> (PersistentLog, LogReplica) {
         let dir = common::shared_storage_prefix();
         let r = std::fs::remove_dir_all(&dir);
         println!("RM: {r:?}");
         std::env::set_var("OBK_EXECUTION_MODE", "local_ecs");
         let echo_kit = make_test_echo_kit().await;
-        let echolog = PersistentLog::new(
+        let plog = PersistentLog::new(
             echo_kit.instance_info.clone(),
             echo_kit.serverless_storage.unwrap(),
         )
         .await
         .unwrap();
-        let replica_kit = make_test_replica_kit();
+        let replica_kit = make_test_replica_kit().await;
         let replica = LogReplica::new(replica_kit).await;
+        (plog, replica)
+    }
+
+    async fn run_basic_replica_test() {
+        let (plog, replica) = make_log_and_replica().await;
         // Send lsns[0, 1], persist=0, owner=1.
         let resp = replica.handle_log(0, 1, 0, 1, vec![37]).await;
         assert!(matches!(resp, PersistenceRespMeta::Ok));
@@ -373,7 +378,7 @@ mod tests {
         // Drop log, and terminate. Should write last log entry[11, 15] to log.
         {
             // Drop
-            drop(echolog);
+            drop(plog);
         }
         replica.handle_termination().await;
         // Check log file.

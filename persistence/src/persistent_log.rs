@@ -1,7 +1,7 @@
 use super::{NUM_DB_RETRIES, SUBSYSTEM_NAME};
 use bytes::Bytes;
 use common::scaling_state::{ScalingStateManager, ServerfulInstance};
-use common::{InstanceInfo, MetricsManager, ServerlessStorage};
+use common::{HandlingResp, InstanceInfo, MetricsManager, ServerlessStorage, WrapperMessage};
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -39,7 +39,6 @@ pub struct PersistentLog {
 }
 
 /// Modifyable internal state.
-/// TODO: Fix first log entry issues. The current implementation seems to start at 2, which is fine correctness-wise, but should be 1.
 struct PersistentLogInner {
     curr_lsn: usize,                    // curr_lsn+1 is the lsn of the next enqueue.
     flush_lsn: usize,                   // Highest lsn known to be persisted or replicated.
@@ -196,7 +195,7 @@ impl PersistentLog {
             replication_lock: Arc::new(RwLock::new(())),
             direct_client: reqwest::ClientBuilder::new()
                 .connect_timeout(std::time::Duration::from_millis(100)) // Short on purpose.
-                .timeout(std::time::Duration::from_millis(50)) // Short on purpose.
+                .timeout(std::time::Duration::from_millis(100)) // Short on purpose.
                 .build()
                 .unwrap(),
             _handle: handle,
@@ -346,13 +345,17 @@ impl PersistentLog {
     /// Truncate up to (and including) at most the given lsn.
     /// TODO: Might have to vaccum.
     pub async fn truncate(&self, lsn: usize) -> Result<(), String> {
-        let curr_start_lsn = {
+        let (curr_start_lsn, flush_lsn) = {
             let inner = self.inner.lock().await;
-            inner.start_lsn
+            (inner.start_lsn, inner.flush_lsn)
         };
-        if curr_start_lsn >= lsn {
+        // Limit truncation range to flush lsn.
+        let lsn = if lsn > flush_lsn { flush_lsn } else { lsn };
+        // Check if there is a point in truncating.
+        if curr_start_lsn > lsn {
             return Ok(());
         }
+        let new_start_lsn = lsn + 1;
         // Update DB.
         let resp = tokio::task::block_in_place(move || {
             for _ in 0..NUM_DB_RETRIES {
@@ -366,7 +369,7 @@ impl PersistentLog {
                 };
                 match txn.execute(
                     "UPDATE system__logs_ownership SET start_lsn=? WHERE new_owner_id=?",
-                    [lsn, self.owner_id],
+                    [new_start_lsn, self.owner_id],
                 ) {
                     Ok(executed) if executed > 0 => {}
                     Ok(executed) if executed == 0 => {
@@ -392,8 +395,8 @@ impl PersistentLog {
         if resp.is_ok() {
             let mut inner = self.inner.lock().await;
             // Concurrent truncate may change value.
-            if inner.start_lsn < lsn {
-                inner.start_lsn = lsn;
+            if inner.start_lsn < new_start_lsn {
+                inner.start_lsn = new_start_lsn;
             }
         }
         resp
@@ -410,12 +413,17 @@ impl PersistentLog {
     ) -> Result<Vec<(usize, Vec<u8>)>, String> {
         let exclusive_start_lsn = {
             let inner = self.inner.lock().await;
-            if inner.start_lsn > exclusive_start_lsn {
-                inner.start_lsn
+            let exclusive_start_lsn = if inner.start_lsn > exclusive_start_lsn {
+                inner.start_lsn - 1
             } else {
                 exclusive_start_lsn
+            };
+            if exclusive_start_lsn >= inner.flush_lsn {
+                return Ok(vec![]);
             }
+            exclusive_start_lsn
         };
+        println!("Exclusive Start: {exclusive_start_lsn:?}");
         tokio::task::block_in_place(move || {
             // println!("Exclusive start lsn: {exclusive_start_lsn}");
             for _ in 0..NUM_DB_RETRIES {
@@ -442,11 +450,13 @@ impl PersistentLog {
                         continue;
                     }
                 };
-                let mut entries: Vec<u8> = Vec::new();
+                let mut entries: Vec<(usize, Vec<u8>)> = Vec::new();
                 let (entries, ok) = loop {
                     match rows.next() {
                         Ok(Some(row)) => {
-                            let mut row: Vec<u8> = row.get(0).unwrap();
+                            let row: Vec<u8> = row.get(0).unwrap();
+                            let mut row: Vec<(usize, Vec<u8>)> =
+                                bincode::deserialize(&row).unwrap();
                             entries.append(&mut row);
                         }
                         Ok(None) => {
@@ -461,7 +471,6 @@ impl PersistentLog {
                 if !ok {
                     continue;
                 }
-                let entries: Vec<(usize, Vec<u8>)> = bincode::deserialize(&entries).unwrap();
                 let entries = entries
                     .into_iter()
                     .filter(|(lsn, _)| *lsn > exclusive_start_lsn)
@@ -647,7 +656,7 @@ impl PersistentLog {
         // println!("Persist on replicas: {num_total} instances.");
         let failed_replications = self.failed_replications.clone();
         if num_total == 0 {
-            failed_replications.fetch_add(1, atomic::Ordering::Relaxed);
+            failed_replications.fetch_add(hi_lsn - lo_lsn + 1, atomic::Ordering::Relaxed);
             tx.send(PersistedMode::Replicas(false)).await.unwrap();
             return;
         }
@@ -658,8 +667,13 @@ impl PersistentLog {
             tx.send(PersistedMode::Replicas(false)).await.unwrap();
             return;
         }
-
-        let quorum_size: usize = num_total / 2 + 1;
+        // Quorum size.
+        let quorum_size: usize = if USE_AZ_PLUS_1 {
+            num_total / 2 + 1
+        } else {
+            num_total
+        };
+        println!("Quorum: ({quorum_size}/{num_total}).");
         let client = self.direct_client.clone();
         let owner_id = self.owner_id;
         tokio::spawn(async move {
@@ -682,8 +696,8 @@ impl PersistentLog {
                         owner_id,
                         replica_id: instance.instance_info.peer_id.clone(),
                     };
-                    let meta = serde_json::to_string(&meta).unwrap();
-                    // let start_time = std::time::Instant::now();
+                    let meta = Self::wrap_message(meta);
+                    let start_time = std::time::Instant::now();
                     let resp = client
                         .post(&instance.instance_info.public_url.unwrap())
                         .header("obelisk-meta", meta)
@@ -691,9 +705,9 @@ impl PersistentLog {
                         .body(entries)
                         .send()
                         .await;
-                    // let end_time = std::time::Instant::now();
-                    // let duration = end_time.duration_since(start_time);
-                    // println!("Replica send duration: {duration:?}");
+                    let end_time = std::time::Instant::now();
+                    let duration = end_time.duration_since(start_time);
+                    println!("Replica send duration: {duration:?}");
                     // Parse resp.
                     if resp.is_err() {
                         println!("Resp err: {resp:?}");
@@ -707,7 +721,7 @@ impl PersistentLog {
                         return;
                     }
                     let meta = meta.unwrap().to_str().unwrap();
-                    let meta: PersistenceRespMeta = serde_json::from_str(meta).unwrap();
+                    let meta = Self::unwrap_message(meta);
                     match meta {
                         PersistenceRespMeta::Ok => {
                             replica_tx.send(true).await.unwrap();
@@ -734,12 +748,13 @@ impl PersistentLog {
                 if valid {
                     num_valid += 1;
                 }
+                println!("Completed={num_completed}. Valid={num_valid}");
             }
             if num_valid >= quorum_size {
                 failed_replications.store(0, atomic::Ordering::Relaxed);
                 tx.send(PersistedMode::Replicas(true)).await.unwrap();
             } else {
-                failed_replications.fetch_add(1, atomic::Ordering::Relaxed);
+                failed_replications.fetch_add(hi_lsn - lo_lsn + 1, atomic::Ordering::Relaxed);
                 tx.send(PersistedMode::Replicas(false)).await.unwrap();
             }
             while num_completed < num_total {
@@ -803,7 +818,7 @@ impl PersistentLog {
             persisted_lsn
         } else {
             let inner = self.inner.lock().await;
-            inner.start_lsn
+            inner.start_lsn - 1
         }
     }
 
@@ -840,7 +855,6 @@ impl PersistentLog {
         self.scaling_manager
             .cleanup_instances(&mut scaling_state)
             .await;
-        println!("SubsysState: {:?}", scaling_state.subsys_state);
         let all_instances = scaling_state.subsys_state.peers.get("replica").unwrap();
 
         let mut all_instances = all_instances.values().cloned().collect::<Vec<_>>();
@@ -878,13 +892,16 @@ impl PersistentLog {
                     *az_count += 1;
                     new_instances.push(instance);
                 }
+                // Check if replication is safe for AZ+1 failure.
+                if new_instances.len() == 6 || num_azs == 5 {
+                    is_safe = true;
+                }
             } else {
+                // Just check that two instances are deployed.
                 new_instances.push(instance);
-            }
-
-            // Check if replication is safe for AZ+1 failure.
-            if new_instances.len() == 6 || num_azs == 5 {
-                is_safe = true;
+                if new_instances.len() >= 2 {
+                    is_safe = true;
+                }
             }
         }
         // If amount of replication is not safe, empty instances.
@@ -941,6 +958,20 @@ impl PersistentLog {
         println!("Updated ownership");
     }
 
+    /// Wrap message.
+    fn wrap_message(req: PersistenceReqMeta) -> String {
+        let req = serde_json::to_string(&req).unwrap();
+        let meta = WrapperMessage::HandlerMessage { meta: req };
+        serde_json::to_string(&meta).unwrap()
+    }
+
+    /// Unwrap message.
+    fn unwrap_message(resp: &str) -> PersistenceRespMeta {
+        let resp: HandlingResp = serde_json::from_str(resp).unwrap();
+        let meta = resp.meta;
+        serde_json::from_str(&meta).unwrap()
+    }
+
     /// Assuming at most AZ+1 uncontrolled crashes, this function makes sure that
     /// all acked writes will make to shared storage and that no previously active node can replicate new stuff.
     async fn drain_instances(
@@ -994,7 +1025,7 @@ impl PersistentLog {
                         persisted_lsn,
                         replica_id: instance_id.clone(),
                     };
-                    let req_meta = serde_json::to_string(&req_meta).unwrap();
+                    let req_meta = Self::wrap_message(req_meta);
                     let resp = client
                         .post(url)
                         .header("obelisk-meta", req_meta)
@@ -1014,7 +1045,7 @@ impl PersistentLog {
                         return;
                     }
                     let meta = meta.unwrap().to_str().unwrap();
-                    let meta: PersistenceRespMeta = serde_json::from_str(meta).unwrap();
+                    let meta = Self::unwrap_message(&meta);
                     println!("Resp: {meta:?}");
                     match meta {
                         PersistenceRespMeta::Ok => {
@@ -1153,149 +1184,216 @@ impl PersistentLog {
     }
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use super::PersistentLog;
-//     use std::sync::Arc;
+#[cfg(test)]
+mod tests {
+    use common::{HandlerKit, InstanceInfo, ServerlessStorage};
 
-//     // async fn bench_log(instances: Vec<String>) {
-//     //     {
-//     //         let mut inner = log.inner.lock().unwrap();
-//     //         inner.instances = instances;
-//     //     }
-//     //     let num_threads: i32 = 2;
-//     //     let batch_size: i32 = 512;
-//     //     let num_elems: i32 = 512 * 200;
-//     //     // 1KB of data.
-//     //     let content: Vec<u8> = (0..1024).map(|i| (i % 256) as u8).collect();
-//     //     let start_time = std::time::Instant::now();
-//     //     let mut ts = Vec::new();
-//     //     for tidx in 0..num_threads {
-//     //         let content = content.clone();
-//     //         let num_elems: i32 = num_elems.clone();
-//     //         let log = log.clone();
-//     //         let _tidx = tidx;
-//     //         ts.push(tokio::task::spawn(async move {
-//     //             for i in 0..num_elems {
-//     //                 log.enqueue(content.clone()).await;
-//     //                 if (i + 1)%batch_size == 0 {
-//     //                     log.flush().await;
-//     //                 }
-//     //             }
-//     //         }));
-//     //     }
-//     //     for t in ts {
-//     //         t.await.unwrap();
-//     //     }
+    use super::PersistentLog;
+    use std::sync::Arc;
 
-//     //     let end_time = std::time::Instant::now();
-//     //     let duration = end_time.duration_since(start_time);
-//     //     {
-//     //         let inner = log.inner.lock().unwrap();
-//     //         println!("Logs {} took: {duration:?}. Total enqueues: {}", inner.new_entries.len(), num_threads * num_elems);
-//     //     }
-//     // }
+    //     // async fn bench_log(instances: Vec<String>) {
+    //     //     {
+    //     //         let mut inner = log.inner.lock().unwrap();
+    //     //         inner.instances = instances;
+    //     //     }
+    //     //     let num_threads: i32 = 2;
+    //     //     let batch_size: i32 = 512;
+    //     //     let num_elems: i32 = 512 * 200;
+    //     //     // 1KB of data.
+    //     //     let content: Vec<u8> = (0..1024).map(|i| (i % 256) as u8).collect();
+    //     //     let start_time = std::time::Instant::now();
+    //     //     let mut ts = Vec::new();
+    //     //     for tidx in 0..num_threads {
+    //     //         let content = content.clone();
+    //     //         let num_elems: i32 = num_elems.clone();
+    //     //         let log = log.clone();
+    //     //         let _tidx = tidx;
+    //     //         ts.push(tokio::task::spawn(async move {
+    //     //             for i in 0..num_elems {
+    //     //                 log.enqueue(content.clone()).await;
+    //     //                 if (i + 1)%batch_size == 0 {
+    //     //                     log.flush().await;
+    //     //                 }
+    //     //             }
+    //     //         }));
+    //     //     }
+    //     //     for t in ts {
+    //     //         t.await.unwrap();
+    //     //     }
 
-//     #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
-//     async fn test_bench_log() {
-//         let plog = Arc::new(PersistentLog::new("test", "test").await.unwrap());
-//         // 1KB of data.
-//         let content: Vec<u8> = (0..1024).map(|i| (i % 256) as u8).collect();
-//         let num_writes = 50_000;
-//         let start_time = std::time::Instant::now();
-//         for i in 0..num_writes {
-//             plog.enqueue(content.clone()).await;
-//             if (i + 1) % 100 == 0 {
-//                 plog.flush().await;
-//             }
-//         }
-//         let end_time = std::time::Instant::now();
-//         let duration = end_time.duration_since(start_time);
-//         println!("Logging took: {duration:?}");
-//         // tokio::time::sleep(std::time::Duration::from_secs(20)).await;
-//     }
+    //     //     let end_time = std::time::Instant::now();
+    //     //     let duration = end_time.duration_since(start_time);
+    //     //     {
+    //     //         let inner = log.inner.lock().unwrap();
+    //     //         println!("Logs {} took: {duration:?}. Total enqueues: {}", inner.new_entries.len(), num_threads * num_elems);
+    //     //     }
+    //     // }
 
-//     async fn run_content_test() {
-//         let plog = Arc::new(PersistentLog::new("messaging", "echo").await.unwrap());
-//         let flush_lsn = plog.get_flush_lsn().await;
-//         println!("Flush Lsn: {flush_lsn}");
-//         plog.truncate(flush_lsn).await.unwrap();
-//         let mut num_entries = 0;
-//         let mut expected_entries = vec![];
-//         let mut ts = Vec::new();
-//         for i in 0..10 {
-//             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-//             for j in 0..10 {
-//                 num_entries += 1;
-//                 expected_entries.push(vec![i, j]);
-//                 plog.enqueue(vec![i, j]).await;
-//             }
-//             let plog = plog.clone();
-//             ts.push(tokio::spawn(async move {
-//                 plog.flush().await;
-//             }))
-//         }
-//         for t in ts {
-//             t.await.unwrap();
-//         }
-//         println!("Num entries: {num_entries}");
-//         let mut num_found_entries = 0;
-//         let mut curr_last_lsn = flush_lsn;
-//         loop {
-//             let entries = plog.replay(curr_last_lsn).await.unwrap();
-//             if entries.is_empty() {
-//                 break;
-//             }
-//             for (lsn, entry) in entries {
-//                 assert!(entry == expected_entries[num_found_entries]);
-//                 assert!(lsn == curr_last_lsn + 1);
-//                 num_found_entries += 1;
-//                 curr_last_lsn = lsn;
-//             }
-//         }
-//         println!("Num found entries: {num_found_entries}");
-//         assert!(num_found_entries == num_entries);
-//     }
+    //     #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    //     async fn test_bench_log() {
+    //         let plog = Arc::new(PersistentLog::new("test", "test").await.unwrap());
+    //         // 1KB of data.
+    //         let content: Vec<u8> = (0..1024).map(|i| (i % 256) as u8).collect();
+    //         let num_writes = 50_000;
+    //         let start_time = std::time::Instant::now();
+    //         for i in 0..num_writes {
+    //             plog.enqueue(content.clone()).await;
+    //             if (i + 1) % 100 == 0 {
+    //                 plog.flush().await;
+    //             }
+    //         }
+    //         let end_time = std::time::Instant::now();
+    //         let duration = end_time.duration_since(start_time);
+    //         println!("Logging took: {duration:?}");
+    //         // tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+    //     }
 
-//     #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
-//     async fn content_test() {
-//         run_content_test().await;
-//     }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    async fn basic_log_test() {
+        run_basic_log_test().await;
+    }
 
-//     async fn run_scaling_test() {
-//         let plog = Arc::new(PersistentLog::new("messaging", "echo").await.unwrap());
-//         // Make 100 empty flushes per seconds for 100 seconds to trigger a scale up.
-//         // Note that the code is written to push metrics even for empty flushes.
-//         for i in 0..100 {
-//             let round = i + 1;
-//             println!("Round {round}/100");
-//             let failed_count = plog
-//                 .failed_replications
-//                 .load(std::sync::atomic::Ordering::Relaxed);
-//             println!("FailedCount={failed_count}");
-//             let start_time = std::time::Instant::now();
-//             for _ in 0..1000 {
-//                 plog.enqueue(vec![1, 2, 3]).await;
-//                 plog.flush().await;
-//             }
-//             let end_time = std::time::Instant::now();
-//             let duration = end_time.duration_since(start_time);
-//             println!("Flushes took: {duration:?}");
-//             tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-//         }
-//         {
-//             let inner = plog.inner.lock().await;
-//             println!("Instances: {:?}", inner.instances);
-//         }
-//         plog.terminate().await;
-//         {
-//             let inner = plog.inner.lock().await;
-//             println!("Instances: {:?}", inner.instances);
-//         }
-//     }
+    async fn make_test_echo_kit() -> HandlerKit {
+        let instance_info = Arc::new(InstanceInfo {
+            peer_id: "444-555-666".into(),
+            az: None,
+            mem: 1024,
+            cpus: 512,
+            public_url: Some("chezmoi.com".into()),
+            private_url: Some("chezmoi.com".into()),
+            service_name: None,
+            handler_name: Some("echolog".into()),
+            subsystem: "functional".into(),
+            namespace: "wal".into(),
+            identifier: "echolog0".into(),
+            unique: true,
+            persistent: true,
+        });
 
-//     #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
-//     async fn scaling_test() {
-//         run_scaling_test().await;
-//     }
-// }
+        let serverless_storage = ServerlessStorage::new_from_info(instance_info.clone())
+            .await
+            .unwrap();
+
+        HandlerKit {
+            instance_info,
+            serverless_storage, // Does not matter.
+        }
+    }
+
+    async fn make_log(external: bool, reset: bool) -> PersistentLog {
+        let dir = common::shared_storage_prefix();
+        if reset {
+            let r = std::fs::remove_dir_all(&dir);
+            println!("RM: {r:?}");
+        }
+        std::env::set_var("OBK_EXECUTION_MODE", "local_ecs");
+        std::env::set_var("OBK_EXTERNAL_ACCESS", external.to_string());
+        let echo_kit = make_test_echo_kit().await;
+        let plog = PersistentLog::new(
+            echo_kit.instance_info.clone(),
+            echo_kit.serverless_storage.unwrap(),
+        )
+        .await
+        .unwrap();
+        plog
+    }
+
+    async fn run_basic_log_test() {
+        let reset = true;
+        let plog = make_log(false, reset).await;
+        let start_lsn = plog.get_start_lsn().await;
+        let flush_lsn = plog.get_flush_lsn().await;
+        println!("Lsns = ({start_lsn}, {flush_lsn})");
+        if reset {
+            assert_eq!(start_lsn, 1);
+            assert_eq!(flush_lsn, 0);
+        }
+        plog.truncate(flush_lsn).await.unwrap();
+        let mut num_entries = 0;
+        let mut expected_entries = vec![];
+        let mut ts = Vec::new();
+        for i in 0..200 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            for j in 0..10 {
+                num_entries += 1;
+                expected_entries.push(vec![i, j]);
+                plog.enqueue(vec![i, j], None).await;
+            }
+            let plog = plog.clone();
+            // Try async flush every now and then.
+            if i % 20 == 0 {
+                ts.push(tokio::spawn(async move {
+                    plog.flush().await;
+                }))
+            } else {
+                plog.flush().await;
+            }
+        }
+        for t in ts {
+            t.await.unwrap();
+        }
+        println!("Num entries: {num_entries}");
+        let mut num_found_entries = 0;
+        let mut curr_last_lsn = flush_lsn;
+        loop {
+            let entries = plog.replay(curr_last_lsn).await.unwrap();
+            println!("Replaying: {:?}.", entries.len());
+            if entries.is_empty() {
+                break;
+            }
+            for (lsn, entry) in entries {
+                assert!(entry == expected_entries[num_found_entries]);
+                assert!(lsn == curr_last_lsn + 1);
+                num_found_entries += 1;
+                curr_last_lsn = lsn;
+            }
+        }
+        println!("Num found entries: {num_found_entries}");
+        assert!(num_found_entries == num_entries);
+    }
+
+    //     #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    //     async fn content_test() {
+    //         run_content_test().await;
+    //     }
+
+    async fn run_scaling_test() {
+        let reset = true;
+        let plog = make_log(true, reset).await;
+        // Make 100 empty flushes per seconds for 100 seconds to trigger a scale up.
+        // Note that the code is written to push metrics even for empty flushes.
+        for i in 0..100 {
+            let round = i + 1;
+            println!("Round {round}/100");
+            let failed_count = plog
+                .failed_replications
+                .load(std::sync::atomic::Ordering::Relaxed);
+            println!("FailedCount={failed_count}");
+            let start_time = std::time::Instant::now();
+            for _ in 0..100 {
+                plog.enqueue(vec![1, 2, 3], Some(2048)).await;
+            }
+            plog.flush().await;
+            let end_time = std::time::Instant::now();
+            let duration = end_time.duration_since(start_time);
+            println!("Flush took: {duration:?}");
+            tokio::time::sleep(std::time::Duration::from_secs_f64(1.0)).await;
+        }
+        {
+            let inner = plog.inner.lock().await;
+            println!("Instances: {:?}", inner.instances);
+            assert!(!inner.instances.is_empty());
+        }
+        plog.terminate().await;
+        {
+            let inner = plog.inner.lock().await;
+            println!("Instances: {:?}", inner.instances);
+            assert!(inner.instances.is_empty());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    async fn scaling_test() {
+        run_scaling_test().await;
+    }
+}

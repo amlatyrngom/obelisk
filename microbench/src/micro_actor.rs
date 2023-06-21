@@ -1,4 +1,4 @@
-use common::ActorInstance;
+use common::{HandlerKit, ScalingState, ServerlessHandler};
 use persistence::PersistentLog;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -31,9 +31,20 @@ pub struct MicroActorInner {
 /// Implementation.
 impl MicroActor {
     /// Create actor.
-    pub async fn new(name: &str, plog: Arc<PersistentLog>) -> Self {
-        println!("Making micro bench actor {name}!");
+    pub async fn new(kit: HandlerKit) -> Self {
+        let HandlerKit {
+            instance_info,
+            serverless_storage,
+        } = kit;
+        let serverless_storage = serverless_storage.unwrap();
+        println!("Making micro bench actor: {}!", instance_info.identifier);
+        let plog = Arc::new(
+            PersistentLog::new(instance_info.clone(), serverless_storage)
+                .await
+                .unwrap(),
+        );
         let inner = Arc::new(RwLock::new(MicroActorInner { curr_value: 0 }));
+
         let actor = MicroActor { plog, inner };
         // Recover first.
         actor.recover().await;
@@ -44,7 +55,8 @@ impl MicroActor {
     async fn recover(&self) {
         let flush_lsn = self.plog.get_flush_lsn().await;
         let start_lsn = self.plog.get_start_lsn().await;
-        if flush_lsn == start_lsn {
+        if flush_lsn < start_lsn {
+            // Nothing appended yet.
             return;
         }
         println!("Flush LSN: {flush_lsn}");
@@ -68,7 +80,7 @@ impl MicroActor {
             let mut inner = self.inner.write().await;
             inner.curr_value += v;
             let entry: Vec<u8> = serde_json::to_vec(&inner.curr_value).unwrap();
-            let lsn = self.plog.enqueue(entry).await;
+            let lsn = self.plog.enqueue(entry, Some(512)).await;
             (inner.curr_value, lsn)
         };
         // Wait for flush and return.
@@ -88,9 +100,9 @@ impl MicroActor {
 }
 
 #[async_trait::async_trait]
-impl ActorInstance for MicroActor {
+impl ServerlessHandler for MicroActor {
     /// Handle a message.
-    async fn message(&self, msg: String, _payload: Vec<u8>) -> (String, Vec<u8>) {
+    async fn handle(&self, msg: String, _payload: Vec<u8>) -> (String, Vec<u8>) {
         let req: MicroActorReq = serde_json::from_str(&msg).unwrap();
         let resp: MicroActorResp = match req {
             MicroActorReq::Increment(v) => self.handle_increment(v).await,
@@ -100,14 +112,10 @@ impl ActorInstance for MicroActor {
         (resp, vec![])
     }
 
-    /// Checkpoint. Just truncate the log here.
-    async fn checkpoint(&self, terminating: bool) {
-        println!("Checkpoint: terminating=({terminating})");
+    /// Checkpoint. Just truncate the log up to and excluding the last entry.
+    async fn checkpoint(&self, _scaling_state: &ScalingState, terminating: bool) {
+        println!("Checkpoint:  =({terminating})");
         let flush_lsn = self.plog.get_flush_lsn().await;
-        let start_lsn = self.plog.get_start_lsn().await;
-        if flush_lsn > start_lsn + 1 {
-            return;
-        }
         self.plog.truncate(flush_lsn - 1).await.unwrap();
     }
 }

@@ -106,6 +106,7 @@ pub(crate) struct Handler {
     caller: Option<i32>,
     unique: Option<bool>,
     ephemeral: Option<i32>,
+    scaleup: Option<bool>,
 }
 
 /// A VISC subsystem.
@@ -131,6 +132,8 @@ pub(crate) struct Subsystem1 {
 pub struct Deployment1 {
     /// Everything within a namespace has the same filesystem, s3 bucket, ecs cluster, etc.
     namespace: String,
+    /// Dependencies.
+    dependencies: Option<Vec<String>>,
     /// A subsystem allows implementing VISC for an API.
     subsystem: Option<Subsystem1>,
     /// A subsystem allows implementing VISC
@@ -225,6 +228,7 @@ fn make_specs(
                             ephemeral: h.ephemeral.unwrap_or(512),
                             persistent: h.persistent.unwrap_or(false),
                             unique: h.unique.unwrap_or(false),
+                            scaleup: h.scaleup.unwrap_or(false),
                         },
                     )
                 })
@@ -233,6 +237,7 @@ fn make_specs(
                 namespace: deployment.namespace.clone(),
                 public_img_url: public_uri.into(),
                 private_img_url: private_uri.into(),
+                dependencies: deployment.dependencies.clone().unwrap_or(vec![]),
                 subsystem_spec,
                 handler_specs,
             }

@@ -4,7 +4,7 @@ members = [
     'common',
     # 'messaging',
     'persistence',
-    # 'microbench',
+    'microbench',
     'deployment'
 ]
 
@@ -25,11 +25,11 @@ path = './functional'
 # [dependencies.messaging]
 # path = './messaging'
 
-# [dependencies.persistence]
-# path = './persistence'
+[dependencies.persistence]
+path = './persistence'
 
-# [dependencies.microbench]
-# path = './microbench'
+[dependencies.microbench]
+path = './microbench'
 
 
 [dependencies.tokio]

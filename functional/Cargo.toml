@@ -9,6 +9,7 @@ edition = "2021"
 tokio = { version = "*", features = ["full"] }
 reqwest = { version = "*", features = ["json", "rustls-tls"], default-features = false }
 aws-sdk-lambda = "*"
+aws-sdk-s3 = "*"
 aws-config = "*"
 aws-smithy-types = "*"
 aws-types = "*"
@@ -20,6 +21,7 @@ rand = "*"
 serde = {version="*", features=["derive"]}
 chrono = {version="*", features=["serde"]}
 common = {path="../common"}
+uuid = { version = "*", features = ["v4"]}
 
 
 [dev-dependencies]

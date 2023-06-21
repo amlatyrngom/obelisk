@@ -175,7 +175,23 @@ impl ContainerDeployment {
             )
             .build();
         let task_def = task_def.container_definitions(container_def);
-        task_def.send().await.unwrap();
+        loop {
+            let to_send = task_def.clone();
+            let resp = to_send.send().await;
+            match resp {
+                Ok(_) => return,
+                Err(e) => {
+                    let e = format!("{e:?}");
+                    if e.contains("ThrottlingException") {
+                        println!("Retrying due to request throtlling!");
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        continue;
+                    } else {
+                        panic!("{e:?}");
+                    }
+                }
+            }
+        }
     }
 
     /// Register handler task definition.
@@ -291,10 +307,29 @@ impl ContainerDeployment {
         }
         let container_def = container_def.build();
         let task_def = task_def.container_definitions(container_def);
-        task_def.send().await.unwrap();
+        loop {
+            let to_send = task_def.clone();
+            let resp = to_send.send().await;
+            match resp {
+                Ok(_) => return,
+                Err(e) => {
+                    let e = format!("{e:?}");
+                    if e.contains("ThrottlingException") {
+                        println!("Retrying due to request throtlling!");
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        continue;
+                    } else {
+                        panic!("{e:?}");
+                    }
+                }
+            }
+        }
     }
 
-    pub fn all_avail_mems(mem: i32) -> Vec<i32> {
+    pub fn all_avail_mems(mem: i32, scaleup: bool) -> Vec<i32> {
+        if !scaleup {
+            return vec![mem];
+        }
         let mut res = Vec::<i32>::new();
         if mem <= 64 * 1024 {
             res.push(64 * 1024);
@@ -355,22 +390,17 @@ impl ContainerDeployment {
         fs_id: &str,
         ap_id: &str,
     ) {
-        let mut curr_mem = handler_spec.default_mem;
-        let mut is_default = true;
-        assert!(curr_mem <= 8192);
+        let avail_mems = Self::all_avail_mems(handler_spec.default_mem, handler_spec.scaleup);
         let mut mems = Vec::new();
         let mut cpus = Vec::new();
-        while curr_mem <= 64 * 1024 {
-            // Up to and including 64GB.
-            if is_default {
-                mems.push(curr_mem);
-                cpus.push(curr_mem / 2);
+        for mem in avail_mems {
+            if mem == handler_spec.default_mem {
+                mems.push(mem);
+                cpus.push(mem / 2);
             } else {
-                mems.push(curr_mem);
-                cpus.push(curr_mem / 4);
+                mems.push(mem);
+                cpus.push(mem / 4);
             }
-            curr_mem *= 2;
-            is_default = false;
         }
 
         for (mem, cpu) in mems.into_iter().zip(cpus.into_iter()) {

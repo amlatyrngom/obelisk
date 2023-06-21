@@ -8,7 +8,7 @@ const REPLICAS_VCPUS: f64 = 0.25;
 /// Replics mem.
 const REPLICAS_MEM_GB: f64 = 1.0;
 /// Time saved with replication.
-const REPLICATION_GAIN: f64 = 0.010;
+const REPLICATION_GAIN_SECS: f64 = 0.010;
 
 /// Info to maintain for scaling functions.
 #[derive(Serialize, Deserialize, Debug)]
@@ -81,7 +81,7 @@ impl WalRescaler {
         for metric in &metrics {
             let metric: WalMetric = bincode::deserialize(metric).unwrap();
             for mem in metric.user_mems {
-                user_activity += (mem as f64 / 1024.0) * REPLICATION_GAIN;
+                user_activity += (mem as f64 / 1024.0) * REPLICATION_GAIN_SECS;
             }
         }
         // Divide by duration.
