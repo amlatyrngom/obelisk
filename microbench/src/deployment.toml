@@ -1,0 +1,32 @@
+namespace = "microbench"
+dependencies = ["wal", "functional"]
+
+
+[[handlers]]
+name = "microfn"
+subsystem = "functional"
+path = "microbench::MicroFunction"
+mem = 512
+timeout = 10
+concurrency = 32
+scaleup = false
+
+
+[[handlers]]
+name = "microactor"
+subsystem = "functional"
+path = "microbench::MicroActor"
+mem = 1024
+timeout = 10
+persistent = true
+unique = true
+scaleup = false
+
+
+[[handlers]]
+name = "microrunner"
+subsystem = "functional"
+path = "microbench::BenchRunner"
+mem = 512
+timeout = 60
+scaleup = false
