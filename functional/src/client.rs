@@ -42,7 +42,7 @@ impl FunctionalClient {
             .retry_config(
                 aws_sdk_lambda::config::retry::RetryConfig::standard()
                     .with_initial_backoff(std::time::Duration::from_millis(10)) // On avg: 25ms, 50ms, 100ms, ....
-                    .with_max_attempts(5),
+                    .with_max_attempts(10),
             )
             .build();
         let lambda_client = aws_sdk_lambda::Client::from_conf(lambda_config);

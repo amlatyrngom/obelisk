@@ -246,7 +246,6 @@ fn make_specs(
 }
 
 pub async fn build_system(deployments: &[String]) {
-    // Gen main file.
     let deployments: Vec<Deployment1> = deployments
         .iter()
         .map(|s| toml::from_str(s).unwrap())
@@ -280,29 +279,30 @@ pub async fn build_system(deployments: &[String]) {
 //     aws.deployer.teardown_vpc_endpoints().await;
 // }
 
-// pub async fn build_user_deployment(project_name: &str, system_img: &str, deployments: &[String]) {
-//     // Gen main file.
-//     let deployments: Vec<Deployment> = deployments
-//         .iter()
-//         .map(|s| toml::from_str(s).unwrap())
-//         .collect();
-//     codegen::gen_main(&deployments, false);
-//     // Gen cargo file.
-//     let user_cargo = std::fs::read_to_string("Cargo.toml").unwrap();
-//     let user_cargo: CargoConfig = toml::from_str(&user_cargo).unwrap();
-//     codegen::gen_cargo(user_cargo);
-//     // Create repos and push image.
-//     let aws = aws::AWS::new().await;
-//     aws.deployer.create_cluster().await;
-//     aws.deployer.create_bucket().await;
-//     aws.deployer.get_subnet_with_endpoints(true).await;
-//     // Make user repos.
-//     build_image(false);
-//     let (private_uri, public_uri) = aws.create_repos(project_name).await;
-//     push_images(&private_uri, &public_uri, false);
-//     // // Do deployment.
-//     for deployment in deployments {
-//         aws.deploy(system_img, &private_uri, &public_uri, &deployment)
-//             .await;
-//     }
-// }
+pub async fn build_user_deployment(project_name: &str, deployments: &[String]) {
+    // Gen main file.
+    let deployments: Vec<Deployment1> = deployments
+        .iter()
+        .map(|s| toml::from_str(s).unwrap())
+        .collect();
+    codegen::gen_main(&deployments, false);
+    // Gen cargo file.
+    let user_cargo = std::fs::read_to_string("Cargo.toml").unwrap();
+    let user_cargo: CargoConfig = toml::from_str(&user_cargo).unwrap();
+    codegen::gen_cargo(user_cargo);
+    // Build image.
+    let aws = aws::AWS::new().await;
+    build_image(false);
+    let (private_uri, public_uri) = aws.create_repos(project_name).await;
+    println!("URLS: {private_uri}; {public_uri}");
+    push_images(&private_uri, &public_uri, false);
+    // Make specs.
+    let namespace_specs = make_specs(&deployments, &public_uri, &private_uri);
+    let deployer = deployment::Deployment::new().await;
+    for spec in &namespace_specs {
+        deployer.setup_namespace(spec).await.unwrap();
+    }
+    for spec in &namespace_specs {
+        deployer.redeploy_subsystems(spec).await;
+    }
+}

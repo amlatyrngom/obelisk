@@ -24,7 +24,7 @@ impl ServerlessStorage {
         let db_file = format!("{storage_dir}/lockfile.db");
         let manager = r2d2_sqlite::SqliteConnectionManager::file(db_file.clone());
         let pool = r2d2::Pool::builder()
-            .max_size(1)
+            .max_size(16)
             .build(manager)
             .map_err(debug_format!())?;
         let mut num_tries = num_tries;
@@ -66,7 +66,7 @@ impl ServerlessStorage {
         let db_file = format!("{storage_dir}/notif.db");
         let manager = r2d2_sqlite::SqliteConnectionManager::file(db_file.clone());
         let pool = r2d2::Pool::builder()
-            .max_size(1)
+            .max_size(16)
             .build(manager)
             .map_err(debug_format!())?;
         let mut conn = pool
