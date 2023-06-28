@@ -227,6 +227,9 @@ impl ScalingStateManager {
 
     /// Invoke the rescaler.
     pub async fn invoke_rescaler(&self, client: &aws_sdk_lambda::Client) -> Result<String, String> {
+        if !crate::has_external_access() {
+            return Err("No external access!".into());
+        }
         let req = (self.namespace.clone(), self.identifier.clone());
         let req = serde_json::to_vec(&req).unwrap();
         let req = aws_sdk_lambda::primitives::Blob::new(req);

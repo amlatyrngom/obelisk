@@ -7,13 +7,13 @@ use serde::{Deserialize, Serialize};
 const MOVING_FACTOR: f64 = 0.25;
 /// Overhead of lambda.
 const AVG_LAMBDA_OVERHEAD_SECS: f64 = 0.010;
-/// Utilization upper bound.
-const UTILIZATION_UPPER_BOUND: f64 = 0.8;
-/// Utilization lower bound.
-const UTILIZATION_LOWER_BOUND: f64 = 0.3;
+/// Utilization upper bound. Scale up when either cpu or mem above this.
+const UTILIZATION_UPPER_BOUND: f64 = 0.85;
+/// Utilization lower bound. Scale down when both cpu and mem below this.
+const UTILIZATION_LOWER_BOUND: f64 = 0.25;
 /// Number of rescaling rounds to observe before considering utilization stable.
 /// A rescaling round occurs once every ~10 seconds (see constants).
-const UTILIZATION_NUM_ROUNDS: f64 = 6.0;
+const UTILIZATION_NUM_ROUNDS: f64 = 10.0;
 
 /// Exploration stats.
 #[derive(Serialize, Deserialize, Debug)]
@@ -147,15 +147,13 @@ impl Rescaler for FunctionalRescaler {
         } else {
             cost_ratio.floor()
         };
-        let mut to_deploy = to_deploy as i32;
-        if to_deploy < 0 {
-            to_deploy = 0;
-        }
-        if to_deploy > 1 && handler_scaling_state.handler_spec.unique {
-            to_deploy = 1;
-        }
-
-        self.mark_rescaling(&mut rescaling_result, ideal_mem, to_deploy);
+        let to_deploy = to_deploy as i32;
+        self.mark_rescaling(
+            &mut rescaling_result,
+            &handler_scaling_state,
+            ideal_mem,
+            to_deploy,
+        );
         println!("Summary: LP={lambda_price}, EP={ecs_price}, IP={invoker_price}, OC={observed_concurrency}, CR={cost_ratio}, TS={target_scale}, TD={to_deploy}, IM={ideal_mem}");
         rescaling_result.handler_scaling_info =
             Some(serde_json::to_string(&current_stats).unwrap());
@@ -189,6 +187,17 @@ impl FunctionalRescaler {
             user_activity += (metric.caller_mem as f64 / 1024.0) * AVG_LAMBDA_OVERHEAD_SECS;
             let duration_secs = metric.duration.as_secs_f64();
             function_activity += default_mem_gb * duration_secs;
+            // If overutilized, increase user's overhead by half the duration (heuristic).
+            let overused = metric
+                .cpu_usage
+                .map_or(false, |x| x > UTILIZATION_UPPER_BOUND);
+            let overused = overused
+                || metric
+                    .mem_usage
+                    .map_or(false, |x| x > UTILIZATION_UPPER_BOUND);
+            if overused {
+                user_activity += (metric.caller_mem as f64 / 1024.0) * (duration_secs / 2.0);
+            }
             // Update exploration stats.
             if metric.mem_usage.is_none() {
                 continue;
@@ -330,13 +339,6 @@ impl FunctionalRescaler {
                 handler_scales.insert(*mem, 0);
             }
         }
-        // Scale invoker appropriately.
-        if ideal_mem.is_some() && !handler_scaling_state.handler_spec.unique {
-            println!("Setting service scales");
-            rescaling_result.services_scales.insert("invoker".into(), 1);
-        } else {
-            rescaling_result.services_scales.insert("invoker".into(), 0);
-        }
     }
 
     /// Summarize current statistics.
@@ -379,9 +381,22 @@ impl FunctionalRescaler {
     fn mark_rescaling(
         &self,
         rescaling_result: &mut RescalingResult,
+        handler_scaling_state: &HandlerScalingState,
         ideal_mem: i32,
-        to_deploy: i32,
+        mut to_deploy: i32,
     ) {
+        if to_deploy <= 0 {
+            return;
+        }
+        // Special case for actors.
+        if handler_scaling_state.handler_spec.unique {
+            rescaling_result.services_scales.insert("invoker".into(), 0);
+            to_deploy = 1;
+        } else {
+            println!("Setting service scales");
+            rescaling_result.services_scales.insert("invoker".into(), 1);
+        };
+        // Update scales.
         let handler_scales = rescaling_result.handler_scales.as_mut().unwrap();
         handler_scales.insert(ideal_mem, to_deploy as u64);
     }

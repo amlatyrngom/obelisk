@@ -116,7 +116,8 @@ impl ScalingStateRescaler {
         }
         // Check rescaling interval.
         let curr_time = state_manager.leaser.current_time().await;
-        let since_last_scaling = curr_time.signed_duration_since(scaling_state.last_rescale);
+        let old_last_rescale = scaling_state.last_rescale;
+        let since_last_scaling = curr_time.signed_duration_since(old_last_rescale);
         if since_last_scaling < chrono::Duration::seconds(RESCALING_INTERVAL_SECS as i64) {
             return Ok("Recent Rescale".into());
         }
@@ -153,7 +154,7 @@ impl ScalingStateRescaler {
                 return Ok("All Good".into());
             } else {
                 let new_scaling_state = state_manager.retrieve_scaling_state().await?;
-                if new_scaling_state.last_rescale == scaling_state.last_rescale {
+                if new_scaling_state.last_rescale == old_last_rescale {
                     // Failed write is not due to rescale conflict, but to peers update.
                     scaling_state.subsys_state.peers = new_scaling_state.subsys_state.peers;
                     if let Some(handler_state) = &mut scaling_state.handler_state {

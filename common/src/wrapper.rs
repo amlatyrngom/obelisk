@@ -1,5 +1,4 @@
 use crate::debug_format;
-use crate::deployment::ServiceSpec;
 use crate::scaling_state::ScalingStateManager;
 use crate::storage::ServerlessStorage;
 use crate::{deployment, ServerlessHandler};
@@ -22,10 +21,6 @@ pub struct ServerlessWrapper {
     serverless_storage: Option<Arc<ServerlessStorage>>,
     handler: Arc<dyn ServerlessHandler>,
     instance_stats: Arc<RwLock<Option<InstanceStats>>>,
-}
-
-pub enum InstanceType {
-    Service { spec: ServiceSpec },
 }
 
 /// Information about a running instance.
@@ -335,7 +330,9 @@ impl ServerlessWrapper {
         let (msg_id, meta, payload): (String, String, Vec<u8>) =
             bincode::deserialize(&body).unwrap();
         // Handle.
+        println!("Indirect Handling.");
         let (resp_meta, resp_payload) = self.handler.handle(meta, payload).await;
+        println!("Indirect Handled.");
         let resp_meta = self.wrap_response(resp_meta, start_time);
         // Serialize response.
         let body: (String, HandlingResp, Vec<u8>) = (msg_id.clone(), resp_meta, resp_payload);

@@ -4,7 +4,7 @@ FROM rust:slim AS chef
 WORKDIR /app
 RUN cargo install cargo-chef --version 0.1.52
 RUN apt-get update
-RUN apt-get install -y make software-properties-common wget python3-dev
+RUN apt-get install -y make software-properties-common wget python3-dev clang 
 
 FROM chef AS planner
 WORKDIR /app

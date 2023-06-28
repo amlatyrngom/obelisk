@@ -1,7 +1,6 @@
-pub use common::{HandlerKit, ScalingState, ServerlessHandler, ServerlessStorage, InstanceInfo};
-pub use persistence::PersistentLog;
+pub use common::{HandlerKit, InstanceInfo, ScalingState, ServerlessHandler, ServerlessStorage};
 pub use functional::FunctionalClient;
-
+pub use persistence::PersistentLog;
 
 pub use common;
 pub use functional;

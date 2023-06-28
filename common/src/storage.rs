@@ -18,17 +18,21 @@ impl ServerlessStorage {
     /// Try opening lock file.
     pub fn try_exclusive_file(
         storage_dir: &str,
-        num_tries: i32,
+        max_num_tries: i32,
     ) -> Result<Pool<SqliteConnectionManager>, String> {
         println!("Opening Exclusive File!");
         let db_file = format!("{storage_dir}/lockfile.db");
         let manager = r2d2_sqlite::SqliteConnectionManager::file(db_file.clone());
         let pool = r2d2::Pool::builder()
-            .max_size(16)
+            .max_size(1)
             .build(manager)
             .map_err(debug_format!())?;
-        let mut num_tries = num_tries;
+        let mut num_tries = max_num_tries;
         loop {
+            // Sleep since the conn timeout seems not enough.
+            if num_tries < max_num_tries {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
             let conn = pool
                 .get_timeout(std::time::Duration::from_secs(1))
                 .map_err(debug_format!())?;
@@ -63,10 +67,11 @@ impl ServerlessStorage {
     pub fn try_shared_file(
         storage_dir: &str,
     ) -> Result<(Pool<SqliteConnectionManager>, usize), String> {
+        println!("Opening Shared File!");
         let db_file = format!("{storage_dir}/notif.db");
         let manager = r2d2_sqlite::SqliteConnectionManager::file(db_file.clone());
         let pool = r2d2::Pool::builder()
-            .max_size(16)
+            .max_size(1)
             .build(manager)
             .map_err(debug_format!())?;
         let mut conn = pool
@@ -258,11 +263,14 @@ impl ServerlessStorage {
                 }
             }
             // Actually release lock in sqlite.
-            match conn.query_row("SELECT * FROM sqlite_master LIMIT 1", [], |r| r.get(0)) {
+            match conn.query_row("SELECT COUNT(*) FROM sqlite_master LIMIT 1", [], |r| {
+                r.get(0)
+            }) {
                 Ok(res) => {
                     let _res: usize = res;
                 }
                 Err(rusqlite::Error::QueryReturnedNoRows) => {}
+                Err(rusqlite::Error::InvalidColumnType(_, _, _)) => {}
                 Err(x) => {
                     println!("Cannot release: {x:?}");
                     continue;

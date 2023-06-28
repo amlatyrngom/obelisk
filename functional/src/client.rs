@@ -4,7 +4,7 @@ use common::deployment::lambda;
 use common::scaling_state::ScalingStateManager;
 use common::wrapper::WrapperMessage;
 use common::{HandlingResp, MetricsManager};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 const NUM_INDIRECT_RETRIES: u64 = 50;
 const INDIRECT_WAIT_TIME_SECS: f64 = 0.02;
@@ -21,6 +21,7 @@ pub struct FunctionalClient {
     metrics_manager: Arc<MetricsManager>,
     scaling_manager: Arc<ScalingStateManager>,
     caller_mem: i32,
+    last_force_refresh: Arc<Mutex<std::time::Instant>>,
 }
 
 impl FunctionalClient {
@@ -76,11 +77,13 @@ impl FunctionalClient {
             metrics_manager: Arc::new(metrics_manager),
             scaling_manager: Arc::new(scaling_manager),
             caller_mem: caller_mem.unwrap_or(512),
+            last_force_refresh: Arc::new(Mutex::new(std::time::Instant::now())),
         }
     }
 
     /// Log a metric with a given probability.
     async fn log_metrics(&self, resp: &HandlingResp) {
+        println!("Resp Duration: {:?}.", resp.duration);
         let metric = FunctionalMetric {
             duration: resp.duration,
             mem_size_mb: resp.mem_size_mb,
@@ -263,6 +266,7 @@ impl FunctionalClient {
             // Check code.
             if resp.status().as_u16() != 200 {
                 let err = common::debug_format!()(resp);
+                println!("HTTP Err: {err:?}");
                 return Err(err);
             }
             // Resp of invoker.
@@ -384,6 +388,24 @@ impl FunctionalClient {
                         Ok(resp) => (Some(resp), false),
                         Err(e) => {
                             println!("{e:?}");
+                            // Check if should refresh scaling state.
+                            let refresh = {
+                                let mut last_force_refresh =
+                                    self.last_force_refresh.lock().unwrap();
+                                let now = std::time::Instant::now();
+                                if now.duration_since(*last_force_refresh).as_secs() > 1 {
+                                    *last_force_refresh = now;
+                                    true
+                                } else {
+                                    false
+                                }
+                            };
+                            if refresh {
+                                let scaling_manager = self.scaling_manager.clone();
+                                tokio::spawn(async move {
+                                    let _ = scaling_manager.retrieve_scaling_state().await;
+                                });
+                            }
                             (None, false)
                         }
                     }
