@@ -8,12 +8,14 @@ const MOVING_FACTOR: f64 = 0.25;
 /// Overhead of lambda.
 const AVG_LAMBDA_OVERHEAD_SECS: f64 = 0.010;
 /// Utilization upper bound. Scale up when either cpu or mem above this.
-const UTILIZATION_UPPER_BOUND: f64 = 0.85;
+const UTILIZATION_UPPER_BOUND: f64 = 0.90;
 /// Utilization lower bound. Scale down when both cpu and mem below this.
 const UTILIZATION_LOWER_BOUND: f64 = 0.25;
 /// Number of rescaling rounds to observe before considering utilization stable.
 /// A rescaling round occurs once every ~10 seconds (see constants).
-const UTILIZATION_NUM_ROUNDS: f64 = 10.0;
+const UTILIZATION_NUM_ROUNDS: f64 = 20.0;
+/// Upscaling for safety.
+const UPSCALE_FACTOR: f64 = 0.0;
 
 /// Exploration stats.
 #[derive(Serialize, Deserialize, Debug)]
@@ -98,7 +100,8 @@ impl Rescaler for FunctionalRescaler {
         );
         // Find ideal mem and summary.
         let mut ideal_mem = self.find_ideal_memory(&mut current_stats, &handler_scaling_state);
-        while ideal_mem > handler_scaling_state.handler_spec.default_mem {
+        let min_mem = *current_stats.exploration_stats.keys().min().unwrap();
+        while ideal_mem > min_mem {
             let (lambda_price, ecs_price, invoker_price, _observed_concurrency) = self
                 .summarize_stats(
                     &current_stats,
@@ -142,6 +145,7 @@ impl Rescaler for FunctionalRescaler {
         let cost_ratio = (lambda_price - invoker_price) / ecs_price;
         let target_scale =
             observed_concurrency / handler_scaling_state.handler_spec.concurrency as f64;
+        let target_scale = target_scale * (UPSCALE_FACTOR + 1.0);
         let to_deploy: f64 = if cost_ratio.floor() > target_scale.ceil() {
             target_scale.ceil()
         } else {
@@ -253,20 +257,41 @@ impl FunctionalRescaler {
     fn find_ideal_memory(
         &self,
         current_stats: &mut FunctionalScalingInfo,
-        handler_scaling_state: &HandlerScalingState,
+        _handler_scaling_state: &HandlerScalingState,
     ) -> i32 {
         let mut previous_mem = None;
+        let min_mem = current_stats
+            .exploration_stats
+            .keys()
+            .min()
+            .unwrap()
+            .clone();
+        let max_mem = current_stats
+            .exploration_stats
+            .keys()
+            .max()
+            .unwrap()
+            .clone();
+        let mut cpu_bound = false;
         for (mem, exploration) in &mut current_stats.exploration_stats {
+            let mem = *mem;
+            // Special case: Skip first scale up container if cpu bound.
+            if cpu_bound && mem < max_mem && mem == 2 * min_mem {
+                continue;
+            }
             // Check if enough points have been collected.
             if exploration.num_points < UTILIZATION_NUM_ROUNDS {
                 // Use this until more points are collected.
-                return *mem;
+                return mem;
             }
-            // Check overutilization.
-            if exploration.avg_cpu_util > UTILIZATION_UPPER_BOUND
-                || exploration.avg_mem_util > UTILIZATION_UPPER_BOUND
+
+            // Check overutilization unless already at max size.
+            if mem < max_mem
+                && (exploration.avg_cpu_util > UTILIZATION_UPPER_BOUND
+                    || exploration.avg_mem_util > UTILIZATION_UPPER_BOUND)
             {
-                previous_mem = Some(*mem);
+                previous_mem = Some(mem);
+                cpu_bound = exploration.avg_cpu_util > UTILIZATION_UPPER_BOUND;
                 continue;
             }
             // Check underutilization.
@@ -276,7 +301,7 @@ impl FunctionalRescaler {
             {
                 if previous_mem.is_none() {
                     // If not smaller size, return.
-                    return *mem;
+                    return mem;
                 }
                 // Reset exploration.
                 exploration.num_points = 0.0;
@@ -285,7 +310,7 @@ impl FunctionalRescaler {
                 break;
             }
             // Well utilized.
-            return *mem;
+            return mem;
         }
         if let Some(previous_mem) = previous_mem {
             // Reset exploration.
@@ -298,7 +323,7 @@ impl FunctionalRescaler {
             exploration.avg_mem_util = 0.0;
             previous_mem
         } else {
-            handler_scaling_state.handler_spec.default_mem
+            min_mem
         }
     }
 
@@ -355,9 +380,10 @@ impl FunctionalRescaler {
         let fn_compute_cost = current_stats.function_activity_gbsec * 0.0000166667 * 3600.0;
         let user_cost = current_stats.user_activity_gbsec * 0.0000166667 * 3600.0;
         let lambda_price = user_cost + fn_compute_cost + fn_call_cost;
-        let observed_concurrency = current_stats.function_activity_gbsec / default_mem_gb;
+        let observed_concurrency: f64 = current_stats.function_activity_gbsec / default_mem_gb;
         // Compute ecs cost.
-        let cpus = if ideal_mem == handler_scaling_state.handler_spec.default_mem {
+        let min_mem = *current_stats.exploration_stats.keys().min().unwrap();
+        let cpus = if ideal_mem == min_mem {
             ideal_mem / 2
         } else {
             ideal_mem / 4
@@ -386,6 +412,7 @@ impl FunctionalRescaler {
         mut to_deploy: i32,
     ) {
         if to_deploy <= 0 {
+            rescaling_result.services_scales.insert("invoker".into(), 0);
             return;
         }
         // Special case for actors.
@@ -542,6 +569,7 @@ mod tests {
         assert!(subsys_state.service_scales.get("invoker").unwrap() == &1);
         let handler_scales = compute_actual_scales(&handler_state);
         assert!(handler_scales.get(&512).unwrap() == &1);
+        assert!(handler_scales.get(&1024).unwrap() == &1); // 1024 is minimum size.
         for _ in 0..100 {
             let metrics = vec![];
             let rescaling_result = fn_rescaler

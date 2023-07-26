@@ -451,8 +451,8 @@ mod tests {
         let resp = fc.invoke("0.5", b"Ngom").await;
         println!("Resp: {resp:?}");
         // Try invoking rescaler.
-        let resp = fc.scaling_manager.invoke_rescaler(&fc.lambda_client).await;
-        println!("Resp: {resp:?}");
+        // let resp = fc.scaling_manager.invoke_rescaler(&fc.lambda_client).await;
+        // println!("Resp: {resp:?}");
     }
 
     #[tokio::test]

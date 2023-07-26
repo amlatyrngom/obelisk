@@ -327,6 +327,22 @@ impl ContainerDeployment {
     }
 
     pub fn all_avail_mems(mem: i32, scaleup: bool) -> Vec<i32> {
+        // Container mem based on lambda.
+        let vcpus = (mem as f64) / 1769.0;
+        let vcpus = if vcpus <= 0.25 {
+            0.25
+        } else if vcpus <= 0.5 {
+            0.5
+        } else if vcpus <= 1.0 {
+            1.0
+        } else if vcpus <= 2.0 {
+            2.0
+        } else if vcpus <= 4.0 {
+            4.0
+        } else {
+            8.0
+        };
+        let mem = (vcpus * 2.0 * 1024.0) as i32;
         if !scaleup {
             return vec![mem];
         }
@@ -391,10 +407,11 @@ impl ContainerDeployment {
         ap_id: &str,
     ) {
         let avail_mems = Self::all_avail_mems(handler_spec.default_mem, handler_spec.scaleup);
+        println!("Avail Mems: {avail_mems:?}.");
         let mut mems = Vec::new();
         let mut cpus = Vec::new();
         for mem in avail_mems {
-            if mem == handler_spec.default_mem {
+            if mem <= handler_spec.default_mem * 2 {
                 mems.push(mem);
                 cpus.push(mem / 2);
             } else {

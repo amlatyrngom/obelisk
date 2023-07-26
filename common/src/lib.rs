@@ -113,6 +113,16 @@ pub fn persistence_mnt_path() -> String {
     "/mnt/obelisk_shared_data".into()
 }
 
+pub fn local_storage_path() -> String {
+    if let Ok(v) = std::env::var("OBK_EXECUTION_MODE") {
+        if !v.contains("local") {
+            return "/tmp/obelisk_local_data".into();
+        }
+    }
+    // // For local test
+    "obelisk_local_data".into()
+}
+
 /// Name of s3 bucket. TODO: set to `obelisk` once existing bucket is deleted.
 pub fn bucket_name() -> String {
     "obelisk1".into()

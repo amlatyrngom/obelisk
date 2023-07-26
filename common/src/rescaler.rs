@@ -143,7 +143,7 @@ impl ScalingStateRescaler {
         //     &req.name,
         //     scaling_state.current_scale as i32,
         // ).await;
-        loop {
+        for _ in 0..5 {
             state_manager.cleanup_instances(&mut scaling_state).await;
             let updated = state_manager
                 .write_scaling_state(&mut scaling_state, &old_id)
@@ -168,6 +168,7 @@ impl ScalingStateRescaler {
                 }
             }
         }
+        return Ok("Concurrent Ops".into());
     }
 
     /// Rescale service tasks.

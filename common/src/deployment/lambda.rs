@@ -100,7 +100,13 @@ impl LambdaDeployment {
                     let config = template.configuration().unwrap();
                     let mem_size = config.memory_size().unwrap();
                     let timeout = config.timeout().unwrap();
+                    let ephemeral_storage = config.ephemeral_storage().cloned().unwrap_or(
+                        aws_sdk_lambda::types::EphemeralStorage::builder()
+                            .size(512)
+                            .build(),
+                    );
                     create_function = create_function.memory_size(mem_size).timeout(timeout);
+                    create_function = create_function.ephemeral_storage(ephemeral_storage);
                     if let Some(efs_config) = config.file_system_configs() {
                         create_function = create_function
                             .file_system_configs(efs_config.first().unwrap().clone());
@@ -213,6 +219,11 @@ impl LambdaDeployment {
             .memory_size(spec.default_mem)
             .package_type(PackageType::Image)
             .timeout(spec.timeout)
+            .ephemeral_storage(
+                aws_sdk_lambda::types::EphemeralStorage::builder()
+                    .size(spec.ephemeral)
+                    .build(),
+            )
             .role(role_arn)
             .environment(environ);
         if spec.persistent || spec.unique {
