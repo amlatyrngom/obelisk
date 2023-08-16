@@ -2,8 +2,9 @@
 # cargo-chef and the Rust toolchain
 FROM python:slim AS chef
 RUN apt-get update
-RUN apt-get install -y curl build-essential make software-properties-common wget python3-dev pkg-config libssl-dev
 RUN apt-get update
+RUN apt-get install -y curl build-essential make software-properties-common wget python3-dev pkg-config libssl-dev clang
+# RUN bash -c "$(wget -O - https://apt.llvm.org/llvm.sh)"
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | bash -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
 WORKDIR /app

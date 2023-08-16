@@ -326,7 +326,7 @@ impl ContainerDeployment {
         }
     }
 
-    pub fn all_avail_mems(mem: i32, scaleup: bool) -> Vec<i32> {
+    pub fn all_avail_mems(mem: i32, scaleup: f64) -> Vec<i32> {
         // Container mem based on lambda.
         let vcpus = (mem as f64) / 1769.0;
         let vcpus = if vcpus <= 0.25 {
@@ -343,7 +343,7 @@ impl ContainerDeployment {
             8.0
         };
         let mem = (vcpus * 2.0 * 1024.0) as i32;
-        if !scaleup {
+        if scaleup <= 1e-4 {
             return vec![mem];
         }
         let mut res = Vec::<i32>::new();

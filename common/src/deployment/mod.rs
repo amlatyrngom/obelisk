@@ -75,7 +75,7 @@ pub struct HandlerSpec {
     pub ephemeral: i32,
     pub persistent: bool,
     pub unique: bool,
-    pub scaleup: bool,
+    pub scaleup: f64,
 }
 
 pub struct NamespaceDeployment {}

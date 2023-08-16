@@ -40,7 +40,7 @@ persistent = false
 concurrency = 2
 # When scale up is true, will attempt to select the optimal amount of cpus and mem.
 # Default: false
-scaleup = true
+scaleup = 1.0
 
 
 
@@ -66,4 +66,4 @@ persistent = true
 unique = true
 # When scale up is true, will attempt to select the optimal amount of cpus and mem.
 # Default: false
-scaleup = true
+scaleup = 1.0

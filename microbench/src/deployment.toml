@@ -9,7 +9,6 @@ path = "microbench::MicroFunction"
 mem = 512
 timeout = 10
 concurrency = 32
-scaleup = false
 
 
 [[handlers]]
@@ -20,7 +19,6 @@ mem = 1024
 timeout = 10
 persistent = true
 unique = true
-scaleup = false
 
 
 [[handlers]]
@@ -29,4 +27,3 @@ subsystem = "functional"
 path = "microbench::BenchRunner"
 mem = 512
 timeout = 60
-scaleup = false

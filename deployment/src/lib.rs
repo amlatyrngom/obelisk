@@ -106,7 +106,7 @@ pub(crate) struct Handler {
     caller: Option<i32>,
     unique: Option<bool>,
     ephemeral: Option<i32>,
-    scaleup: Option<bool>,
+    scaleup: Option<f64>,
 }
 
 /// A VISC subsystem.
@@ -228,7 +228,7 @@ fn make_specs(
                             ephemeral: h.ephemeral.unwrap_or(512),
                             persistent: h.persistent.unwrap_or(false),
                             unique: h.unique.unwrap_or(false),
-                            scaleup: h.scaleup.unwrap_or(false),
+                            scaleup: h.scaleup.unwrap_or(0.0),
                         },
                     )
                 })
