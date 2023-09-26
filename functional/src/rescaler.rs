@@ -200,22 +200,11 @@ impl FunctionalRescaler {
             let metric: FunctionalMetric = bincode::deserialize(metric).unwrap();
             // Update overall stats.
             num_calls += 1.0;
-            user_activity += (metric.caller_mem as f64 / 1024.0) * AVG_LAMBDA_OVERHEAD_SECS;
             let duration_secs = metric.duration.as_secs_f64();
+            // Extra user activity induced by Lambda.
+            user_activity += (metric.caller_mem as f64 / 1024.0) * (AVG_LAMBDA_OVERHEAD_SECS);
             avg_latency += duration_secs;
             function_activity += default_mem_gb * duration_secs;
-            // // If overutilized, increase user's overhead by half the duration (heuristic).
-            // // When did I implement this nonsense?
-            // let overused = metric
-            //     .cpu_usage
-            //     .map_or(false, |x| x > UTILIZATION_UPPER_BOUND);
-            // let overused = overused
-            //     || metric
-            //         .mem_usage
-            //         .map_or(false, |x| x > UTILIZATION_UPPER_BOUND);
-            // if overused {
-            //     user_activity += (metric.caller_mem as f64 / 1024.0) * (duration_secs / 2.0);
-            // }
             // Update exploration stats.
             if metric.mem_usage.is_none() {
                 continue;
@@ -259,7 +248,7 @@ impl FunctionalRescaler {
             (1.0 - MOVING_FACTOR) * current_stats.avg_call_rate + MOVING_FACTOR * num_calls;
         current_stats.avg_call_latency =
             (1.0 - MOVING_FACTOR) * current_stats.avg_call_latency + MOVING_FACTOR * avg_latency;
-        // Update memory.
+        // Update exploration.
         for (mem, exploration) in &mut current_stats.exploration_stats {
             if let Some(new_exploration) = explorations.get(&mem) {
                 let avg_cpu_util = new_exploration.avg_cpu_util / new_exploration.num_points;
@@ -284,9 +273,13 @@ impl FunctionalRescaler {
         subsys_state: &SubsystemScalingState,
         handler_scaling_state: &HandlerScalingState,
     ) -> Vec<i32> {
+        // First, compute observed concurrency.
+        let default_mem_gb: f64 = handler_scaling_state.handler_spec.default_mem as f64 / 1024.0;
+        let observed_concurrency: f64 = current_stats.function_activity_gbsec / default_mem_gb;
+        let observed_concurrency: f64 = observed_concurrency.ceil();
+        println!("get_mems_to_explore. observed_concurrency={observed_concurrency}.");
         let mut res = Vec::new();
         let mut min_observed_latency = current_stats.avg_call_latency;
-        let avg_user_mem = current_stats.user_activity_gbsec / AVG_LAMBDA_OVERHEAD_SECS;
         let mut min_instance_cost: Option<f64> = None;
         for (mem, exploration) in &current_stats.exploration_stats {
             // Assume larger instance sizes with missing info will have latency similar to fastest one seen so far.
@@ -300,13 +293,16 @@ impl FunctionalRescaler {
                 min_observed_latency = observed_latency;
             }
             // Compute user cost under the observed latency.
-            let user_activity_gbsec = current_stats.avg_call_rate * observed_latency * avg_user_mem;
+            // Get rid of lambda latency and multiply by call latency. Slightly hacky, but should work.
+            let user_activity_gbsec =
+                (current_stats.user_activity_gbsec / AVG_LAMBDA_OVERHEAD_SECS) * observed_latency;
             let user_cost = user_activity_gbsec * 0.0000166667 * 3600.0;
             // Compute cost.
             let (ecs_price, invoker_price) =
                 self.get_instance_cost(&current_stats, subsys_state, handler_scaling_state, *mem);
             // Total cost
-            let total_cost = user_cost + ecs_price + invoker_price;
+            let total_cost = user_cost + observed_concurrency * ecs_price + invoker_price;
+            println!("Mem {mem}. Total Cost={total_cost}. User Cost={user_cost}. ECS={ecs_price}. UserActivity={user_activity_gbsec}.");
             if min_instance_cost.is_none() {
                 min_instance_cost = Some(total_cost);
             }

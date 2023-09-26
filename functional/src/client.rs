@@ -83,7 +83,7 @@ impl FunctionalClient {
 
     /// Log a metric with a given probability.
     async fn log_metrics(&self, resp: &HandlingResp) {
-        println!("Resp Duration: {:?}.", resp.duration);
+        // println!("Resp Duration: {:?}.", resp.duration);
         let metric = FunctionalMetric {
             duration: resp.duration,
             mem_size_mb: resp.mem_size_mb,
@@ -138,7 +138,7 @@ impl FunctionalClient {
     ) -> Result<(HandlingResp, Vec<u8>), String> {
         let fn_name =
             lambda::LambdaDeployment::handler_function_name(&self.namespace, &self.identifier);
-        println!("FunctionalClient::invoke_lambda: {fn_name}.");
+        // println!("FunctionalClient::invoke_lambda: {fn_name}.");
         let payload = general_purpose::STANDARD_NO_PAD.encode(payload);
         let meta = WrapperMessage::HandlerMessage { meta: meta.into() };
         let arg: (WrapperMessage, String) = (meta, payload);
@@ -195,7 +195,7 @@ impl FunctionalClient {
             return None;
         }
         let url = url.unwrap();
-        println!("FunctionalClient::invoke_direct. Url={url:?}");
+        // println!("FunctionalClient::invoke_direct. Url={url:?}");
         // Double wrap (client -> invoker -> handler).
         let meta = WrapperMessage::HandlerMessage { meta: meta.into() };
         let meta = serde_json::to_string(&meta).unwrap();
