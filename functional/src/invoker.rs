@@ -94,7 +94,7 @@ impl Invoker {
         let lambda_client = aws_sdk_lambda::Client::new(&shared_config);
         // Make direct client.
         let direct_client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_millis(100))
+            .connect_timeout(std::time::Duration::from_millis(10)) // Same region, so should be small.
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .unwrap();
@@ -168,14 +168,21 @@ impl Invoker {
         };
         // Direct invoke if worker found.
         if let Some(worker) = worker {
-            println!("Found Worker: {worker:?}");
+            println!("Found Worker: {}", worker.info.peer_id);
             let url = if let Some(url) = &worker.info.public_url {
                 // Try using public url to facilitate tests from outside AWS.
                 url
             } else {
                 worker.info.private_url.as_ref().unwrap()
             };
+            let start_time = std::time::Instant::now();
             let resp = self.invoke_direct(url, meta, payload).await;
+            let end_time = std::time::Instant::now();
+            let duration = end_time.duration_since(start_time);
+            println!(
+                "Worker {} request duration: {duration:?}",
+                worker.info.peer_id
+            );
             {
                 // Free worker.
                 let mut inner = self.inner.lock().await;

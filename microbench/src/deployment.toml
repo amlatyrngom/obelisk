@@ -6,16 +6,17 @@ dependencies = ["wal", "functional"]
 name = "microfn"
 subsystem = "functional"
 path = "microbench::MicroFunction"
-mem = 512
+mem = 1769
 timeout = 10
-concurrency = 32
+concurrency = 1
+scaleup = 0.0
 
 
 [[handlers]]
 name = "microactor"
 subsystem = "functional"
 path = "microbench::MicroActor"
-mem = 1024
+mem = 1769
 timeout = 10
 persistent = true
 unique = true
@@ -25,5 +26,6 @@ unique = true
 name = "microrunner"
 subsystem = "functional"
 path = "microbench::BenchRunner"
-mem = 512
+mem = 1769
 timeout = 60
+concurrency = 16

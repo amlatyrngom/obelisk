@@ -8,14 +8,14 @@ const MOVING_FACTOR: f64 = 0.25;
 /// Overhead of lambda.
 const AVG_LAMBDA_OVERHEAD_SECS: f64 = 0.010;
 /// Utilization upper bound. Scale up when either cpu or mem above this.
-const UTILIZATION_UPPER_BOUND: f64 = 0.85;
+const UTILIZATION_UPPER_BOUND: f64 = 0.75;
 /// Utilization lower bound. Scale down when both cpu and mem below this.
 const UTILIZATION_LOWER_BOUND: f64 = 0.25;
 /// Number of rescaling rounds to observe before considering utilization stable.
 /// A rescaling round occurs once every ~10 seconds (see constants).
-const UTILIZATION_NUM_ROUNDS: f64 = 10.0;
+const UTILIZATION_NUM_ROUNDS: f64 = 3.0;
 /// Upscaling for safety.
-const UPSCALE_FACTOR: f64 = 0.0;
+const UPSCALE_FACTOR: f64 = 0.05;
 
 /// Exploration stats.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -33,6 +33,7 @@ struct FunctionalScalingInfo {
     avg_call_latency: f64,        // Call latency.
     function_activity_gbsec: f64, // Rate of duration * active_mem.
     user_activity_gbsec: f64,     // Rate of duration * caller_mem.
+    user_activity: f64,
     exploration_stats: BTreeMap<i32, ExplorationStats>,
     scheduled_scale_downs: BTreeMap<i32, chrono::DateTime<chrono::Utc>>,
 }
@@ -76,6 +77,7 @@ impl Rescaler for FunctionalRescaler {
                 avg_call_latency: 0.0,
                 function_activity_gbsec: 0.0,
                 user_activity_gbsec: 0.0,
+                user_activity: 0.0,
                 scheduled_scale_downs: BTreeMap::new(),
                 exploration_stats: handler_scaling_state
                     .handler_scales
@@ -156,7 +158,14 @@ impl Rescaler for FunctionalRescaler {
         let cost_ratio = (lambda_price - invoker_price) / ecs_price;
         let target_scale =
             observed_concurrency / handler_scaling_state.handler_spec.concurrency as f64;
-        let target_scale = target_scale * (UPSCALE_FACTOR + 1.0);
+        let mut target_scale = target_scale;
+        if target_scale > 2.0 {
+            // Hack to prevent oscillations around ideal concurency.
+            // At this point, ECS is so much cheaper than Lambda that extra deployments are ok.
+            // TODO: This smoothing is still imperfect around boundaries.
+            // The best approach is probably to only decrease by +2.
+            target_scale = target_scale * 1.25;
+        }
         let to_deploy: f64 = if cost_ratio.floor() > target_scale.ceil() {
             target_scale.ceil()
         } else {
@@ -191,27 +200,34 @@ impl FunctionalRescaler {
         since: f64,
     ) {
         let mut avg_latency = 0.0;
-        let mut function_activity = 0.0;
+        let mut function_activity_gbsec = 0.0;
+        let mut user_activity_gbsec = 0.0;
         let mut user_activity = 0.0;
         let mut num_calls = 0.0;
         let mut explorations = HashMap::<i32, ExplorationStats>::new();
         let default_mem_gb: f64 = handler_scaling_state.handler_spec.default_mem as f64 / 1024.0;
+        let min_mem_mb = *current_stats.exploration_stats.keys().min().unwrap();
         for metric in &metrics {
             let metric: FunctionalMetric = bincode::deserialize(metric).unwrap();
             // Update overall stats.
             num_calls += 1.0;
             let duration_secs = metric.duration.as_secs_f64();
             // Extra user activity induced by Lambda.
-            user_activity += (metric.caller_mem as f64 / 1024.0) * (AVG_LAMBDA_OVERHEAD_SECS);
+            // NOTE: Keep this user_activity_gbsec. It should ONLY capture the extra overhead.
+            user_activity_gbsec += (metric.caller_mem as f64 / 1024.0) * (AVG_LAMBDA_OVERHEAD_SECS);
             avg_latency += duration_secs;
-            function_activity += default_mem_gb * duration_secs;
-            // Update exploration stats.
-            if metric.mem_usage.is_none() {
-                continue;
-            }
-            if !explorations.contains_key(&metric.mem_size_mb) {
+            function_activity_gbsec += default_mem_gb * duration_secs;
+            user_activity += AVG_LAMBDA_OVERHEAD_SECS + duration_secs; // Used only for exploration.
+                                                                       // Update exploration stats.
+            let mem_size_mb = if metric.mem_usage.is_none() {
+                // Lambda. Use default minimum memory.
+                min_mem_mb
+            } else {
+                metric.mem_size_mb
+            };
+            if !explorations.contains_key(&mem_size_mb) {
                 explorations.insert(
-                    metric.mem_size_mb,
+                    mem_size_mb,
                     ExplorationStats {
                         avg_cpu_util: 0.0,
                         avg_mem_util: 0.0,
@@ -220,9 +236,9 @@ impl FunctionalRescaler {
                     },
                 );
             }
-            let exploration = explorations.get_mut(&metric.mem_size_mb).unwrap();
-            exploration.avg_mem_util += metric.mem_usage.unwrap();
-            exploration.avg_cpu_util += metric.cpu_usage.unwrap();
+            let exploration = explorations.get_mut(&mem_size_mb).unwrap();
+            exploration.avg_mem_util += metric.mem_usage.unwrap_or(0.5);
+            exploration.avg_cpu_util += metric.cpu_usage.unwrap_or(0.5);
             exploration.avg_call_latency += duration_secs;
             exploration.num_points += 1.0;
         }
@@ -230,20 +246,24 @@ impl FunctionalRescaler {
         if num_calls > 0.0 {
             avg_latency /= num_calls;
         }
-        function_activity /= since;
+        function_activity_gbsec /= since;
+        user_activity_gbsec /= since;
         user_activity /= since;
         num_calls /= since;
         println!(
             "Function Activity: {:?}",
-            function_activity / default_mem_gb
+            function_activity_gbsec / default_mem_gb
         );
         // Update activity.
         current_stats.function_activity_gbsec = (1.0 - MOVING_FACTOR)
             * current_stats.function_activity_gbsec
-            + MOVING_FACTOR * function_activity;
+            + MOVING_FACTOR * function_activity_gbsec;
         current_stats.user_activity_gbsec = (1.0 - MOVING_FACTOR)
             * current_stats.user_activity_gbsec
-            + MOVING_FACTOR * user_activity;
+            + MOVING_FACTOR * user_activity_gbsec;
+        current_stats.user_activity =
+            (1.0 - MOVING_FACTOR) * current_stats.user_activity + MOVING_FACTOR * user_activity;
+
         current_stats.avg_call_rate =
             (1.0 - MOVING_FACTOR) * current_stats.avg_call_rate + MOVING_FACTOR * num_calls;
         current_stats.avg_call_latency =
@@ -274,10 +294,17 @@ impl FunctionalRescaler {
         handler_scaling_state: &HandlerScalingState,
     ) -> Vec<i32> {
         // First, compute observed concurrency.
-        let default_mem_gb: f64 = handler_scaling_state.handler_spec.default_mem as f64 / 1024.0;
-        let observed_concurrency: f64 = current_stats.function_activity_gbsec / default_mem_gb;
-        let observed_concurrency: f64 = observed_concurrency.ceil();
-        println!("get_mems_to_explore. observed_concurrency={observed_concurrency}.");
+        let observed_concurrency: f64 = current_stats.user_activity;
+        // Prevent pointless oscillations under low usage (defined by magic constants).
+        // Exploration is only useful under high enough concurrency.
+        let min_mem = *current_stats.exploration_stats.keys().min().unwrap();
+        let (target_scale, stable_usage, invoker_coef) =
+            if handler_scaling_state.handler_spec.unique {
+                (1.0, observed_concurrency > 0.25, 0.0)
+            } else {
+                (observed_concurrency.ceil(), observed_concurrency > 2.0, 1.0)
+            };
+        println!("get_mems_to_explore. observed_concurrency={observed_concurrency}. target_scale={target_scale}.");
         let mut res = Vec::new();
         let mut min_observed_latency = current_stats.avg_call_latency;
         let mut min_instance_cost: Option<f64> = None;
@@ -294,21 +321,26 @@ impl FunctionalRescaler {
             }
             // Compute user cost under the observed latency.
             // Get rid of lambda latency and multiply by call latency. Slightly hacky, but should work.
-            let user_activity_gbsec =
-                (current_stats.user_activity_gbsec / AVG_LAMBDA_OVERHEAD_SECS) * observed_latency;
+            let user_activity_gbsec = (current_stats.user_activity_gbsec
+                / AVG_LAMBDA_OVERHEAD_SECS)
+                * (observed_latency + 0.003);
             let user_cost = user_activity_gbsec * 0.0000166667 * 3600.0;
             // Compute cost.
             let (ecs_price, invoker_price) =
                 self.get_instance_cost(&current_stats, subsys_state, handler_scaling_state, *mem);
             // Total cost
-            let total_cost = user_cost + observed_concurrency * ecs_price + invoker_price;
+            let total_cost = user_cost + target_scale * ecs_price + invoker_coef * invoker_price;
             println!("Mem {mem}. Total Cost={total_cost}. User Cost={user_cost}. ECS={ecs_price}. UserActivity={user_activity_gbsec}.");
             if min_instance_cost.is_none() {
                 min_instance_cost = Some(total_cost);
             }
             let max_allowable_cost =
                 (1.0 + handler_scaling_state.handler_spec.scaleup) * min_instance_cost.unwrap();
-            if total_cost <= max_allowable_cost {
+            if *mem == min_mem {
+                // Always push min mem.
+                res.push(*mem);
+            } else if total_cost <= max_allowable_cost && stable_usage {
+                // Push greater mem if cost within bounds and stable usage.
                 res.push(*mem);
             }
         }
@@ -424,14 +456,13 @@ impl FunctionalRescaler {
 
     fn get_instance_cost(
         &self,
-        current_stats: &FunctionalScalingInfo,
+        _current_stats: &FunctionalScalingInfo,
         subsys_state: &SubsystemScalingState,
         handler_scaling_state: &HandlerScalingState,
         mem: i32,
     ) -> (f64, f64) {
         // Compute ecs cost.
-        let min_mem = *current_stats.exploration_stats.keys().min().unwrap();
-        let cpus = if mem == min_mem { mem / 2 } else { mem / 4 };
+        let cpus = mem / 2;
         let ecs_mem_gb = mem as f64 / 1024.0;
         let ecs_cpus = cpus as f64 / 1024.0;
         let ecs_price = (0.01234398 * ecs_cpus) + (0.00135546 * ecs_mem_gb);
@@ -491,6 +522,12 @@ impl FunctionalRescaler {
         } else {
             println!("Setting service scales");
             rescaling_result.services_scales.insert("invoker".into(), 1);
+            let old_to_deploy = rescaling_result.handler_scales.as_ref().unwrap();
+            let old_to_deploy = old_to_deploy.get(&ideal_mem).cloned().unwrap_or(0) as i32;
+            // To guarantee stability around ceil (only go down by at least two).
+            if to_deploy > 2 && (to_deploy + 1) == old_to_deploy {
+                to_deploy = old_to_deploy
+            }
         };
         // Update scales.
         let handler_scales = rescaling_result.handler_scales.as_mut().unwrap();

@@ -21,6 +21,7 @@ pub struct MicroActorResp {
 pub struct MicroActor {
     plog: Arc<PersistentLog>,
     inner: Arc<RwLock<MicroActorInner>>,
+    metadata: Vec<u8>,
 }
 
 /// Modifiable.
@@ -44,8 +45,17 @@ impl MicroActor {
                 .unwrap(),
         );
         let inner = Arc::new(RwLock::new(MicroActorInner { curr_value: 0 }));
-
-        let actor = MicroActor { plog, inner };
+        let metadata = {
+            let is_lambda = instance_info.private_url.is_none();
+            let memory = instance_info.mem;
+            let metadata = (memory, is_lambda);
+            serde_json::to_vec(&metadata).unwrap()
+        };
+        let actor = MicroActor {
+            plog,
+            inner,
+            metadata,
+        };
         // Recover first.
         actor.recover().await;
         actor
@@ -91,6 +101,7 @@ impl MicroActor {
     /// Retrieve.
     async fn handle_retrieve(&self) -> MicroActorResp {
         // Just read the value.
+        // For test. TODO: Remove
         let val = {
             let inner = self.inner.read().await;
             inner.curr_value
@@ -105,11 +116,17 @@ impl ServerlessHandler for MicroActor {
     async fn handle(&self, msg: String, _payload: Vec<u8>) -> (String, Vec<u8>) {
         let req: MicroActorReq = serde_json::from_str(&msg).unwrap();
         let resp: MicroActorResp = match req {
-            MicroActorReq::Increment(v) => self.handle_increment(v).await,
+            MicroActorReq::Increment(v) => {
+                if v == 0 {
+                    self.handle_retrieve().await
+                } else {
+                    self.handle_increment(v).await
+                }
+            }
             MicroActorReq::Retrieve => self.handle_retrieve().await,
         };
         let resp: String = serde_json::to_string(&resp).unwrap();
-        (resp, vec![])
+        (resp, self.metadata.clone())
     }
 
     /// Checkpoint. Just truncate the log up to and excluding the last entry.

@@ -23,6 +23,8 @@ impl BenchRunner {
             Arc::new(FunctionalClient::new("microbench", "microfn", None, Some(512)).await);
         let actor_client =
             Arc::new(FunctionalClient::new("microbench", "microactor", Some(0), Some(512)).await);
+        // Hack to prevent benchmark timeouts.
+        actor_client.set_indirect_lambda_retry(false);
         BenchRunner {
             fn_client,
             actor_client,
@@ -54,14 +56,14 @@ impl ServerlessHandler for BenchRunner {
 impl BenchRunner {
     /// Do stateless microbench.
     async fn do_invoke_bench(&self, count: u64) -> (String, Vec<u8>) {
-        let mut durations: Vec<std::time::Duration> = Vec::new();
+        let mut durations = Vec::new();
         for _ in 0..count {
             let start_time = std::time::Instant::now();
             let resp = self.fn_client.invoke("foo", &[]).await;
-            if let Ok(_resp) = resp {
+            if let Ok((_, metadata)) = resp {
                 let end_time = std::time::Instant::now();
                 let duration = end_time.duration_since(start_time);
-                durations.push(duration);
+                durations.push((duration, metadata));
             }
         }
         (serde_json::to_string(&durations).unwrap(), vec![])
@@ -69,36 +71,37 @@ impl BenchRunner {
 
     /// Do actor microbench.
     async fn do_messaging_bench(&self, count: u64) -> (String, Vec<u8>) {
-        let mut retrieve_times = Vec::new();
-        let mut increment_times = Vec::new();
-        let mut vals: Vec<i64> = Vec::new();
+        // let mut retrieve_times = Vec::new();
+        let mut durations = Vec::new();
+        // let mut vals: Vec<i64> = Vec::new();
         for _ in 0..count {
-            // Retrieve.
-            let req = MicroActorReq::Retrieve;
-            let req = serde_json::to_string(&req).unwrap();
-            let start_time = std::time::Instant::now();
-            let resp = self.actor_client.invoke(&req, &[]).await;
-            let end_time = std::time::Instant::now();
-            let duration = end_time.duration_since(start_time);
-            if let Ok((resp, _)) = resp {
-                let resp: MicroActorResp = serde_json::from_str(&resp).unwrap();
-                vals.push(resp.val);
-                retrieve_times.push(duration);
-            }
+            // // Retrieve.
+            // let req = MicroActorReq::Retrieve;
+            // let req = serde_json::to_string(&req).unwrap();
+            // let start_time = std::time::Instant::now();
+            // let resp = self.actor_client.invoke(&req, &[]).await;
+            // let end_time = std::time::Instant::now();
+            // let duration = end_time.duration_since(start_time);
+            // if let Ok((resp, _)) = resp {
+            //     let resp: MicroActorResp = serde_json::from_str(&resp).unwrap();
+            //     vals.push(resp.val);
+            //     retrieve_times.push(duration);
+            // }
             // Increment
-            let req = MicroActorReq::Increment(10);
+            let req = MicroActorReq::Increment(1);
             let req = serde_json::to_string(&req).unwrap();
             let start_time = std::time::Instant::now();
+            // TODO: Should probably retry until success.
             let resp = self.actor_client.invoke(&req, &[]).await;
             let end_time = std::time::Instant::now();
             let duration = end_time.duration_since(start_time);
-            if let Ok((resp, _)) = resp {
-                let resp: MicroActorResp = serde_json::from_str(&resp).unwrap();
-                vals.push(resp.val);
-                increment_times.push(duration);
+            if let Ok((_, metadata)) = resp {
+                // let resp: MicroActorResp = serde_json::from_str(&resp).unwrap();
+                // vals.push(resp.val);
+                durations.push((duration, metadata));
             }
         }
-        let resp = (retrieve_times, increment_times, vals);
-        (serde_json::to_string(&resp).unwrap(), vec![])
+        // let resp = (retrieve_times, increment_times, vals);
+        (serde_json::to_string(&durations).unwrap(), vec![])
     }
 }

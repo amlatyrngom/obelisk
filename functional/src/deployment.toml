@@ -2,8 +2,8 @@ namespace = "functional"
 
 [subsystem]
 service_path = "functional::invoker::Invoker"
-service_mem = 256
-service_cpus = 256
+service_mem = 2048
+service_cpus = 1024
 service_grace = 60
 rescaler_path = "functional::rescaler::FunctionalRescaler"
 rescaler_mem = 512

@@ -347,9 +347,9 @@ impl ContainerDeployment {
             return vec![mem];
         }
         let mut res = Vec::<i32>::new();
-        if mem <= 64 * 1024 {
-            res.push(64 * 1024);
-        }
+        // if mem <= 64 * 1024 {
+        //     res.push(64 * 1024);
+        // }
         if mem <= 32 * 1024 {
             res.push(32 * 1024);
         }
@@ -411,13 +411,8 @@ impl ContainerDeployment {
         let mut mems = Vec::new();
         let mut cpus = Vec::new();
         for mem in avail_mems {
-            if mem <= handler_spec.default_mem * 2 {
-                mems.push(mem);
-                cpus.push(mem / 2);
-            } else {
-                mems.push(mem);
-                cpus.push(mem / 4);
-            }
+            mems.push(mem);
+            cpus.push(mem / 2);
         }
 
         for (mem, cpu) in mems.into_iter().zip(cpus.into_iter()) {

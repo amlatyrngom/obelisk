@@ -8,7 +8,7 @@ const REPLICAS_VCPUS: f64 = 0.25;
 /// Replics mem.
 const REPLICAS_MEM_GB: f64 = 1.0;
 /// Time saved with replication.
-const REPLICATION_GAIN_SECS: f64 = 0.010;
+const REPLICATION_GAIN_SECS: f64 = 0.007;
 
 /// Info to maintain for scaling functions.
 #[derive(Serialize, Deserialize, Debug)]
@@ -77,19 +77,19 @@ impl WalRescaler {
         metrics: Vec<Vec<u8>>,
         since: f64,
     ) {
-        let mut user_activity = 0.0;
+        let mut user_activity_gbsec = 0.0;
         for metric in &metrics {
             let metric: WalMetric = bincode::deserialize(metric).unwrap();
             for mem in metric.user_mems {
-                user_activity += (mem as f64 / 1024.0) * REPLICATION_GAIN_SECS;
+                user_activity_gbsec += (mem as f64 / 1024.0) * REPLICATION_GAIN_SECS;
             }
         }
         // Divide by duration.
-        user_activity /= since;
+        user_activity_gbsec /= since;
         // Update activity.
         current_stats.user_activity_gbsec = (1.0 - MOVING_FACTOR)
             * current_stats.user_activity_gbsec
-            + MOVING_FACTOR * user_activity;
+            + MOVING_FACTOR * user_activity_gbsec;
     }
 
     fn summarize_stats(&self, current_stats: &WalScalingInfo) -> (f64, f64) {

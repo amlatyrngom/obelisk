@@ -4,7 +4,7 @@ use common::deployment::lambda;
 use common::scaling_state::ScalingStateManager;
 use common::wrapper::WrapperMessage;
 use common::{HandlingResp, MetricsManager};
-use std::sync::{Arc, Mutex};
+use std::sync::{atomic, Arc, Mutex};
 
 const NUM_INDIRECT_RETRIES: u64 = 50;
 const INDIRECT_WAIT_TIME_SECS: f64 = 0.02;
@@ -22,6 +22,7 @@ pub struct FunctionalClient {
     scaling_manager: Arc<ScalingStateManager>,
     caller_mem: i32,
     last_force_refresh: Arc<Mutex<std::time::Instant>>,
+    with_indirect_lambda_retry: Arc<atomic::AtomicBool>,
 }
 
 impl FunctionalClient {
@@ -32,9 +33,12 @@ impl FunctionalClient {
         id: Option<usize>,
         caller_mem: Option<i32>,
     ) -> Self {
+        // Connect timeout should be as realistically short as possibly.
+        // TODO: Find ways set to make it shorter, possibly using some heuristics.
+        let connect_timeout_ms = if Self::is_in_aws() { 10 } else { 100 };
         let direct_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10)) // TODO: set to correct value.
-            .connect_timeout(std::time::Duration::from_millis(100)) // Short on purpose.
+            .connect_timeout(std::time::Duration::from_millis(connect_timeout_ms)) // Short on purpose. May break when connecting to a distant region.
             .build()
             .unwrap();
         let shared_config = aws_config::load_from_env().await;
@@ -78,7 +82,18 @@ impl FunctionalClient {
             scaling_manager: Arc::new(scaling_manager),
             caller_mem: caller_mem.unwrap_or(512),
             last_force_refresh: Arc::new(Mutex::new(std::time::Instant::now())),
+            with_indirect_lambda_retry: Arc::new(atomic::AtomicBool::new(true)),
         }
+    }
+
+    // Heuristic to know if in AWS. Should allow shorter connection timeouts.
+    fn is_in_aws() -> bool {
+        std::env::var("OBK_EXECUTION_MODE").is_ok()
+    }
+
+    pub fn set_indirect_lambda_retry(&self, v: bool) {
+        self.with_indirect_lambda_retry
+            .store(v, atomic::Ordering::Release);
     }
 
     /// Log a metric with a given probability.
@@ -382,7 +397,7 @@ impl FunctionalClient {
             Ok(resp) => (Some(resp), true),
             Err(e) => {
                 // If no container running, So try direct lambda invokation.
-                if e.contains("avail") {
+                if e.to_lowercase().contains("unavailable") {
                     let resp = self.invoke_lambda_handler(meta, payload).await;
                     match resp {
                         Ok(resp) => (Some(resp), false),
@@ -410,7 +425,8 @@ impl FunctionalClient {
                         }
                     }
                 } else {
-                    (None, false)
+                    // Failed http request.
+                    (None, true)
                 }
             }
         };
@@ -418,6 +434,14 @@ impl FunctionalClient {
         let (resp, payload, was_direct) = if let Some((resp, payload)) = resp {
             (resp, payload, true)
         } else {
+            let try_indirect = self
+                .with_indirect_lambda_retry
+                .load(atomic::Ordering::Acquire);
+            if !try_indirect && !was_http {
+                return Err(
+                    "Not doing indirect lambda retry! Client should manually retry!".into(),
+                );
+            }
             let (resp, payload) = self.invoke_indirect(meta, payload).await?;
             (resp, payload, false)
         };
