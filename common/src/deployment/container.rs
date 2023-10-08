@@ -371,6 +371,8 @@ impl ContainerDeployment {
         if mem <= 512 {
             res.push(512);
         }
+        // Only keep up to 4x
+        let res = res.into_iter().filter(|m| *m <= 4 * mem).collect();
         res
     }
 
@@ -540,6 +542,7 @@ impl ContainerDeployment {
         sg_id: &str,
         mem: i32,
     ) {
+        let provider = if spec.spot { "FARGATE_SPOT" } else { "FARGATE" };
         let task_name =
             Self::handler_task_name(&spec.namespace, identifier, &Self::mem_mb_to_str(mem));
         let task_def_name =
@@ -568,7 +571,7 @@ impl ContainerDeployment {
             )
             .capacity_provider_strategy(
                 aws_sdk_ecs::types::CapacityProviderStrategyItem::builder()
-                    .capacity_provider("FARGATE_SPOT")
+                    .capacity_provider(provider)
                     .weight(1)
                     .base(0)
                     .build(),
@@ -596,6 +599,13 @@ impl ContainerDeployment {
                 .network_configuration(
                     aws_sdk_ecs::types::NetworkConfiguration::builder()
                         .awsvpc_configuration(vpc_config.clone())
+                        .build(),
+                )
+                .capacity_provider_strategy(
+                    aws_sdk_ecs::types::CapacityProviderStrategyItem::builder()
+                        .capacity_provider(provider)
+                        .weight(1)
+                        .base(0)
                         .build(),
                 )
                 .propagate_tags(aws_sdk_ecs::types::PropagateTags::Service)

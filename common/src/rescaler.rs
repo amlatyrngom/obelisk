@@ -101,7 +101,7 @@ impl ScalingStateRescaler {
         };
         // Get scaling state.
         let mut scaling_state = state_manager.retrieve_scaling_state().await?;
-        let old_id = scaling_state.state_id.clone();
+        let mut old_id = scaling_state.state_id.clone();
         // If uninitiliazed, initialize.
         if !scaling_state.initialized {
             if let Some(handler_state) = &scaling_state.handler_state {
@@ -160,7 +160,8 @@ impl ScalingStateRescaler {
                     if let Some(handler_state) = &mut scaling_state.handler_state {
                         handler_state.peers = new_scaling_state.handler_state.unwrap().peers;
                     }
-                    scaling_state.state_id = new_scaling_state.state_id;
+                    old_id = new_scaling_state.state_id.clone();
+                    // scaling_state.state_id = new_scaling_state.state_id;
                     continue;
                 } else {
                     // Rescale conflict: should almost never happed thanks to lease.

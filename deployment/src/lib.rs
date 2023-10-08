@@ -107,6 +107,7 @@ pub(crate) struct Handler {
     unique: Option<bool>,
     ephemeral: Option<i32>,
     scaleup: Option<f64>,
+    spot: Option<bool>,
 }
 
 /// A VISC subsystem.
@@ -229,6 +230,7 @@ fn make_specs(
                             persistent: h.persistent.unwrap_or(false),
                             unique: h.unique.unwrap_or(false),
                             scaleup: h.scaleup.unwrap_or(0.0),
+                            spot: h.spot.unwrap_or(true),
                         },
                     )
                 })

@@ -35,7 +35,7 @@ impl FunctionalClient {
     ) -> Self {
         // Connect timeout should be as realistically short as possibly.
         // TODO: Find ways set to make it shorter, possibly using some heuristics.
-        let connect_timeout_ms = if Self::is_in_aws() { 10 } else { 100 };
+        let connect_timeout_ms: u64 = if Self::is_in_aws() { 10 } else { 100 };
         let direct_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10)) // TODO: set to correct value.
             .connect_timeout(std::time::Duration::from_millis(connect_timeout_ms)) // Short on purpose. May break when connecting to a distant region.
@@ -210,7 +210,9 @@ impl FunctionalClient {
             return None;
         }
         let url = url.unwrap();
-        // println!("FunctionalClient::invoke_direct. Url={url:?}");
+        if Self::is_in_aws() {
+            println!("FunctionalClient::invoke_direct. Url={url:?}");
+        }
         // Double wrap (client -> invoker -> handler).
         let meta = WrapperMessage::HandlerMessage { meta: meta.into() };
         let meta = serde_json::to_string(&meta).unwrap();

@@ -296,13 +296,16 @@ impl FunctionalRescaler {
         // First, compute observed concurrency.
         let observed_concurrency: f64 = current_stats.user_activity;
         // Prevent pointless oscillations under low usage (defined by magic constants).
-        // Exploration is only useful under high enough concurrency.
         let min_mem = *current_stats.exploration_stats.keys().min().unwrap();
         let (target_scale, stable_usage, invoker_coef) =
             if handler_scaling_state.handler_spec.unique {
                 (1.0, observed_concurrency > 0.25, 0.0)
             } else {
-                (observed_concurrency.ceil(), observed_concurrency > 2.0, 1.0)
+                (
+                    observed_concurrency.ceil(),
+                    observed_concurrency > 0.25,
+                    1.0,
+                )
             };
         println!("get_mems_to_explore. observed_concurrency={observed_concurrency}. target_scale={target_scale}.");
         let mut res = Vec::new();
@@ -465,7 +468,15 @@ impl FunctionalRescaler {
         let cpus = mem / 2;
         let ecs_mem_gb = mem as f64 / 1024.0;
         let ecs_cpus = cpus as f64 / 1024.0;
-        let ecs_price = (0.01234398 * ecs_cpus) + (0.00135546 * ecs_mem_gb);
+        let ecs_price = if handler_scaling_state.handler_spec.spot {
+            (0.01234398 * ecs_cpus) + (0.00135546 * ecs_mem_gb)
+        } else {
+            (0.04048 * ecs_cpus) + (0.004445 * ecs_mem_gb)
+        };
+        println!(
+            "Instance price {mem}: {ecs_price}. Spot={}!",
+            handler_scaling_state.handler_spec.spot
+        );
         // Invoker is only needed for non-unique functions (non-actors).
         let invoker_price = if handler_scaling_state.handler_spec.unique {
             0.0
@@ -515,6 +526,11 @@ impl FunctionalRescaler {
             rescaling_result.services_scales.insert("invoker".into(), 0);
             return;
         }
+        // Hack to disallow scaling.
+        if handler_scaling_state.handler_spec.scaleup < -(1e-4) {
+            return;
+        }
+
         // Special case for actors.
         if handler_scaling_state.handler_spec.unique {
             rescaling_result.services_scales.insert("invoker".into(), 0);
@@ -526,7 +542,7 @@ impl FunctionalRescaler {
             let old_to_deploy = old_to_deploy.get(&ideal_mem).cloned().unwrap_or(0) as i32;
             // To guarantee stability around ceil (only go down by at least two).
             if to_deploy > 2 && (to_deploy + 1) == old_to_deploy {
-                to_deploy = old_to_deploy
+                to_deploy = old_to_deploy;
             }
         };
         // Update scales.
@@ -566,6 +582,7 @@ mod tests {
                 persistent: false,
                 unique: false,
                 scaleup,
+                spot: true,
             },
             handler_scales: mems.into_iter().map(|m| (m, 0)).collect(),
         }
