@@ -83,15 +83,17 @@ pub async fn get_public_url() -> Result<String, String> {
 pub async fn clean_die(msg: &str) -> ! {
     eprintln!("obelisk clean die: {msg}");
     loop {
-        let cmd = std::process::Command::new("kill")
+        let cmd = std::process::Command::new("/bin/kill")
             .arg("-s")
             .arg("TERM")
             .arg(std::process::id().to_string())
             .output();
         if cmd.is_ok() {
+            println!("Sent termination signal.");
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             std::process::exit(1);
         } else {
+            println!("termination err: {cmd:?}");
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
     }

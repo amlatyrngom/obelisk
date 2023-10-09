@@ -56,7 +56,7 @@ RUN if test -f scripts/setup.sh; then bash scripts/setup.sh; fi
 COPY script[s] scripts
 RUN mkdir -p scripts
 # Create entrypoint file if not exists.
-RUN [ -f scripts/entrypoint.sh ] || echo "./obelisk_main" >> scripts/entrypoint.sh
+RUN [ -f scripts/entrypoint.sh ] || echo "exec ./obelisk_main" >> scripts/entrypoint.sh
 # Bring over main file.
 COPY --from=builder /app/target/release/obelisk_main .
 # Entrypoint.
