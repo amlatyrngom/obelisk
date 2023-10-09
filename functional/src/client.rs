@@ -132,7 +132,13 @@ impl FunctionalClient {
         let scaling_state = self.scaling_manager.current_scaling_state().await;
         // println!("FunctionalClient::get_invoker_url: {scaling_state:?}");
         if let Some(peers) = scaling_state.handler_state.as_ref().map(|s| &s.peers) {
-            let mut instances = peers.values().collect::<Vec<_>>();
+            let instances = peers.values().collect::<Vec<_>>();
+            let now = chrono::Utc::now();
+            let max_since = chrono::Duration::seconds(20);
+            let mut instances = instances
+                .into_iter()
+                .filter(|i| now.signed_duration_since(i.active_time) < max_since)
+                .collect::<Vec<_>>();
             instances.sort_by_key(|k| k.join_time);
             let instance = instances.last();
             if let Some(instance) = instance {

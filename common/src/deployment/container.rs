@@ -625,7 +625,7 @@ impl ContainerDeployment {
     ) -> Result<(), String> {
         let task_name =
             Self::handler_task_name(&spec.namespace, identifier, &Self::mem_mb_to_str(mem));
-        let _resp = client
+        let resp = client
             .update_service()
             .desired_count(count)
             .cluster(Self::cluster_name(&spec.namespace))
@@ -633,7 +633,13 @@ impl ContainerDeployment {
             .propagate_tags(aws_sdk_ecs::types::PropagateTags::Service)
             .send()
             .await
-            .map_err(|e| format!("{e:?}"))?;
+            .map_err(|e| format!("{e:?}"));
+        if count == 0 && identifier.starts_with("sbactor") {
+            println!("Reset count to 0");
+            if resp.is_err() {
+                println!("Resp error: {resp:?}");
+            }
+        }
         Ok(())
     }
 }
