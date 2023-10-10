@@ -299,7 +299,7 @@ impl FunctionalRescaler {
         let min_mem = *current_stats.exploration_stats.keys().min().unwrap();
         let (target_scale, stable_usage, invoker_coef) =
             if handler_scaling_state.handler_spec.unique {
-                (1.0, observed_concurrency > 0.25, 0.0)
+                (1.0, true, 0.0)
             } else {
                 (
                     observed_concurrency.ceil(),
@@ -309,19 +309,26 @@ impl FunctionalRescaler {
             };
         println!("get_mems_to_explore. observed_concurrency={observed_concurrency}. target_scale={target_scale}.");
         let mut res = Vec::new();
-        let mut min_observed_latency = current_stats.avg_call_latency;
+        let mut prev_observed_latency = current_stats
+            .exploration_stats
+            .get(&min_mem)
+            .unwrap()
+            .avg_call_latency;
         let mut min_instance_cost: Option<f64> = None;
         for (mem, exploration) in &current_stats.exploration_stats {
             // Assume larger instance sizes with missing info will have latency similar to fastest one seen so far.
             // This assumes iteration is in key order.
             let observed_latency = if exploration.num_points >= UTILIZATION_NUM_ROUNDS {
-                exploration.avg_call_latency
+                // Never let avg latency go down.
+                if exploration.avg_call_latency < prev_observed_latency {
+                    prev_observed_latency = exploration.avg_call_latency;
+                    exploration.avg_call_latency
+                } else {
+                    prev_observed_latency
+                }
             } else {
-                min_observed_latency
+                prev_observed_latency
             };
-            if min_observed_latency > observed_latency {
-                min_observed_latency = observed_latency;
-            }
             // Compute user cost under the observed latency.
             // Get rid of lambda latency and multiply by call latency. Slightly hacky, but should work.
             let user_activity_gbsec = (current_stats.user_activity_gbsec
@@ -333,7 +340,7 @@ impl FunctionalRescaler {
                 self.get_instance_cost(&current_stats, subsys_state, handler_scaling_state, *mem);
             // Total cost
             let total_cost = user_cost + target_scale * ecs_price + invoker_coef * invoker_price;
-            println!("Mem {mem}. Total Cost={total_cost}. User Cost={user_cost}. ECS={ecs_price}. UserActivity={user_activity_gbsec}.");
+            println!("Mem {mem}. Total Cost={total_cost}. User Cost={user_cost}. ECS={ecs_price}. UserActivity={user_activity_gbsec}. OL={observed_latency}.");
             if min_instance_cost.is_none() {
                 min_instance_cost = Some(total_cost);
             }
