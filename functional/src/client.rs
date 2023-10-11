@@ -26,6 +26,16 @@ pub struct FunctionalClient {
 }
 
 impl FunctionalClient {
+    /// Simpler construction for function client.
+    pub async fn new_fn(namespace: &str, name: &str) -> Self {
+        Self::new(namespace, name, None, None).await
+    }
+
+    /// Simpler construction for actor client.
+    pub async fn new_ator(namespace: &str, name: &str, id: usize) -> Self {
+        Self::new(namespace, name, Some(id), None).await
+    }
+
     /// Create client.
     pub async fn new(
         namespace: &str,
@@ -473,6 +483,8 @@ impl FunctionalClient {
 
 #[cfg(test)]
 mod tests {
+    use crate::FunctionalClient;
+
     #[tokio::test]
     async fn simple_fn_invoke_test() {
         run_simple_invoke_test("echofn", None).await;

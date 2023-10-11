@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use common::{HandlerKit, ScalingState, ServerlessHandler};
 
 pub struct MicroFunction {
@@ -30,4 +31,21 @@ impl ServerlessHandler for MicroFunction {
             println!("Echo Handler Terminating.");
         }
     }
+}
+
+pub struct EchoFn {}
+
+impl EchoFn {
+    pub async fn new(_kit: HandlerKit) -> Self {
+        EchoFn {}
+    }
+}
+
+#[async_trait]
+impl ServerlessHandler for EchoFn {
+    async fn handle(&self, meta: String, payload: Vec<u8>) -> (String, Vec<u8>) {
+        (meta, payload)
+    }
+
+    async fn checkpoint(&self, _scaling_state: &ScalingState, _terminating: bool) {}
 }

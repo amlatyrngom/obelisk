@@ -96,7 +96,7 @@ pub(crate) struct Service {
 /// VISC handler.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub(crate) struct Handler {
-    subsystem: String,
+    subsystem: Option<String>,
     name: String,
     path: String,
     mem: i32,
@@ -220,7 +220,7 @@ fn make_specs(
                     (
                         h.name.clone(),
                         HandlerSpec {
-                            subsystem: h.subsystem.clone(),
+                            subsystem: h.subsystem.clone().unwrap_or("functional".into()),
                             namespace: deployment.namespace.clone(),
                             name: h.name.clone(),
                             timeout: h.timeout,

@@ -1,9 +1,12 @@
 pub mod micro_actor;
 pub use micro_actor::MicroActor;
 pub mod micro_function;
+pub use micro_function::EchoFn;
 pub use micro_function::MicroFunction;
 pub mod runner;
 pub use runner::BenchRunner;
+pub mod sim_actor;
+pub use sim_actor::SimActor;
 
 pub async fn prepare_deployment() -> Vec<String> {
     // Return specs.
@@ -23,6 +26,7 @@ mod tests {
 
     struct RequestSender {
         is_fn: bool,
+        is_sim: bool,
         curr_avg_latency: f64,
         desired_requests_per_second: f64,
         fc: Arc<FunctionalClient>,
@@ -46,6 +50,7 @@ mod tests {
                 let requests_per_thread = requests_per_thread as u64;
                 let fc = self.fc.clone();
                 let is_fn = self.is_fn;
+                let is_sim: bool = self.is_sim;
                 let t = tokio::spawn(async move {
                     let start_time = std::time::Instant::now();
                     let mut responses = Vec::new();
@@ -62,6 +67,8 @@ mod tests {
                         // Now send requests.
                         let req = if is_fn {
                             RunnerReq::Function(call_count)
+                        } else if is_sim {
+                            RunnerReq::Sim(call_count)
                         } else {
                             RunnerReq::Actor(call_count)
                         };
@@ -236,6 +243,27 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    async fn simple_sim_cloud() {
+        {
+            // Make sure stuff is initialized.
+            let _fn_client =
+                Arc::new(FunctionalClient::new("microbench", "microfn", None, Some(512)).await);
+            let _actor_client = Arc::new(
+                FunctionalClient::new("microbench", "microactor", Some(0), Some(512)).await,
+            );
+            let _sim_client =
+                Arc::new(FunctionalClient::new("microbench", "simactor", Some(0), Some(512)).await);
+        }
+        let fc =
+            Arc::new(FunctionalClient::new("microbench", "microrunner", None, Some(512)).await);
+        let req = RunnerReq::Sim(1);
+        let meta = serde_json::to_string(&req).unwrap();
+        let (resp, _) = fc.invoke(&meta, &[]).await.unwrap();
+        let resp: Vec<(Duration, Vec<u8>)> = serde_json::from_str(&resp).unwrap();
+        println!("Response: {resp:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
     async fn full_fn_bench_cloud() {
         let fc = Arc::new(
             FunctionalClient::new("microbench", "microrunner", None, Some(USER_MEM)).await,
@@ -246,6 +274,7 @@ mod tests {
         let high_req_per_secs = 400.0;
         let mut request_sender = RequestSender {
             is_fn: true,
+            is_sim: false,
             curr_avg_latency: 0.025,
             desired_requests_per_second: 0.0,
             fc: fc.clone(),
@@ -295,6 +324,57 @@ mod tests {
         let high_req_per_secs = 400.0;
         let mut request_sender = RequestSender {
             is_fn: false,
+            is_sim: false,
+            curr_avg_latency: 0.025,
+            desired_requests_per_second: 0.0,
+            fc: fc.clone(),
+        };
+        // Low
+        request_sender.desired_requests_per_second = low_req_per_secs;
+        run_bench(
+            &mut request_sender,
+            "pre_low",
+            Duration::from_secs_f64(60.0 * duration_mins),
+        )
+        .await;
+        // Medium
+        request_sender.desired_requests_per_second = medium_req_per_secs;
+        run_bench(
+            &mut request_sender,
+            "pre_medium",
+            Duration::from_secs_f64(60.0 * duration_mins),
+        )
+        .await;
+        // High
+        request_sender.desired_requests_per_second = high_req_per_secs;
+        run_bench(
+            &mut request_sender,
+            "pre_high",
+            Duration::from_secs_f64(60.0 * duration_mins),
+        )
+        .await;
+        // Low again.
+        request_sender.desired_requests_per_second = low_req_per_secs;
+        run_bench(
+            &mut request_sender,
+            "post_low",
+            Duration::from_secs_f64(60.0 * duration_mins),
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    async fn full_sim_bench_cloud() {
+        let fc = Arc::new(
+            FunctionalClient::new("microbench", "microrunner", None, Some(USER_MEM)).await,
+        );
+        let duration_mins = 15.0;
+        let low_req_per_secs = 1.0;
+        let medium_req_per_secs = 20.0;
+        let high_req_per_secs = 200.0;
+        let mut request_sender = RequestSender {
+            is_fn: false,
+            is_sim: true,
             curr_avg_latency: 0.025,
             desired_requests_per_second: 0.0,
             fc: fc.clone(),
