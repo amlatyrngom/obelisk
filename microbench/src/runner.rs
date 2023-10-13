@@ -30,6 +30,7 @@ impl BenchRunner {
 
         // Hack to prevent benchmark timeouts.
         actor_client.set_indirect_lambda_retry(false);
+        sim_client.set_indirect_lambda_retry(false);
         BenchRunner {
             fn_client,
             actor_client,

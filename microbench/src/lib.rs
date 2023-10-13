@@ -325,7 +325,7 @@ mod tests {
         let mut request_sender = RequestSender {
             is_fn: false,
             is_sim: false,
-            curr_avg_latency: 0.025,
+            curr_avg_latency: 0.020,
             desired_requests_per_second: 0.0,
             fc: fc.clone(),
         };
@@ -342,7 +342,7 @@ mod tests {
         run_bench(
             &mut request_sender,
             "pre_medium",
-            Duration::from_secs_f64(60.0 * duration_mins),
+            Duration::from_secs_f64(60.0 * duration_mins / 3.0),
         )
         .await;
         // High
@@ -379,20 +379,20 @@ mod tests {
             desired_requests_per_second: 0.0,
             fc: fc.clone(),
         };
-        // Low
-        request_sender.desired_requests_per_second = low_req_per_secs;
-        run_bench(
-            &mut request_sender,
-            "pre_low",
-            Duration::from_secs_f64(60.0 * duration_mins),
-        )
-        .await;
+        // // Low
+        // request_sender.desired_requests_per_second = low_req_per_secs;
+        // run_bench(
+        //     &mut request_sender,
+        //     "pre_low",
+        //     Duration::from_secs_f64(60.0 * duration_mins),
+        // )
+        // .await;
         // Medium
         request_sender.desired_requests_per_second = medium_req_per_secs;
         run_bench(
             &mut request_sender,
             "pre_medium",
-            Duration::from_secs_f64(60.0 * duration_mins),
+            Duration::from_secs_f64(60.0 * duration_mins / 3.0),
         )
         .await;
         // High
@@ -403,13 +403,13 @@ mod tests {
             Duration::from_secs_f64(60.0 * duration_mins),
         )
         .await;
-        // Low again.
-        request_sender.desired_requests_per_second = low_req_per_secs;
-        run_bench(
-            &mut request_sender,
-            "post_low",
-            Duration::from_secs_f64(60.0 * duration_mins),
-        )
-        .await;
+        // // Low again.
+        // request_sender.desired_requests_per_second = low_req_per_secs;
+        // run_bench(
+        //     &mut request_sender,
+        //     "post_low",
+        //     Duration::from_secs_f64(60.0 * duration_mins),
+        // )
+        // .await;
     }
 }
