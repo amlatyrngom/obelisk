@@ -21,18 +21,15 @@ const UPSCALE_FACTOR: f64 = 0.0;
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct ExplorationStats {
     num_points: f64,
-    avg_mem_util: f64,
-    avg_cpu_util: f64,
-    avg_call_latency: f64,
+    avg_latency: f64,
 }
 
 /// Info to maintain for scaling functions.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct FunctionalScalingInfo {
-    avg_call_rate: f64,           // Number of calls per second.
-    avg_call_latency: f64,        // Call latency.
-    function_activity_gbsec: f64, // Rate of duration * active_mem.
-    user_activity_gbsec: f64,     // Rate of duration * caller_mem.
+    invocation_rate: f64,
+    caller_mem_avg: f64,
+    lambda_stats: ExplorationStats,
     exploration_stats: BTreeMap<i32, ExplorationStats>,
     scheduled_scale_downs: BTreeMap<i32, chrono::DateTime<chrono::Utc>>,
 }
@@ -72,10 +69,12 @@ impl Rescaler for FunctionalRescaler {
         // Read current stats or make new ones.
         let mut current_stats = handler_scaling_state.scaling_info.as_ref().map_or(
             FunctionalScalingInfo {
-                avg_call_rate: 0.0,
-                avg_call_latency: 0.0,
-                function_activity_gbsec: 0.0,
-                user_activity_gbsec: 0.0,
+                invocation_rate: 0.0,
+                caller_mem_avg: 0.0,
+                lambda_stats: ExplorationStats {
+                    num_points: 0.0,
+                    avg_latency: 0.0,
+                },
                 scheduled_scale_downs: BTreeMap::new(),
                 exploration_stats: handler_scaling_state
                     .handler_scales
@@ -84,10 +83,8 @@ impl Rescaler for FunctionalRescaler {
                         (
                             *m,
                             ExplorationStats {
-                                avg_mem_util: 0.0,
-                                avg_cpu_util: 0.0,
                                 num_points: 0.0,
-                                avg_call_latency: 0.0,
+                                avg_latency: 0.0,
                             },
                         )
                     })
@@ -190,90 +187,63 @@ impl FunctionalRescaler {
         metrics: Vec<Vec<u8>>,
         since: f64,
     ) {
-        let mut avg_latency = 0.0;
-        let mut function_activity = 0.0;
-        let mut user_activity = 0.0;
-        let mut num_calls = 0.0;
-        let mut explorations = HashMap::<i32, ExplorationStats>::new();
-        let default_mem_gb: f64 = handler_scaling_state.handler_spec.default_mem as f64 / 1024.0;
+        let mut num_invocations = 0.0;
+        let mut lambda_exploration = ExplorationStats {
+            num_points: 0.0,
+            avg_latency: 0.0,
+        };
+        let mut ecs_explorations = HashMap::<i32, ExplorationStats>::new();
+        let mut caller_mem = 0.0;
         for metric in &metrics {
             let metric: FunctionalMetric = bincode::deserialize(metric).unwrap();
-            // Update overall stats.
-            num_calls += 1.0;
-            user_activity += (metric.caller_mem as f64 / 1024.0) * AVG_LAMBDA_OVERHEAD_SECS;
-            let duration_secs = metric.duration.as_secs_f64();
-            avg_latency += duration_secs;
-            function_activity += default_mem_gb * duration_secs;
-            // // If overutilized, increase user's overhead by half the duration (heuristic).
-            // // When did I implement this nonsense?
-            // let overused = metric
-            //     .cpu_usage
-            //     .map_or(false, |x| x > UTILIZATION_UPPER_BOUND);
-            // let overused = overused
-            //     || metric
-            //         .mem_usage
-            //         .map_or(false, |x| x > UTILIZATION_UPPER_BOUND);
-            // if overused {
-            //     user_activity += (metric.caller_mem as f64 / 1024.0) * (duration_secs / 2.0);
-            // }
+            // Update stats.
+            num_invocations += 1.0;
+            caller_mem += metric.caller_mem as f64;
             // Update exploration stats.
-            if metric.mem_usage.is_none() {
-                continue;
-            }
-            if !explorations.contains_key(&metric.mem_size_mb) {
-                explorations.insert(
-                    metric.mem_size_mb,
-                    ExplorationStats {
-                        avg_cpu_util: 0.0,
-                        avg_mem_util: 0.0,
-                        num_points: 0.0,
-                        avg_call_latency: 0.0,
-                    },
-                );
-            }
-            let exploration = explorations.get_mut(&metric.mem_size_mb).unwrap();
-            exploration.avg_mem_util += metric.mem_usage.unwrap();
-            exploration.avg_cpu_util += metric.cpu_usage.unwrap();
-            exploration.avg_call_latency += duration_secs;
+            let duration_secs = metric.duration.as_secs_f64();
+            let exploration = if metric.mem_usage.is_none() {
+                // Lambda.
+                &mut lambda_exploration
+            } else {
+                // ECS.
+                if !ecs_explorations.contains_key(&metric.mem_size_mb) {
+                    ecs_explorations.insert(
+                        metric.mem_size_mb,
+                        ExplorationStats {
+                            num_points: 0.0,
+                            avg_latency: 0.0,
+                        },
+                    );
+                }
+                ecs_explorations.get_mut(&metric.mem_size_mb).unwrap()
+            };
+            exploration.avg_latency += duration_secs;
             exploration.num_points += 1.0;
         }
-        // Divide by duration.
-        if num_calls > 0.0 {
-            avg_latency /= num_calls;
+        // Take average and divide by duration.
+        if num_invocations > 0.0 {
+            caller_mem /= num_invocations;
         }
-        function_activity /= since;
-        user_activity /= since;
-        num_calls /= since;
-        println!(
-            "Function Activity: {:?}",
-            function_activity / default_mem_gb
-        );
-        // Update activity.
-        current_stats.function_activity_gbsec = (1.0 - MOVING_FACTOR)
-            * current_stats.function_activity_gbsec
-            + MOVING_FACTOR * function_activity;
-        current_stats.user_activity_gbsec = (1.0 - MOVING_FACTOR)
-            * current_stats.user_activity_gbsec
-            + MOVING_FACTOR * user_activity;
-        current_stats.avg_call_rate =
-            (1.0 - MOVING_FACTOR) * current_stats.avg_call_rate + MOVING_FACTOR * num_calls;
-        current_stats.avg_call_latency =
-            (1.0 - MOVING_FACTOR) * current_stats.avg_call_latency + MOVING_FACTOR * avg_latency;
-        // Update memory.
+        num_invocations /= since;
+        println!("Invocations/second: {num_invocations:?}");
+        // Update global stats.
+        current_stats.invocation_rate =
+            (1.0 - MOVING_FACTOR) * current_stats.invocation_rate + MOVING_FACTOR * num_invocations;
+        current_stats.caller_mem_avg =
+            (1.0 - MOVING_FACTOR) * current_stats.caller_mem_avg + MOVING_FACTOR * caller_mem;
+        // Update lambda stats.
+        lambda_exploration.avg_latency /= lambda_exploration.num_points;
+        current_stats.lambda_stats.avg_latency =
+            (1.0 - MOVING_FACTOR) * current_stats.lambda_stats.avg_latency
+                + MOVING_FACTOR * lambda_exploration.avg_latency;
+        current_stats.lambda_stats.num_points += lambda_exploration.num_points;
+        // Update ecs stats.
         for (mem, exploration) in &mut current_stats.exploration_stats {
-            if let Some(new_exploration) = explorations.get(&mem) {
-                let avg_cpu_util = new_exploration.avg_cpu_util / new_exploration.num_points;
-                let avg_mem_util = new_exploration.avg_mem_util / new_exploration.num_points;
-                let avg_call_latency =
-                    new_exploration.avg_call_latency / new_exploration.num_points;
-                exploration.avg_mem_util =
-                    (1.0 - MOVING_FACTOR) * exploration.avg_mem_util + MOVING_FACTOR * avg_mem_util;
-                exploration.avg_cpu_util =
-                    (1.0 - MOVING_FACTOR) * exploration.avg_cpu_util + MOVING_FACTOR * avg_cpu_util;
-                exploration.avg_call_latency = (1.0 - MOVING_FACTOR) * exploration.avg_call_latency
-                    + MOVING_FACTOR * avg_call_latency;
-                exploration.num_points += 1.0; // Increase only by one per time step.
-                println!("Setting exploration: {exploration:?}");
+            if let Some(new_exploration) = ecs_explorations.get(&mem) {
+                new_exploration.avg_latency /= new_exploration.num_points;
+                exploration.avg_latency = (1.0 - MOVING_FACTOR) * exploration.avg_latency
+                    + MOVING_FACTOR * new_exploration.avg_latency;
+                exploration.num_points += new_exploration.num_points;
             }
         }
     }
@@ -460,12 +430,17 @@ impl FunctionalRescaler {
         ideal_mem: i32,
     ) -> (f64, f64, f64, f64) {
         // Compute lambda cost.
-        let default_mem_gb: f64 = handler_scaling_state.handler_spec.default_mem as f64 / 1024.0;
-        let fn_call_cost = current_stats.avg_call_rate * 0.2 * 3600.0 / 1e6;
-        let fn_compute_cost = current_stats.function_activity_gbsec * 0.0000166667 * 3600.0;
-        let user_cost = current_stats.user_activity_gbsec * 0.0000166667 * 3600.0;
-        let lambda_price = user_cost + fn_compute_cost + fn_call_cost;
-        let observed_concurrency: f64 = current_stats.function_activity_gbsec / default_mem_gb;
+        let default_mem_gb = handler_scaling_state.handler_spec.default_mem as f64 / 1024.0;
+        let caller_mem_gb = current_stats.caller_mem_avg / 1024.0;
+        let fn_call_cost = current_stats.invocation_rate * 0.2 * 3600.0 / 1e6;
+        let fn_activity = current_stats.invocation_rate * current_stats.lambda_stats.avg_latency;
+        let fn_activity_gbsec = fn_activity * default_mem_gb;
+        let fn_compute_cost = fn_activity_gbsec * 0.0000166667 * 3600.0;
+        let fn_user_activity = current_stats.invocation_rate * (current_stats.lambda_stats.avg_latency + AVG_LAMBDA_OVERHEAD_SECS);
+        let fn_user_activity_gbsec = fn_user_activity * caller_mem_gb;
+        let fn_user_cost = fn_user_activity_gbsec * 0.0000166667 * 3600.0;
+        let lambda_price = fn_user_cost + fn_compute_cost + fn_call_cost;
+        let observed_concurrency: f64 = fn_activity;
         // Compute ecs cost.
         let (ecs_price, invoker_price) = self.get_instance_cost(
             current_stats,
