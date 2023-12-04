@@ -14,8 +14,9 @@ const UTILIZATION_LOWER_BOUND: f64 = 0.25;
 /// Number of rescaling rounds to observe before considering utilization stable.
 /// A rescaling round occurs once every ~10 seconds (see constants).
 const UTILIZATION_NUM_ROUNDS: f64 = 3.0;
-/// Upscaling for safety.
-const UPSCALE_FACTOR: f64 = 0.05;
+/// Upscaling for stability. When optimal deployment is too close to two configs,
+/// Oscillating between them leads to much lower performance.
+const UPSCALE_FACTOR: f64 = 1.25;
 
 /// Exploration stats.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -164,7 +165,7 @@ impl Rescaler for FunctionalRescaler {
             // At this point, ECS is so much cheaper than Lambda that extra deployments are ok.
             // TODO: This smoothing is still imperfect around boundaries.
             // The best approach is probably to only decrease by +2.
-            target_scale = target_scale * 1.25;
+            target_scale = target_scale * UPSCALE_FACTOR;
         }
         let to_deploy: f64 = if cost_ratio.floor() > target_scale.ceil() {
             target_scale.ceil()
@@ -329,12 +330,14 @@ impl FunctionalRescaler {
             } else {
                 prev_observed_latency
             };
+            // Avoid oscillations. A drastic reduction is latency may lead to artifially lower user costs when exploring.
+            let upscale = (*mem / min_mem) as f64;
             // Compute user cost under the observed latency.
             // Get rid of lambda latency and multiply by call latency. Slightly hacky, but should work.
             let user_activity_gbsec = (current_stats.user_activity_gbsec
                 / AVG_LAMBDA_OVERHEAD_SECS)
                 * (observed_latency + 0.003);
-            let user_cost = user_activity_gbsec * 0.0000166667 * 3600.0;
+            let user_cost = user_activity_gbsec * 0.0000166667 * 3600.0 / upscale;
             // Compute cost.
             let (ecs_price, invoker_price) =
                 self.get_instance_cost(&current_stats, subsys_state, handler_scaling_state, *mem);
@@ -506,10 +509,14 @@ impl FunctionalRescaler {
     ) -> (f64, f64, f64, f64) {
         // Compute lambda cost.
         let default_mem_gb: f64 = handler_scaling_state.handler_spec.default_mem as f64 / 1024.0;
+        let ideal_mem_gb: f64 = ideal_mem as f64 / 1024.0;
         let fn_call_cost = current_stats.avg_call_rate * 0.2 * 3600.0 / 1e6;
         let fn_compute_cost = current_stats.function_activity_gbsec * 0.0000166667 * 3600.0;
         let user_cost = current_stats.user_activity_gbsec * 0.0000166667 * 3600.0;
-        let lambda_price = user_cost + fn_compute_cost + fn_call_cost;
+        // Assume the function would run longer if not due to upscaling.
+        // TODO: Should just be using exploration values here (for both user and compute cost), but fine.
+        let upscale = ideal_mem_gb / default_mem_gb;
+        let lambda_price = user_cost + fn_compute_cost * upscale + fn_call_cost;
         let observed_concurrency: f64 = current_stats.function_activity_gbsec / default_mem_gb;
         // Compute ecs cost.
         let (ecs_price, invoker_price) = self.get_instance_cost(
