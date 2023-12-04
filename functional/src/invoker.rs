@@ -94,7 +94,7 @@ impl Invoker {
         let lambda_client = aws_sdk_lambda::Client::new(&shared_config);
         // Make direct client.
         let direct_client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_millis(100))
+            .connect_timeout(std::time::Duration::from_millis(10)) // Same region, so should be small.
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .unwrap();
@@ -119,6 +119,7 @@ impl Invoker {
         meta: &str,
         payload: &[u8],
     ) -> Result<(String, Vec<u8>), String> {
+        println!("Invoker Invoke Direct: {url}");
         // Send request.
         let resp = self
             .direct_client
@@ -147,6 +148,15 @@ impl Invoker {
         let worker = {
             let now = chrono::Utc::now();
             let mut inner = self.inner.lock().await;
+            {
+                // Just for debugging.
+                let workers: Vec<_> = inner
+                    .workers
+                    .iter()
+                    .map(|(x, w)| (x.clone(), w.avail_concurrency))
+                    .collect();
+                println!("All Workers: {workers:?}");
+            }
             let mut avail_workers = inner
                 .workers
                 .iter_mut()
@@ -168,14 +178,23 @@ impl Invoker {
         };
         // Direct invoke if worker found.
         if let Some(worker) = worker {
-            println!("Found Worker: {worker:?}");
-            let url = if let Some(url) = &worker.info.public_url {
-                // Try using public url to facilitate tests from outside AWS.
-                url
-            } else {
-                worker.info.private_url.as_ref().unwrap()
-            };
-            let resp = self.invoke_direct(url, meta, payload).await;
+            // TODO: Some kind of infrequent bug here? Sometimes it seems like the worker is never freed.
+            println!("Found Worker: {}", worker.info.peer_id);
+            let url = worker.info.private_url.clone().unwrap();
+            // let url = if let Some(url) = &worker.info.public_url {
+            //     // Try using public url to facilitate tests from outside AWS.
+            //     url
+            // } else {
+            //     worker.info.private_url.as_ref().unwrap()
+            // };
+            let start_time = std::time::Instant::now();
+            let resp = self.invoke_direct(&url, meta, payload).await;
+            let end_time = std::time::Instant::now();
+            let duration = end_time.duration_since(start_time);
+            println!(
+                "Worker {} request duration: {duration:?}",
+                worker.info.peer_id
+            );
             {
                 // Free worker.
                 let mut inner = self.inner.lock().await;

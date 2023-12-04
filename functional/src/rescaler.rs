@@ -8,14 +8,15 @@ const MOVING_FACTOR: f64 = 0.25;
 /// Overhead of lambda.
 const AVG_LAMBDA_OVERHEAD_SECS: f64 = 0.010;
 /// Utilization upper bound. Scale up when either cpu or mem above this.
-const UTILIZATION_UPPER_BOUND: f64 = 0.85;
+const UTILIZATION_UPPER_BOUND: f64 = 0.75;
 /// Utilization lower bound. Scale down when both cpu and mem below this.
 const UTILIZATION_LOWER_BOUND: f64 = 0.25;
 /// Number of rescaling rounds to observe before considering utilization stable.
 /// A rescaling round occurs once every ~10 seconds (see constants).
-const UTILIZATION_NUM_ROUNDS: f64 = 10.0;
-/// Upscaling for safety.
-const UPSCALE_FACTOR: f64 = 0.0;
+const UTILIZATION_NUM_ROUNDS: f64 = 3.0;
+/// Upscaling for stability. When optimal deployment is too close to two configs,
+/// Oscillating between them leads to much lower performance.
+const UPSCALE_FACTOR: f64 = 1.25;
 
 /// Exploration stats.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -153,7 +154,14 @@ impl Rescaler for FunctionalRescaler {
         let cost_ratio = (lambda_price - invoker_price) / ecs_price;
         let target_scale =
             observed_concurrency / handler_scaling_state.handler_spec.concurrency as f64;
-        let target_scale = target_scale * (UPSCALE_FACTOR + 1.0);
+        let mut target_scale = target_scale;
+        if target_scale > 2.0 {
+            // Hack to prevent oscillations around ideal concurency.
+            // At this point, ECS is so much cheaper than Lambda that extra deployments are ok.
+            // TODO: This smoothing is still imperfect around boundaries.
+            // The best approach is probably to only decrease by +2.
+            target_scale = target_scale * UPSCALE_FACTOR;
+        }
         let to_deploy: f64 = if cost_ratio.floor() > target_scale.ceil() {
             target_scale.ceil()
         } else {
@@ -254,35 +262,66 @@ impl FunctionalRescaler {
         subsys_state: &SubsystemScalingState,
         handler_scaling_state: &HandlerScalingState,
     ) -> Vec<i32> {
+        // First, compute observed concurrency.
+        let observed_concurrency: f64 = current_stats.user_activity;
+        // Prevent pointless oscillations under low usage (defined by magic constants).
+        let min_mem = *current_stats.exploration_stats.keys().min().unwrap();
+        let (target_scale, stable_usage, invoker_coef) =
+            if handler_scaling_state.handler_spec.unique {
+                (1.0, true, 0.0)
+            } else {
+                (
+                    observed_concurrency.ceil(),
+                    observed_concurrency > 0.25,
+                    1.0,
+                )
+            };
+        println!("get_mems_to_explore. observed_concurrency={observed_concurrency}. target_scale={target_scale}.");
         let mut res = Vec::new();
-        let mut min_observed_latency = current_stats.avg_call_latency;
-        let avg_user_mem = current_stats.user_activity_gbsec / AVG_LAMBDA_OVERHEAD_SECS;
+        let mut prev_observed_latency = current_stats
+            .exploration_stats
+            .get(&min_mem)
+            .unwrap()
+            .avg_call_latency;
         let mut min_instance_cost: Option<f64> = None;
         for (mem, exploration) in &current_stats.exploration_stats {
             // Assume larger instance sizes with missing info will have latency similar to fastest one seen so far.
             // This assumes iteration is in key order.
             let observed_latency = if exploration.num_points >= UTILIZATION_NUM_ROUNDS {
-                exploration.avg_call_latency
+                // Never let avg latency go down.
+                if exploration.avg_call_latency < prev_observed_latency {
+                    prev_observed_latency = exploration.avg_call_latency;
+                    exploration.avg_call_latency
+                } else {
+                    prev_observed_latency
+                }
             } else {
-                min_observed_latency
+                prev_observed_latency
             };
-            if min_observed_latency > observed_latency {
-                min_observed_latency = observed_latency;
-            }
+            // Avoid oscillations. A drastic reduction is latency may lead to artifially lower user costs when exploring.
+            let upscale = (*mem / min_mem) as f64;
             // Compute user cost under the observed latency.
-            let user_activity_gbsec = current_stats.avg_call_rate * observed_latency * avg_user_mem;
-            let user_cost = user_activity_gbsec * 0.0000166667 * 3600.0;
+            // Get rid of lambda latency and multiply by call latency. Slightly hacky, but should work.
+            let user_activity_gbsec = (current_stats.user_activity_gbsec
+                / AVG_LAMBDA_OVERHEAD_SECS)
+                * (observed_latency + 0.003);
+            let user_cost = user_activity_gbsec * 0.0000166667 * 3600.0 / upscale;
             // Compute cost.
             let (ecs_price, invoker_price) =
                 self.get_instance_cost(&current_stats, subsys_state, handler_scaling_state, *mem);
             // Total cost
-            let total_cost = user_cost + ecs_price + invoker_price;
+            let total_cost = user_cost + target_scale * ecs_price + invoker_coef * invoker_price;
+            println!("Mem {mem}. Total Cost={total_cost}. User Cost={user_cost}. ECS={ecs_price}. UserActivity={user_activity_gbsec}. OL={observed_latency}.");
             if min_instance_cost.is_none() {
                 min_instance_cost = Some(total_cost);
             }
             let max_allowable_cost =
                 (1.0 + handler_scaling_state.handler_spec.scaleup) * min_instance_cost.unwrap();
-            if total_cost <= max_allowable_cost {
+            if *mem == min_mem {
+                // Always push min mem.
+                res.push(*mem);
+            } else if total_cost <= max_allowable_cost && stable_usage {
+                // Push greater mem if cost within bounds and stable usage.
                 res.push(*mem);
             }
         }
@@ -398,17 +437,24 @@ impl FunctionalRescaler {
 
     fn get_instance_cost(
         &self,
-        current_stats: &FunctionalScalingInfo,
+        _current_stats: &FunctionalScalingInfo,
         subsys_state: &SubsystemScalingState,
         handler_scaling_state: &HandlerScalingState,
         mem: i32,
     ) -> (f64, f64) {
         // Compute ecs cost.
-        let min_mem = *current_stats.exploration_stats.keys().min().unwrap();
-        let cpus = if mem == min_mem { mem / 2 } else { mem / 4 };
+        let cpus = mem / 2;
         let ecs_mem_gb = mem as f64 / 1024.0;
         let ecs_cpus = cpus as f64 / 1024.0;
-        let ecs_price = (0.01234398 * ecs_cpus) + (0.00135546 * ecs_mem_gb);
+        let ecs_price = if handler_scaling_state.handler_spec.spot {
+            (0.01234398 * ecs_cpus) + (0.00135546 * ecs_mem_gb)
+        } else {
+            (0.04048 * ecs_cpus) + (0.004445 * ecs_mem_gb)
+        };
+        println!(
+            "Instance price {mem}: {ecs_price}. Spot={}!",
+            handler_scaling_state.handler_spec.spot
+        );
         // Invoker is only needed for non-unique functions (non-actors).
         let invoker_price = if handler_scaling_state.handler_spec.unique {
             0.0
@@ -463,6 +509,11 @@ impl FunctionalRescaler {
             rescaling_result.services_scales.insert("invoker".into(), 0);
             return;
         }
+        // Hack to disallow scaling.
+        if handler_scaling_state.handler_spec.scaleup < -(1e-4) {
+            return;
+        }
+
         // Special case for actors.
         if handler_scaling_state.handler_spec.unique {
             rescaling_result.services_scales.insert("invoker".into(), 0);
@@ -470,6 +521,12 @@ impl FunctionalRescaler {
         } else {
             println!("Setting service scales");
             rescaling_result.services_scales.insert("invoker".into(), 1);
+            let old_to_deploy = rescaling_result.handler_scales.as_ref().unwrap();
+            let old_to_deploy = old_to_deploy.get(&ideal_mem).cloned().unwrap_or(0) as i32;
+            // To guarantee stability around ceil (only go down by at least two).
+            if to_deploy > 2 && (to_deploy + 1) == old_to_deploy {
+                to_deploy = old_to_deploy;
+            }
         };
         // Update scales.
         let handler_scales = rescaling_result.handler_scales.as_mut().unwrap();
@@ -508,6 +565,7 @@ mod tests {
                 persistent: false,
                 unique: false,
                 scaleup,
+                spot: true,
             },
             handler_scales: mems.into_iter().map(|m| (m, 0)).collect(),
         }

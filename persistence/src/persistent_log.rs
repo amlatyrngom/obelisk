@@ -599,15 +599,15 @@ impl PersistentLog {
             tokio::task::spawn_blocking(move || {
                 for _ in 0..NUM_DB_RETRIES {
                     let values_params = rusqlite::params_from_iter(values_params.iter());
-                    // let start_time = std::time::Instant::now();
+                    let start_time = std::time::Instant::now();
                     let conn = pool.get().unwrap();
                     let executed = conn.execute(
                         &replace_stmt,
                         values_params,
                     );
-                    // let end_time = std::time::Instant::now();
-                    // let duration = end_time.duration_since(start_time);
-                    // println!("DB Write took: {duration:?}");
+                    let end_time = std::time::Instant::now();
+                    let duration = end_time.duration_since(start_time);
+                    println!("DB Batch Write took: {duration:?}");
                     match executed {
                         Ok(executed) if executed > 0 => {
                             return;

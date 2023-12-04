@@ -347,9 +347,9 @@ impl ContainerDeployment {
             return vec![mem];
         }
         let mut res = Vec::<i32>::new();
-        if mem <= 64 * 1024 {
-            res.push(64 * 1024);
-        }
+        // if mem <= 64 * 1024 {
+        //     res.push(64 * 1024);
+        // }
         if mem <= 32 * 1024 {
             res.push(32 * 1024);
         }
@@ -371,6 +371,8 @@ impl ContainerDeployment {
         if mem <= 512 {
             res.push(512);
         }
+        // Only keep up to 4x
+        let res = res.into_iter().filter(|m| *m <= 4 * mem).collect();
         res
     }
 
@@ -411,13 +413,8 @@ impl ContainerDeployment {
         let mut mems = Vec::new();
         let mut cpus = Vec::new();
         for mem in avail_mems {
-            if mem <= handler_spec.default_mem * 2 {
-                mems.push(mem);
-                cpus.push(mem / 2);
-            } else {
-                mems.push(mem);
-                cpus.push(mem / 4);
-            }
+            mems.push(mem);
+            cpus.push(mem / 2);
         }
 
         for (mem, cpu) in mems.into_iter().zip(cpus.into_iter()) {
@@ -545,6 +542,7 @@ impl ContainerDeployment {
         sg_id: &str,
         mem: i32,
     ) {
+        let provider = if spec.spot { "FARGATE_SPOT" } else { "FARGATE" };
         let task_name =
             Self::handler_task_name(&spec.namespace, identifier, &Self::mem_mb_to_str(mem));
         let task_def_name =
@@ -573,7 +571,7 @@ impl ContainerDeployment {
             )
             .capacity_provider_strategy(
                 aws_sdk_ecs::types::CapacityProviderStrategyItem::builder()
-                    .capacity_provider("FARGATE_SPOT")
+                    .capacity_provider(provider)
                     .weight(1)
                     .base(0)
                     .build(),
@@ -603,6 +601,13 @@ impl ContainerDeployment {
                         .awsvpc_configuration(vpc_config.clone())
                         .build(),
                 )
+                .capacity_provider_strategy(
+                    aws_sdk_ecs::types::CapacityProviderStrategyItem::builder()
+                        .capacity_provider(provider)
+                        .weight(1)
+                        .base(0)
+                        .build(),
+                )
                 .propagate_tags(aws_sdk_ecs::types::PropagateTags::Service)
                 .send()
                 .await
@@ -620,7 +625,7 @@ impl ContainerDeployment {
     ) -> Result<(), String> {
         let task_name =
             Self::handler_task_name(&spec.namespace, identifier, &Self::mem_mb_to_str(mem));
-        let _resp = client
+        let resp = client
             .update_service()
             .desired_count(count)
             .cluster(Self::cluster_name(&spec.namespace))
@@ -628,7 +633,13 @@ impl ContainerDeployment {
             .propagate_tags(aws_sdk_ecs::types::PropagateTags::Service)
             .send()
             .await
-            .map_err(|e| format!("{e:?}"))?;
+            .map_err(|e| format!("{e:?}"));
+        if count == 0 && identifier.starts_with("sbactor") {
+            println!("Reset count to 0");
+            if resp.is_err() {
+                println!("Resp error: {resp:?}");
+            }
+        }
         Ok(())
     }
 }

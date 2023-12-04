@@ -4,7 +4,7 @@ use common::deployment::lambda;
 use common::scaling_state::ScalingStateManager;
 use common::wrapper::WrapperMessage;
 use common::{HandlingResp, MetricsManager};
-use std::sync::{Arc, Mutex};
+use std::sync::{atomic, Arc, Mutex};
 
 const NUM_INDIRECT_RETRIES: u64 = 50;
 const INDIRECT_WAIT_TIME_SECS: f64 = 0.02;
@@ -22,9 +22,20 @@ pub struct FunctionalClient {
     scaling_manager: Arc<ScalingStateManager>,
     caller_mem: i32,
     last_force_refresh: Arc<Mutex<std::time::Instant>>,
+    with_indirect_lambda_retry: Arc<atomic::AtomicBool>,
 }
 
 impl FunctionalClient {
+    /// Simpler construction for function client.
+    pub async fn new_fn(namespace: &str, name: &str) -> Self {
+        Self::new(namespace, name, None, None).await
+    }
+
+    /// Simpler construction for actor client.
+    pub async fn new_ator(namespace: &str, name: &str, id: usize) -> Self {
+        Self::new(namespace, name, Some(id), None).await
+    }
+
     /// Create client.
     pub async fn new(
         namespace: &str,
@@ -32,9 +43,12 @@ impl FunctionalClient {
         id: Option<usize>,
         caller_mem: Option<i32>,
     ) -> Self {
+        // Connect timeout should be as realistically short as possibly.
+        // TODO: Find ways set to make it shorter, possibly using some heuristics.
+        let connect_timeout_ms: u64 = if Self::is_in_aws() { 10 } else { 100 };
         let direct_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10)) // TODO: set to correct value.
-            .connect_timeout(std::time::Duration::from_millis(100)) // Short on purpose.
+            .connect_timeout(std::time::Duration::from_millis(connect_timeout_ms)) // Short on purpose. May break when connecting to a distant region.
             .build()
             .unwrap();
         let shared_config = aws_config::load_from_env().await;
@@ -78,12 +92,23 @@ impl FunctionalClient {
             scaling_manager: Arc::new(scaling_manager),
             caller_mem: caller_mem.unwrap_or(512),
             last_force_refresh: Arc::new(Mutex::new(std::time::Instant::now())),
+            with_indirect_lambda_retry: Arc::new(atomic::AtomicBool::new(true)),
         }
+    }
+
+    // Heuristic to know if in AWS. Should allow shorter connection timeouts.
+    fn is_in_aws() -> bool {
+        std::env::var("OBK_EXECUTION_MODE").is_ok()
+    }
+
+    pub fn set_indirect_lambda_retry(&self, v: bool) {
+        self.with_indirect_lambda_retry
+            .store(v, atomic::Ordering::Release);
     }
 
     /// Log a metric with a given probability.
     async fn log_metrics(&self, resp: &HandlingResp) {
-        println!("Resp Duration: {:?}.", resp.duration);
+        // println!("Resp Duration: {:?}.", resp.duration);
         let metric = FunctionalMetric {
             duration: resp.duration,
             mem_size_mb: resp.mem_size_mb,
@@ -117,7 +142,13 @@ impl FunctionalClient {
         let scaling_state = self.scaling_manager.current_scaling_state().await;
         // println!("FunctionalClient::get_invoker_url: {scaling_state:?}");
         if let Some(peers) = scaling_state.handler_state.as_ref().map(|s| &s.peers) {
-            let mut instances = peers.values().collect::<Vec<_>>();
+            let instances = peers.values().collect::<Vec<_>>();
+            let now = chrono::Utc::now();
+            let max_since = chrono::Duration::seconds(20);
+            let mut instances = instances
+                .into_iter()
+                .filter(|i| now.signed_duration_since(i.active_time) < max_since)
+                .collect::<Vec<_>>();
             instances.sort_by_key(|k| k.join_time);
             let instance = instances.last();
             if let Some(instance) = instance {
@@ -138,7 +169,7 @@ impl FunctionalClient {
     ) -> Result<(HandlingResp, Vec<u8>), String> {
         let fn_name =
             lambda::LambdaDeployment::handler_function_name(&self.namespace, &self.identifier);
-        println!("FunctionalClient::invoke_lambda: {fn_name}.");
+        // println!("FunctionalClient::invoke_lambda: {fn_name}.");
         let payload = general_purpose::STANDARD_NO_PAD.encode(payload);
         let meta = WrapperMessage::HandlerMessage { meta: meta.into() };
         let arg: (WrapperMessage, String) = (meta, payload);
@@ -195,7 +226,9 @@ impl FunctionalClient {
             return None;
         }
         let url = url.unwrap();
-        println!("FunctionalClient::invoke_direct. Url={url:?}");
+        if Self::is_in_aws() {
+            println!("FunctionalClient::invoke_direct. Url={url:?}");
+        }
         // Double wrap (client -> invoker -> handler).
         let meta = WrapperMessage::HandlerMessage { meta: meta.into() };
         let meta = serde_json::to_string(&meta).unwrap();
@@ -382,7 +415,7 @@ impl FunctionalClient {
             Ok(resp) => (Some(resp), true),
             Err(e) => {
                 // If no container running, So try direct lambda invokation.
-                if e.contains("avail") {
+                if e.to_lowercase().contains("unavailable") {
                     let resp = self.invoke_lambda_handler(meta, payload).await;
                     match resp {
                         Ok(resp) => (Some(resp), false),
@@ -410,7 +443,8 @@ impl FunctionalClient {
                         }
                     }
                 } else {
-                    (None, false)
+                    // Failed http request.
+                    (None, true)
                 }
             }
         };
@@ -418,6 +452,14 @@ impl FunctionalClient {
         let (resp, payload, was_direct) = if let Some((resp, payload)) = resp {
             (resp, payload, true)
         } else {
+            let try_indirect = self
+                .with_indirect_lambda_retry
+                .load(atomic::Ordering::Acquire);
+            if !try_indirect && !was_http {
+                return Err(
+                    "Not doing indirect lambda retry! Client should manually retry!".into(),
+                );
+            }
             let (resp, payload) = self.invoke_indirect(meta, payload).await?;
             (resp, payload, false)
         };
@@ -441,6 +483,8 @@ impl FunctionalClient {
 
 #[cfg(test)]
 mod tests {
+    use crate::FunctionalClient;
+
     #[tokio::test]
     async fn simple_fn_invoke_test() {
         run_simple_invoke_test("echofn", None).await;

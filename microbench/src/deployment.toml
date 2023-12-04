@@ -6,19 +6,41 @@ dependencies = ["wal", "functional"]
 name = "microfn"
 subsystem = "functional"
 path = "microbench::MicroFunction"
-mem = 512
+mem = 1769
 timeout = 10
-concurrency = 32
+concurrency = 1
+scaleup = 0.0
+
+[[handlers]]
+name = "echofn" # Function name
+path = "microbench::EchoFn" # Path to the function
+mem = 512 # Amount of memory
+timeout = 10 # Timeout value
+# Optional paramaters:
+# unique = True # Marks it as an actor
+# scaleup = 1.0 # Sets X = 100%
 
 
 [[handlers]]
 name = "microactor"
 subsystem = "functional"
 path = "microbench::MicroActor"
-mem = 1024
+mem = 1769
 timeout = 10
 persistent = true
 unique = true
+
+
+[[handlers]]
+name = "simactor"
+subsystem = "functional"
+path = "microbench::SimActor"
+mem = 1769
+timeout = 10
+scaleup = 0.0
+persistent = true
+unique = true
+spot = false
 
 
 [[handlers]]
@@ -27,3 +49,5 @@ subsystem = "functional"
 path = "microbench::BenchRunner"
 mem = 512
 timeout = 60
+concurrency = 16
+scaleup = -1.0

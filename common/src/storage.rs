@@ -25,6 +25,7 @@ impl ServerlessStorage {
         let manager = r2d2_sqlite::SqliteConnectionManager::file(db_file.clone());
         let pool = r2d2::Pool::builder()
             .max_size(1)
+            .connection_timeout(std::time::Duration::from_secs(1))
             .build(manager)
             .map_err(debug_format!())?;
         let mut num_tries = max_num_tries;
@@ -33,7 +34,7 @@ impl ServerlessStorage {
             if num_tries < max_num_tries {
                 std::thread::sleep(std::time::Duration::from_secs(1));
             }
-            let conn = pool
+            let mut conn = pool
                 .get_timeout(std::time::Duration::from_secs(1))
                 .map_err(debug_format!())?;
             conn.busy_timeout(std::time::Duration::from_secs(1))
@@ -58,6 +59,26 @@ impl ServerlessStorage {
                     continue;
                 }
             }
+            // This is unnecessary; it's just to make a write to the DB, which forces lock aquisition.
+            let txn = conn.transaction().map_err(debug_format!())?;
+            txn.execute("CREATE TABLE IF NOT EXISTS system__ownership (unique_row INTEGER PRIMARY KEY, seq_num INT)", ()).map_err(debug_format!())?;
+            let seq_num = txn.query_row("SELECT seq_num FROM system__ownership", [], |r| r.get(0));
+            let seq_num: usize = match seq_num {
+                Ok(seq_num) => {
+                    let seq_num: usize = seq_num;
+                    seq_num + 1
+                }
+                Err(rusqlite::Error::QueryReturnedNoRows) => 1,
+                e => {
+                    return Err(format!("{e:?}"));
+                }
+            };
+            txn.execute(
+                "REPLACE INTO system__ownership (unique_row, seq_num) VALUES (0, ?)",
+                [&seq_num],
+            )
+            .map_err(debug_format!())?;
+            txn.commit().map_err(debug_format!())?;
             break;
         }
         Ok(pool)
@@ -72,6 +93,7 @@ impl ServerlessStorage {
         let manager = r2d2_sqlite::SqliteConnectionManager::file(db_file.clone());
         let pool = r2d2::Pool::builder()
             .max_size(1)
+            .connection_timeout(std::time::Duration::from_secs(1))
             .build(manager)
             .map_err(debug_format!())?;
         let mut conn = pool
@@ -217,17 +239,37 @@ impl ServerlessStorage {
 
     /// Check current incarnation in notification file.
     pub async fn check_incarnation(&self) -> Result<(), String> {
-        let conn = self
-            .shared_pool
+        tokio::task::block_in_place(move || {
+            let conn = self
+                .shared_pool
+                .get_timeout(std::time::Duration::from_secs(1))
+                .map_err(debug_format!())?;
+            let seq_num = conn.query_row("SELECT seq_num FROM system__ownership", [], |r| r.get(0));
+            let seq_num: usize = seq_num.map_err(debug_format!())?;
+            if self.seq_num == seq_num {
+                Ok(())
+            } else {
+                Err("Lost incarnation!".into())
+            }
+        })
+    }
+
+    pub fn dummy_write_to_exclusive(&self) -> Result<(), String> {
+        let pool = match self.exclusive_pool.clone() {
+            Some(pool) => pool,
+            None => return Ok(()),
+        };
+        let mut conn = pool
             .get_timeout(std::time::Duration::from_secs(1))
             .map_err(debug_format!())?;
-        let seq_num = conn.query_row("SELECT seq_num FROM system__ownership", [], |r| r.get(0));
-        let seq_num: usize = seq_num.map_err(debug_format!())?;
-        if self.seq_num == seq_num {
-            Ok(())
-        } else {
-            Err("Lost incarnation!".into())
-        }
+        let txn = conn.transaction().map_err(debug_format!())?;
+        txn.execute(
+            "UPDATE system__ownership SET seq_num=? WHERE seq_num=?",
+            [&self.seq_num, &self.seq_num],
+        )
+        .map_err(debug_format!())?;
+        txn.commit().map_err(debug_format!())?;
+        Ok(())
     }
 
     pub fn release_exclusive_file(&self, num_tries: i32) -> Result<(), String> {

@@ -246,7 +246,7 @@ impl ServerlessWrapper {
             // Release exclusive file if held.
             if let Some(ss) = &self.serverless_storage {
                 tokio::task::block_in_place(move || {
-                    let _ = ss.release_exclusive_file(10);
+                    let _ = ss.release_exclusive_file(1);
                 });
             }
             // If unique, wait to avoid spurrious ecs restarts.
@@ -254,6 +254,13 @@ impl ServerlessWrapper {
                 tokio::time::sleep(std::time::Duration::from_secs(100)).await;
             }
             std::process::exit(0);
+        } else {
+            // Seems necessary to keep the lock active?
+            if let Some(ss) = &self.serverless_storage {
+                tokio::task::block_in_place(move || {
+                    let _ = ss.dummy_write_to_exclusive();
+                });
+            }
         }
     }
 

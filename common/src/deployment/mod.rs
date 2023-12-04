@@ -76,6 +76,7 @@ pub struct HandlerSpec {
     pub persistent: bool,
     pub unique: bool,
     pub scaleup: f64,
+    pub spot: bool,
 }
 
 pub struct NamespaceDeployment {}

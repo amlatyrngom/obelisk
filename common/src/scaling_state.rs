@@ -205,7 +205,6 @@ impl ScalingStateManager {
     async fn refresh_thread(&self) {
         let duration = std::time::Duration::from_secs(RESCALING_INTERVAL_SECS);
         let mut interval = tokio::time::interval(duration);
-        interval.tick().await;
         let terminate_signal = unix::SignalKind::terminate();
         let interrupt_signal = unix::SignalKind::interrupt();
         let mut sigterm = unix::signal(terminate_signal).unwrap();
