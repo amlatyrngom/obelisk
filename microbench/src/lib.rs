@@ -23,6 +23,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     const USER_MEM: i32 = 512;
+    use common::metrics::MetricsManager;
+    use functional::rescaler::FORECASTING_GRANULARITY_SECS;
 
     struct RequestSender {
         is_fn: bool,
@@ -210,9 +212,9 @@ mod tests {
             // Make sure stuff is initialized.
             let _fn_client =
                 Arc::new(FunctionalClient::new("microbench", "microfn", None, Some(512)).await);
-            let _actor_client = Arc::new(
-                FunctionalClient::new("microbench", "microactor", Some(0), Some(512)).await,
-            );
+            // let _actor_client = Arc::new(
+            //     FunctionalClient::new("microbench", "microactor", Some(0), Some(512)).await,
+            // );
         }
         let fc =
             Arc::new(FunctionalClient::new("microbench", "microrunner", None, Some(512)).await);
@@ -261,6 +263,85 @@ mod tests {
         let (resp, _) = fc.invoke(&meta, &[]).await.unwrap();
         let resp: Vec<(Duration, Vec<u8>)> = serde_json::from_str(&resp).unwrap();
         println!("Response: {resp:?}");
+    }
+
+    async fn generate_robustness_workload(
+        time_interval: f64,
+        quiet_intensity: f64,
+        burst_time: f64,
+        burst_intensity: f64,
+        num_intervals: usize,
+    ) -> (Vec<(f64, f64)>, (chrono::DateTime<chrono::Utc>, Vec<f64>)) {
+        let mut workload = Vec::new();
+        let mut forecasts = Vec::new();
+        let start_time = chrono::Utc::now();
+        for _ in 0..(num_intervals - 1) {
+            let quiet_time = time_interval - burst_time;
+            workload.push((quiet_time, quiet_intensity));
+            let num_forecast_points = (quiet_time / FORECASTING_GRANULARITY_SECS) as usize;
+            forecasts.extend(vec![quiet_intensity; num_forecast_points]);
+            workload.push((burst_time, burst_intensity));
+            let num_forecast_points = (burst_time / FORECASTING_GRANULARITY_SECS) as usize;
+            forecasts.extend(vec![burst_intensity; num_forecast_points]);
+        }
+        // Add a final quiet period not followed by a burst.
+        let quiet_time = time_interval;
+        workload.push((quiet_time, quiet_intensity));
+        let num_forecast_points = (quiet_time / FORECASTING_GRANULARITY_SECS) as usize;
+        forecasts.extend(vec![quiet_intensity; num_forecast_points]);
+        (workload, (start_time, forecasts))
+    }
+
+    async fn run_generated_workload(
+        workload: Vec<(f64, f64)>,
+        forecasts: (chrono::DateTime<chrono::Utc>, Vec<f64>),
+        use_forecast: bool,
+    ) {
+        let prefix = if use_forecast {
+            // TODO: Push forecast metrics.
+            let metrics_manager = MetricsManager::new("functional", "microbench", "microfn").await;
+            let forecast = bincode::serialize(&forecasts).unwrap();
+            metrics_manager.accumulate_metric(forecast).await;
+            let _ = metrics_manager.push_metrics().await;
+            "robustness_with_forecast"
+        } else {
+            "robustness_no_forecast"
+        };
+
+        let fc = Arc::new(
+            FunctionalClient::new("microbench", "microrunner", None, Some(USER_MEM)).await,
+        );
+
+        let mut request_sender = RequestSender {
+            is_fn: true,
+            is_sim: false,
+            curr_avg_latency: 0.025,
+            desired_requests_per_second: 0.0,
+            fc: fc.clone(),
+        };
+
+        for (i, (time_interval, reqs_per_secs)) in workload.into_iter().enumerate() {
+            let duration = Duration::from_secs_f64(time_interval);
+            let name = format!("{prefix}_{i}");
+            request_sender.desired_requests_per_second = reqs_per_secs;
+            run_bench(&mut request_sender, &name, duration).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    async fn robustness_fn_bench_cloud() {
+        let use_forecast = false;
+        let quiet_itensity = 10.0; // 10 requests per second.
+        let time_interval = 60.0 * 2.0; // 60.0 * 10.0; // 10 minutes.
+        let num_intervals = 6; // 6 intervals = 1 hour.
+        let burst_intensity = 400.0; // 100 requests per second.
+        // Short bursts
+        let burst_time = 30.0;
+        // Run.
+        let (workload, forecasts) =
+            generate_robustness_workload(time_interval, quiet_itensity, burst_time, burst_intensity, num_intervals)
+                .await;
+        run_generated_workload(workload, forecasts, use_forecast).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 16)]

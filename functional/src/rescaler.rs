@@ -6,17 +6,14 @@ use serde::{Deserialize, Serialize};
 /// Factor for moving average.
 const MOVING_FACTOR: f64 = 0.25;
 /// Overhead of lambda.
-const AVG_LAMBDA_OVERHEAD_SECS: f64 = 0.010;
-/// Utilization upper bound. Scale up when either cpu or mem above this.
-const UTILIZATION_UPPER_BOUND: f64 = 0.75;
-/// Utilization lower bound. Scale down when both cpu and mem below this.
-const UTILIZATION_LOWER_BOUND: f64 = 0.25;
-/// Number of rescaling rounds to observe before considering utilization stable.
-/// A rescaling round occurs once every ~10 seconds (see constants).
-const UTILIZATION_NUM_ROUNDS: f64 = 3.0;
+const AVG_LAMBDA_OVERHEAD_SECS: f64 = 0.013;
 /// Upscaling for stability. When optimal deployment is too close to two configs,
 /// Oscillating between them leads to much lower performance.
 const UPSCALE_FACTOR: f64 = 1.25;
+/// Forecasting granularity.
+pub const FORECASTING_GRANULARITY_SECS: f64 = 10.0;
+/// Scale down delay.
+pub const SCALE_DOWN_DELAY_SECS: i64 = 60;
 
 /// Exploration stats.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -29,10 +26,15 @@ struct ExplorationStats {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct FunctionalScalingInfo {
     invocation_rate: f64,
+    global_avg_latency: f64,
     caller_mem_avg: f64,
     lambda_stats: ExplorationStats,
     exploration_stats: BTreeMap<i32, ExplorationStats>,
     scheduled_scale_downs: BTreeMap<i32, chrono::DateTime<chrono::Utc>>,
+    // Forecast of invocation rates.
+    // The datetime is the start of the forecast interval.
+    // vec[i] should contain invocatio rate atstart_time + 30s.
+    forecasted_invocations: Option<(chrono::DateTime<chrono::Utc>, Vec<f64>)>,
 }
 
 /// Metrics for scaling functions.
@@ -58,7 +60,7 @@ impl Rescaler for FunctionalRescaler {
         since_last_rescale: std::time::Duration,
         metrics: Vec<Vec<u8>>,
     ) -> RescalingResult {
-        // Get handling state.
+        // Get handler state.
         let handler_scaling_state = handler_scaling_state.unwrap();
         // Make default rescaling result.
         let mut rescaling_result = RescalingResult {
@@ -70,11 +72,12 @@ impl Rescaler for FunctionalRescaler {
         // Read current stats or make new ones.
         let mut current_stats = handler_scaling_state.scaling_info.as_ref().map_or(
             FunctionalScalingInfo {
+                global_avg_latency: 1.0,
                 invocation_rate: 0.0,
                 caller_mem_avg: 0.0,
                 lambda_stats: ExplorationStats {
                     num_points: 0.0,
-                    avg_latency: 0.0,
+                    avg_latency: 1.0,
                 },
                 scheduled_scale_downs: BTreeMap::new(),
                 exploration_stats: handler_scaling_state
@@ -85,11 +88,12 @@ impl Rescaler for FunctionalRescaler {
                             *m,
                             ExplorationStats {
                                 num_points: 0.0,
-                                avg_latency: 0.0,
+                                avg_latency: 1.0,
                             },
                         )
                     })
                     .collect(),
+                forecasted_invocations: None,
             },
             |s| serde_json::from_str(s).unwrap(),
         );
@@ -100,6 +104,7 @@ impl Rescaler for FunctionalRescaler {
             metrics,
             since_last_rescale.as_secs_f64(),
         );
+        self.try_use_forcasted_invocations(&mut current_stats);
         // Find ideal mem and summary.
         let to_explore = self.get_mems_to_explore(
             &current_stats,
@@ -111,35 +116,41 @@ impl Rescaler for FunctionalRescaler {
             self.find_ideal_memory(&mut current_stats, &handler_scaling_state, &to_explore);
         let min_mem = *current_stats.exploration_stats.keys().min().unwrap();
         while ideal_mem > min_mem {
-            let (lambda_price, ecs_price, invoker_price, _observed_concurrency) = self
-                .summarize_stats(
-                    &current_stats,
-                    &subsystem_scaling_state,
-                    &handler_scaling_state,
-                    ideal_mem,
-                );
+            let (
+                lambda_price,
+                ecs_compute_price,
+                invoker_price,
+                ecs_user_cost,
+                _observed_concurrency,
+            ) = self.summarize_stats(
+                &current_stats,
+                &subsystem_scaling_state,
+                &handler_scaling_state,
+                ideal_mem,
+            );
             // If price is ok, break.
-            // TODO: Exclude invoker in unique calculation.
-            if ecs_price + invoker_price <= lambda_price {
+            if ecs_compute_price + ecs_user_cost + invoker_price <= lambda_price {
                 break;
             }
             // If price is too high, try next mem.
             ideal_mem /= 2;
         }
         // Resummarize using new ideal mem in case it changed.
-        let (lambda_price, ecs_price, invoker_price, observed_concurrency) = self.summarize_stats(
-            &current_stats,
-            &subsystem_scaling_state,
-            &handler_scaling_state,
-            ideal_mem,
-        );
+        let (lambda_price, ecs_compute_price, invoker_price, ecs_user_cost, observed_concurrency) =
+            self.summarize_stats(
+                &current_stats,
+                &subsystem_scaling_state,
+                &handler_scaling_state,
+                ideal_mem,
+            );
         // If base price still too high shutdown everything.
-        if ecs_price + invoker_price > lambda_price {
+        if ecs_compute_price + ecs_user_cost + invoker_price > lambda_price {
             self.schedule_shutdowns(
                 &mut current_stats,
                 &handler_scaling_state,
                 &mut rescaling_result,
                 None,
+                true,
             );
         } else {
             // If base price enough, shutdown everything except ideal instance type.
@@ -148,18 +159,17 @@ impl Rescaler for FunctionalRescaler {
                 &handler_scaling_state,
                 &mut rescaling_result,
                 Some(ideal_mem),
+                false,
             );
         }
         // Determines the number of base containers we can deploy in a cost effective manner and still be able to handle the load.
-        let cost_ratio = (lambda_price - invoker_price) / ecs_price;
+        let cost_ratio = (lambda_price - invoker_price - ecs_user_cost) / ecs_compute_price;
         let target_scale =
             observed_concurrency / handler_scaling_state.handler_spec.concurrency as f64;
         let mut target_scale = target_scale;
         if target_scale > 2.0 {
             // Hack to prevent oscillations around ideal concurency.
             // At this point, ECS is so much cheaper than Lambda that extra deployments are ok.
-            // TODO: This smoothing is still imperfect around boundaries.
-            // The best approach is probably to only decrease by +2.
             target_scale = target_scale * UPSCALE_FACTOR;
         }
         let to_deploy: f64 = if cost_ratio.floor() > target_scale.ceil() {
@@ -174,7 +184,7 @@ impl Rescaler for FunctionalRescaler {
             ideal_mem,
             to_deploy,
         );
-        println!("Summary: LP={lambda_price}, EP={ecs_price}, IP={invoker_price}, OC={observed_concurrency}, CR={cost_ratio}, TS={target_scale}, TD={to_deploy}, IM={ideal_mem}");
+        println!("Summary: LP={lambda_price}, EP={ecs_compute_price}, IP={invoker_price}, OC={observed_concurrency}, CR={cost_ratio}, TS={target_scale}, TD={to_deploy}, IM={ideal_mem}");
         rescaling_result.handler_scaling_info =
             Some(serde_json::to_string(&current_stats).unwrap());
         rescaling_result
@@ -191,7 +201,7 @@ impl FunctionalRescaler {
     fn update_moving_averages(
         &self,
         current_stats: &mut FunctionalScalingInfo,
-        handler_scaling_state: &HandlerScalingState,
+        _handler_scaling_state: &HandlerScalingState,
         metrics: Vec<Vec<u8>>,
         since: f64,
     ) {
@@ -202,13 +212,22 @@ impl FunctionalRescaler {
         };
         let mut ecs_explorations = HashMap::<i32, ExplorationStats>::new();
         let mut caller_mem = 0.0;
+        let mut global_avg_latency = 0.0;
         for metric in &metrics {
+            // Try reading forecast.
+            if let Ok(forecast) =
+                bincode::deserialize::<(chrono::DateTime<chrono::Utc>, Vec<f64>)>(metric)
+            {
+                current_stats.forecasted_invocations = Some(forecast);
+                continue;
+            }
             let metric: FunctionalMetric = bincode::deserialize(metric).unwrap();
+            let duration_secs = metric.duration.as_secs_f64();
             // Update stats.
             num_invocations += 1.0;
             caller_mem += metric.caller_mem as f64;
+            global_avg_latency += duration_secs;
             // Update exploration stats.
-            let duration_secs = metric.duration.as_secs_f64();
             let exploration = if metric.mem_usage.is_none() {
                 // Lambda.
                 &mut lambda_exploration
@@ -231,27 +250,52 @@ impl FunctionalRescaler {
         // Take average and divide by duration.
         if num_invocations > 0.0 {
             caller_mem /= num_invocations;
+            global_avg_latency /= num_invocations;
         }
         num_invocations /= since;
         println!("Invocations/second: {num_invocations:?}");
         // Update global stats.
         current_stats.invocation_rate =
             (1.0 - MOVING_FACTOR) * current_stats.invocation_rate + MOVING_FACTOR * num_invocations;
-        current_stats.caller_mem_avg =
-            (1.0 - MOVING_FACTOR) * current_stats.caller_mem_avg + MOVING_FACTOR * caller_mem;
+        if current_stats.global_avg_latency == 0.0 {
+            // First time.
+            current_stats.global_avg_latency = global_avg_latency;
+            current_stats.caller_mem_avg = caller_mem;
+        } else {
+            // Moving average.
+            current_stats.global_avg_latency = (1.0 - MOVING_FACTOR)
+                * current_stats.global_avg_latency
+                + MOVING_FACTOR * global_avg_latency;
+            current_stats.caller_mem_avg =
+                (1.0 - MOVING_FACTOR) * current_stats.caller_mem_avg + MOVING_FACTOR * caller_mem;
+        }
         // Update lambda stats.
-        lambda_exploration.avg_latency /= lambda_exploration.num_points;
-        current_stats.lambda_stats.avg_latency =
-            (1.0 - MOVING_FACTOR) * current_stats.lambda_stats.avg_latency
-                + MOVING_FACTOR * lambda_exploration.avg_latency;
-        current_stats.lambda_stats.num_points += lambda_exploration.num_points;
+        if lambda_exploration.num_points > 0.0 {
+            lambda_exploration.avg_latency /= lambda_exploration.num_points;
+            if current_stats.lambda_stats.num_points == 0.0 {
+                // First time.
+                current_stats.lambda_stats.avg_latency = lambda_exploration.avg_latency;
+            } else {
+                // Moving average.
+                current_stats.lambda_stats.avg_latency = (1.0 - MOVING_FACTOR)
+                    * current_stats.lambda_stats.avg_latency
+                    + MOVING_FACTOR * lambda_exploration.avg_latency;
+            }
+            current_stats.lambda_stats.num_points += 1.0;
+        }
         // Update ecs stats.
         for (mem, exploration) in &mut current_stats.exploration_stats {
-            if let Some(new_exploration) = ecs_explorations.get(&mem) {
+            if let Some(new_exploration) = ecs_explorations.get_mut(&mem) {
                 new_exploration.avg_latency /= new_exploration.num_points;
-                exploration.avg_latency = (1.0 - MOVING_FACTOR) * exploration.avg_latency
-                    + MOVING_FACTOR * new_exploration.avg_latency;
-                exploration.num_points += new_exploration.num_points;
+                if exploration.num_points == 0.0 {
+                    // First time.
+                    exploration.avg_latency = new_exploration.avg_latency;
+                } else {
+                    // Moving average.
+                    exploration.avg_latency = (1.0 - MOVING_FACTOR) * exploration.avg_latency
+                        + MOVING_FACTOR * new_exploration.avg_latency;
+                }
+                exploration.num_points += 1.0;
             }
         }
     }
@@ -262,56 +306,30 @@ impl FunctionalRescaler {
         subsys_state: &SubsystemScalingState,
         handler_scaling_state: &HandlerScalingState,
     ) -> Vec<i32> {
-        // First, compute observed concurrency.
-        let observed_concurrency: f64 = current_stats.user_activity;
         // Prevent pointless oscillations under low usage (defined by magic constants).
+        let global_concurrency: f64 =
+            current_stats.global_avg_latency * current_stats.invocation_rate;
         let min_mem = *current_stats.exploration_stats.keys().min().unwrap();
-        let (target_scale, stable_usage, invoker_coef) =
-            if handler_scaling_state.handler_spec.unique {
-                (1.0, true, 0.0)
-            } else {
-                (
-                    observed_concurrency.ceil(),
-                    observed_concurrency > 0.25,
-                    1.0,
-                )
-            };
-        println!("get_mems_to_explore. observed_concurrency={observed_concurrency}. target_scale={target_scale}.");
+        let (stable_usage, invoker_coef) = if handler_scaling_state.handler_spec.unique {
+            (true, 0.0)
+        } else {
+            (global_concurrency > 0.15, 1.0)
+        };
+        println!("get_mems_to_explore. global_concurrency={global_concurrency}.");
         let mut res = Vec::new();
-        let mut prev_observed_latency = current_stats
-            .exploration_stats
-            .get(&min_mem)
-            .unwrap()
-            .avg_call_latency;
         let mut min_instance_cost: Option<f64> = None;
-        for (mem, exploration) in &current_stats.exploration_stats {
-            // Assume larger instance sizes with missing info will have latency similar to fastest one seen so far.
-            // This assumes iteration is in key order.
-            let observed_latency = if exploration.num_points >= UTILIZATION_NUM_ROUNDS {
-                // Never let avg latency go down.
-                if exploration.avg_call_latency < prev_observed_latency {
-                    prev_observed_latency = exploration.avg_call_latency;
-                    exploration.avg_call_latency
-                } else {
-                    prev_observed_latency
-                }
-            } else {
-                prev_observed_latency
-            };
-            // Avoid oscillations. A drastic reduction is latency may lead to artifially lower user costs when exploring.
-            let upscale = (*mem / min_mem) as f64;
-            // Compute user cost under the observed latency.
-            // Get rid of lambda latency and multiply by call latency. Slightly hacky, but should work.
-            let user_activity_gbsec = (current_stats.user_activity_gbsec
-                / AVG_LAMBDA_OVERHEAD_SECS)
-                * (observed_latency + 0.003);
-            let user_cost = user_activity_gbsec * 0.0000166667 * 3600.0 / upscale;
-            // Compute cost.
-            let (ecs_price, invoker_price) =
+        for (mem, _exploration) in &current_stats.exploration_stats {
+            // Compute expected target scale.
+            let observed_latency =
+                self.get_instance_latency(current_stats, handler_scaling_state, *mem);
+            let expected_concurreny = observed_latency * current_stats.invocation_rate;
+            let target_scale = expected_concurreny.ceil();
+            // Compute costs.
+            let (ecs_price, invoker_price, user_cost) =
                 self.get_instance_cost(&current_stats, subsys_state, handler_scaling_state, *mem);
-            // Total cost
+            // Total cost.
             let total_cost = user_cost + target_scale * ecs_price + invoker_coef * invoker_price;
-            println!("Mem {mem}. Total Cost={total_cost}. User Cost={user_cost}. ECS={ecs_price}. UserActivity={user_activity_gbsec}. OL={observed_latency}.");
+            println!("Mem {mem}. Total Cost={total_cost}. User Cost={user_cost}. ECS={ecs_price}. TS={target_scale}. OL={observed_latency}.");
             if min_instance_cost.is_none() {
                 min_instance_cost = Some(total_cost);
             }
@@ -328,72 +346,15 @@ impl FunctionalRescaler {
         res
     }
 
-    /// Find first instance size that is not over utilized.
+    /// Return the maximum allowable instance.
     fn find_ideal_memory(
         &self,
         _current_stats: &mut FunctionalScalingInfo,
         _handler_scaling_state: &HandlerScalingState,
         to_explore: &[i32],
     ) -> i32 {
-        // // For testing: Just return the maximum allowable memory.
+        // Assumes sorted order.
         return *to_explore.last().unwrap();
-        // let mut previous_mem = None;
-        // let min_mem = *to_explore.first().unwrap();
-        // let max_mem = *to_explore.last().unwrap();
-        // let mut cpu_bound = false;
-        // for mem in to_explore {
-        //     let mem = *mem;
-        //     let exploration = current_stats.exploration_stats.get_mut(&mem).unwrap();
-        //     // Special case: Skip first scale up container if cpu bound.
-        //     if cpu_bound && mem < max_mem && mem == 2 * min_mem {
-        //         continue;
-        //     }
-        //     // Check if enough points have been collected.
-        //     if exploration.num_points < UTILIZATION_NUM_ROUNDS {
-        //         // Use this until more points are collected.
-        //         return mem;
-        //     }
-
-        //     // Check overutilization unless already at max size.
-        //     if mem < max_mem
-        //         && (exploration.avg_cpu_util > UTILIZATION_UPPER_BOUND
-        //             || exploration.avg_mem_util > UTILIZATION_UPPER_BOUND)
-        //     {
-        //         previous_mem = Some(mem);
-        //         cpu_bound = exploration.avg_cpu_util > UTILIZATION_UPPER_BOUND;
-        //         continue;
-        //     }
-        //     // Check underutilization.
-        //     // If underutilized, use previous instance size.
-        //     if exploration.avg_cpu_util < UTILIZATION_LOWER_BOUND
-        //         && exploration.avg_mem_util < UTILIZATION_LOWER_BOUND
-        //     {
-        //         if previous_mem.is_none() {
-        //             // If no smaller size, return.
-        //             return mem;
-        //         }
-        //         // Reset exploration.
-        //         exploration.num_points = 0.0;
-        //         exploration.avg_cpu_util = 0.0;
-        //         exploration.avg_mem_util = 0.0;
-        //         break;
-        //     }
-        //     // Well utilized.
-        //     return mem;
-        // }
-        // if let Some(previous_mem) = previous_mem {
-        //     // Reset exploration.
-        //     let exploration = current_stats
-        //         .exploration_stats
-        //         .get_mut(&previous_mem)
-        //         .unwrap();
-        //     exploration.num_points = 0.0;
-        //     exploration.avg_cpu_util = 0.0;
-        //     exploration.avg_mem_util = 0.0;
-        //     previous_mem
-        // } else {
-        //     min_mem
-        // }
     }
 
     /// Schedule the right shutdowns.
@@ -403,6 +364,7 @@ impl FunctionalRescaler {
         handler_scaling_state: &HandlerScalingState,
         rescaling_result: &mut RescalingResult,
         ideal_mem: Option<i32>,
+        everything: bool,
     ) {
         // Schedule scale downs.
         let handler_scales = rescaling_result.handler_scales.as_mut().unwrap();
@@ -423,36 +385,80 @@ impl FunctionalRescaler {
                 println!("Scheduling for shutdown: {mem}");
                 current_stats
                     .scheduled_scale_downs
-                    .insert(*mem, now + chrono::Duration::minutes(1));
-                continue;
+                    .insert(*mem, now + chrono::Duration::seconds(SCALE_DOWN_DELAY_SECS));
             }
             // If already scheduled, check if should shutdown.
+            // When scaling down to 0, just shutdown everything now.
             let scale_down_time = current_stats.scheduled_scale_downs.get(mem).unwrap();
-            if *scale_down_time < now {
+            if *scale_down_time < now || everything {
                 println!("Actually shutting down: {mem}");
                 handler_scales.insert(*mem, 0);
             }
         }
     }
 
+    /// Get latency.
+    fn get_instance_latency(
+        &self,
+        current_stats: &FunctionalScalingInfo,
+        handler_scaling_state: &HandlerScalingState,
+        mem: i32,
+    ) -> f64 {
+        let ecs_vcpu = (mem / 2) as f64 / 1024.0;
+        let lambda_vcpu = handler_scaling_state.handler_spec.default_mem as f64 / 1769.0;
+        if let Some(exploration) = current_stats.exploration_stats.get(&mem) {
+            if exploration.num_points >= (1.0 / MOVING_FACTOR) {
+                // Enough points to trust.
+                exploration.avg_latency
+            } else {
+                // Find the previous instance type with enough points.
+                let mut prev_latency_vcpu = None;
+                for (other_mem, other_exploration) in &current_stats.exploration_stats {
+                    if *other_mem < mem && other_exploration.num_points >= (1.0 / MOVING_FACTOR) {
+                        let prev_latency = other_exploration.avg_latency;
+                        let prev_vcpu = (*other_mem / 2) as f64 / 1024.0;
+                        prev_latency_vcpu = Some((prev_latency, prev_vcpu));
+                    }
+                }
+                let (prev_latency, prev_vcpu) = if let Some(x) = prev_latency_vcpu {
+                    x
+                } else {
+                    let prev_latency = current_stats.lambda_stats.avg_latency;
+                    (prev_latency, lambda_vcpu)
+                };
+                // Assume semi-linear scaling when not enough points.
+                // This balances between perfect scaling and no scaling.
+                let mut scaling = 1.0 + ((ecs_vcpu - prev_vcpu) / prev_vcpu) / 2.0;
+                if scaling > 2.0 {
+                    scaling = 2.0;
+                }
+                prev_latency / scaling
+            }
+        } else {
+            current_stats.lambda_stats.avg_latency
+        }
+    }
+
+    /// Get instance cost.
+    /// Returns (ecs_compute_price, invoker_price, user_cost).
     fn get_instance_cost(
         &self,
-        _current_stats: &FunctionalScalingInfo,
+        current_stats: &FunctionalScalingInfo,
         subsys_state: &SubsystemScalingState,
         handler_scaling_state: &HandlerScalingState,
         mem: i32,
-    ) -> (f64, f64) {
+    ) -> (f64, f64, f64) {
         // Compute ecs cost.
         let cpus = mem / 2;
         let ecs_mem_gb = mem as f64 / 1024.0;
         let ecs_cpus = cpus as f64 / 1024.0;
-        let ecs_price = if handler_scaling_state.handler_spec.spot {
+        let ecs_compute_price = if handler_scaling_state.handler_spec.spot {
             (0.01234398 * ecs_cpus) + (0.00135546 * ecs_mem_gb)
         } else {
             (0.04048 * ecs_cpus) + (0.004445 * ecs_mem_gb)
         };
         println!(
-            "Instance price {mem}: {ecs_price}. Spot={}!",
+            "Instance price {mem}: {ecs_compute_price}. Spot={}!",
             handler_scaling_state.handler_spec.spot
         );
         // Invoker is only needed for non-unique functions (non-actors).
@@ -464,17 +470,24 @@ impl FunctionalRescaler {
             let invoker_cpus = invoker_specs.cpus as f64 / 1024.0;
             (0.01234398 * invoker_cpus) + (0.00135546 * invoker_mem)
         };
-        return (ecs_price, invoker_price);
+        // Compute user cost.
+        let caller_mem_gb = current_stats.caller_mem_avg / 1024.0;
+        let avg_latency = self.get_instance_latency(current_stats, handler_scaling_state, mem);
+        let user_activity = current_stats.invocation_rate * avg_latency;
+        let user_activity_gbsec = user_activity * caller_mem_gb;
+        let user_cost = user_activity_gbsec * 0.0000166667 * 3600.0;
+        return (ecs_compute_price, invoker_price, user_cost);
     }
 
     /// Summarize current statistics.
+    /// Returns (lambda_price, ecs_compute_price, invoker_price, ecs_user_cost, observed_concurrency).
     fn summarize_stats(
         &self,
         current_stats: &FunctionalScalingInfo,
         subsys_state: &SubsystemScalingState,
         handler_scaling_state: &HandlerScalingState,
         ideal_mem: i32,
-    ) -> (f64, f64, f64, f64) {
+    ) -> (f64, f64, f64, f64, f64) {
         // Compute lambda cost.
         let default_mem_gb = handler_scaling_state.handler_spec.default_mem as f64 / 1024.0;
         let caller_mem_gb = current_stats.caller_mem_avg / 1024.0;
@@ -482,19 +495,28 @@ impl FunctionalRescaler {
         let fn_activity = current_stats.invocation_rate * current_stats.lambda_stats.avg_latency;
         let fn_activity_gbsec = fn_activity * default_mem_gb;
         let fn_compute_cost = fn_activity_gbsec * 0.0000166667 * 3600.0;
-        let fn_user_activity = current_stats.invocation_rate * (current_stats.lambda_stats.avg_latency + AVG_LAMBDA_OVERHEAD_SECS);
+        let fn_user_activity = current_stats.invocation_rate
+            * (current_stats.lambda_stats.avg_latency + AVG_LAMBDA_OVERHEAD_SECS);
         let fn_user_activity_gbsec = fn_user_activity * caller_mem_gb;
         let fn_user_cost = fn_user_activity_gbsec * 0.0000166667 * 3600.0;
         let lambda_price = fn_user_cost + fn_compute_cost + fn_call_cost;
-        let observed_concurrency: f64 = fn_activity;
+        // Compute observed concurrency.
+        let observed_concurrency: f64 =
+            current_stats.global_avg_latency * current_stats.invocation_rate;
         // Compute ecs cost.
-        let (ecs_price, invoker_price) = self.get_instance_cost(
+        let (ecs_compute_price, ecs_invoker_price, ecs_user_cost) = self.get_instance_cost(
             current_stats,
             subsys_state,
             handler_scaling_state,
             ideal_mem,
         );
-        return (lambda_price, ecs_price, invoker_price, observed_concurrency);
+        return (
+            lambda_price,
+            ecs_compute_price,
+            ecs_invoker_price,
+            ecs_user_cost,
+            observed_concurrency,
+        );
     }
 
     /// Mark what to rescale.
@@ -509,7 +531,7 @@ impl FunctionalRescaler {
             rescaling_result.services_scales.insert("invoker".into(), 0);
             return;
         }
-        // Hack to disallow scaling.
+        // Hack to disallow scaling for benchmarks against a lambda baseline.
         if handler_scaling_state.handler_spec.scaleup < -(1e-4) {
             return;
         }
@@ -523,7 +545,7 @@ impl FunctionalRescaler {
             rescaling_result.services_scales.insert("invoker".into(), 1);
             let old_to_deploy = rescaling_result.handler_scales.as_ref().unwrap();
             let old_to_deploy = old_to_deploy.get(&ideal_mem).cloned().unwrap_or(0) as i32;
-            // To guarantee stability around ceil (only go down by at least two).
+            // To guarantee stability around ceil, only go down by at least two.
             if to_deploy > 2 && (to_deploy + 1) == old_to_deploy {
                 to_deploy = old_to_deploy;
             }
@@ -531,6 +553,50 @@ impl FunctionalRescaler {
         // Update scales.
         let handler_scales = rescaling_result.handler_scales.as_mut().unwrap();
         handler_scales.insert(ideal_mem, to_deploy as u64);
+    }
+
+    /// Try using forecasted invocations.
+    fn try_use_forcasted_invocations(&self, current_stats: &mut FunctionalScalingInfo) {
+        if let Some((forecast_start, forecasts)) = &current_stats.forecasted_invocations {
+            // Find index of current time.
+            let now = chrono::Utc::now();
+            let since = now.signed_duration_since(*forecast_start).num_seconds() as f64;
+            let idx = (since / FORECASTING_GRANULARITY_SECS) as usize;
+            // Compute forecast window and lookahead.
+            let forecast_window = 1 + (30.0 / FORECASTING_GRANULARITY_SECS) as usize;
+            if idx + 2 * forecast_window > forecasts.len() {
+                current_stats.forecasted_invocations = None;
+                return;
+            }
+            // Take average invocation rate in the lookahead window.
+            let next_window = &forecasts[(idx + forecast_window)..(idx + 2 * forecast_window)];
+            let forecasted_invocation_rate: f64 =
+                next_window.iter().sum::<f64>() / next_window.len() as f64;
+            // Now find the max forecasted in the current window.
+            let start_idx = if idx > 0 { idx - 1 } else { idx };
+            let curr_window = &forecasts[(start_idx)..(idx + forecast_window)];
+            let max_invocation_rate = curr_window
+                .iter()
+                .max_by(|x, y| x.partial_cmp(y).unwrap())
+                .unwrap();
+            // Set the invocation rate, being careful not to prematurely decrease.
+            if forecasted_invocation_rate > current_stats.invocation_rate {
+                // It's always ok to increase before hand.
+                println!(
+                    "Using forecasted invocation rate (increase): {forecasted_invocation_rate}."
+                );
+                current_stats.invocation_rate = forecasted_invocation_rate;
+            } else {
+                // When decreasing, only do so if the current window is very low.
+                if *max_invocation_rate < forecasted_invocation_rate {
+                    println!("Using forecasted invocation rate (decrease): {forecasted_invocation_rate}.");
+                    current_stats.invocation_rate = forecasted_invocation_rate;
+                } else {
+                    println!("Avoiding forecast decrease. Max={max_invocation_rate}. Forecasted={forecasted_invocation_rate}.");
+                    current_stats.invocation_rate = *max_invocation_rate;
+                }
+            }
+        }
     }
 }
 
@@ -543,11 +609,14 @@ mod tests {
 
     use crate::rescaler::FunctionalScalingInfo;
 
-    use super::{FunctionalMetric, FunctionalRescaler, UTILIZATION_LOWER_BOUND};
+    use super::{FunctionalMetric, FunctionalRescaler, FORECASTING_GRANULARITY_SECS};
     use super::{HandlerScalingState, SubsystemScalingState};
 
+    const HANDLER_MEM: i32 = 1769;
+    const MIN_ECS_MEM: i32 = 2048;
+
     fn test_handler_state(scaleup: f64) -> HandlerScalingState {
-        let mems = container::ContainerDeployment::all_avail_mems(512, scaleup);
+        let mems = container::ContainerDeployment::all_avail_mems(HANDLER_MEM, scaleup);
         HandlerScalingState {
             subsystem: "functional".into(),
             namespace: "functional".into(),
@@ -559,8 +628,8 @@ mod tests {
                 namespace: "functional".into(),
                 name: "echofn".into(),
                 timeout: 10,
-                default_mem: 512,
-                concurrency: 10,
+                default_mem: HANDLER_MEM,
+                concurrency: 1,
                 ephemeral: 512,
                 persistent: false,
                 unique: false,
@@ -596,27 +665,57 @@ mod tests {
         }
     }
 
-    fn test_metrics(num_metrics: usize, mem_size_mb: i32, util: f64) -> Vec<Vec<u8>> {
+    fn test_metrics(num_metrics: usize, mem_size_mb: i32, for_lambda: bool) -> Vec<Vec<u8>> {
         let mut metrics = Vec::new();
-        // Prevent cpu overutilization in test, but allow underutilization.
-        // This is because cpu overutilization has more complex scale up/down.
-        let cpu_usage = if util < UTILIZATION_LOWER_BOUND {
-            util
-        } else {
-            0.5
-        };
+        let util = if for_lambda { None } else { Some(0.5) };
         for _ in 0..num_metrics {
             let metric = FunctionalMetric {
                 duration: std::time::Duration::from_secs(1),
                 mem_size_mb,
-                mem_usage: Some(util),
-                cpu_usage: Some(cpu_usage),
-                caller_mem: 512,
+                mem_usage: util,
+                cpu_usage: util,
+                caller_mem: 1, // Negligible. Makes testing easier.
             };
             let metric = bincode::serialize(&metric).unwrap();
             metrics.push(metric);
         }
         metrics
+    }
+
+    async fn rescale_with_metrics(
+        fn_rescaler: &FunctionalRescaler,
+        handler_state: &mut HandlerScalingState,
+        subsys_state: &mut SubsystemScalingState,
+        metrics: Vec<Vec<u8>>,
+    ) {
+        rescale_with_metrics_and_forecast(fn_rescaler, handler_state, subsys_state, metrics, None)
+            .await;
+    }
+
+    async fn rescale_with_metrics_and_forecast(
+        fn_rescaler: &FunctionalRescaler,
+        handler_state: &mut HandlerScalingState,
+        subsys_state: &mut SubsystemScalingState,
+        mut metrics: Vec<Vec<u8>>,
+        forecast: Option<(chrono::DateTime<chrono::Utc>, Vec<f64>)>,
+    ) {
+        if let Some(forecast) = forecast {
+            let forecast = bincode::serialize(&forecast).unwrap();
+            metrics.push(forecast);
+        }
+        let since_last_rescaling = std::time::Duration::from_secs(10);
+        let rescaling_result = fn_rescaler
+            .rescale(
+                &subsys_state,
+                Some(&handler_state),
+                since_last_rescaling,
+                metrics,
+            )
+            .await;
+        subsys_state.service_scales = rescaling_result.services_scales;
+        subsys_state.scaling_info = rescaling_result.services_scaling_info;
+        handler_state.handler_scales = rescaling_result.handler_scales.unwrap();
+        handler_state.scaling_info = rescaling_result.handler_scaling_info;
     }
 
     fn show_handler_state(prompt: &str, handler_state: &HandlerScalingState) {
@@ -654,78 +753,48 @@ mod tests {
         let fn_rescaler = FunctionalRescaler::new().await;
         let mut subsys_state = test_subsys_state();
         let mut handler_state = test_handler_state(0.0);
-        let since_last_rescaling = std::time::Duration::from_secs(10);
-        let min_mem_mb = 1024;
+        let min_mem_mb = MIN_ECS_MEM;
+        let init_lambda_metrics = test_metrics(10, min_mem_mb, true);
+        rescale_with_metrics(
+            &fn_rescaler,
+            &mut handler_state,
+            &mut subsys_state,
+            init_lambda_metrics,
+        )
+        .await;
         for _ in 0..100 {
-            let metrics = test_metrics(10, min_mem_mb, 0.5);
-            // println!("Before Subsys: {subsys_state:?}");
-            // show_handler_state("Before Handler:", &handler_state);
-            let rescaling_result = fn_rescaler
-                .rescale(
-                    &subsys_state,
-                    Some(&handler_state),
-                    since_last_rescaling,
-                    metrics,
-                )
+            let metrics = test_metrics(10, min_mem_mb, false);
+            rescale_with_metrics(&fn_rescaler, &mut handler_state, &mut subsys_state, metrics)
                 .await;
-            subsys_state.service_scales = rescaling_result.services_scales;
-            subsys_state.scaling_info = rescaling_result.services_scaling_info;
-            handler_state.handler_scales = rescaling_result.handler_scales.unwrap();
-            handler_state.scaling_info = rescaling_result.handler_scaling_info;
-            // println!("After Subsys: {subsys_state:?}");
-            // show_handler_state("Before Handler:", &handler_state);
         }
         println!("After Subsys: {subsys_state:?}");
         show_handler_state("After Handler:", &handler_state);
         let scaling_info = handler_state.scaling_info.as_ref().unwrap();
         let scaling_info: FunctionalScalingInfo = serde_json::from_str(scaling_info).unwrap();
-        assert!(scaling_info.avg_call_rate > 0.9 && scaling_info.avg_call_rate < 1.1);
+        assert!(scaling_info.invocation_rate > 0.9 && scaling_info.invocation_rate < 1.1);
         assert!(subsys_state.service_scales.get("invoker").unwrap() == &1);
         let handler_scales = compute_actual_scales(&handler_state);
         // assert!(handler_scales.get(&512).unwrap() == &1);
         assert!(handler_scales.get(&min_mem_mb).unwrap() == &1); // 1024 is minimum size.
+                                                                 // Now underutilize. Should scale down.
         for _ in 0..100 {
             let metrics = vec![];
-            let rescaling_result = fn_rescaler
-                .rescale(
-                    &subsys_state,
-                    Some(&handler_state),
-                    since_last_rescaling,
-                    metrics,
-                )
+            rescale_with_metrics(&fn_rescaler, &mut handler_state, &mut subsys_state, metrics)
                 .await;
-            subsys_state.service_scales = rescaling_result.services_scales;
-            subsys_state.scaling_info = rescaling_result.services_scaling_info;
-            handler_state.handler_scales = rescaling_result.handler_scales.unwrap();
-            handler_state.scaling_info = rescaling_result.handler_scaling_info;
         }
         println!("After Subsys: {subsys_state:?}");
         show_handler_state("After PostHandler:", &handler_state);
         let scaling_info = handler_state.scaling_info.as_ref().unwrap();
         let scaling_info: FunctionalScalingInfo = serde_json::from_str(scaling_info).unwrap();
-        assert!(scaling_info.avg_call_rate < 0.01);
+        assert!(scaling_info.invocation_rate < 0.01);
         assert!(subsys_state.service_scales.get("invoker").unwrap() == &0);
         let handler_scales = compute_actual_scales(&handler_state);
         assert!(handler_scales.get(&min_mem_mb).unwrap() == &0);
+        // Use concurrently. Should scale out.
         for _ in 0..100 {
-            // Since batching is set to 10, need >100 calls in 10seconds to set target scale to 2.0;
-            let metrics = test_metrics(10 * 15, 512, 0.5);
-            // println!("Before Subsys: {subsys_state:?}");
-            // show_handler_state("Before Handler:", &handler_state);
-            let rescaling_result = fn_rescaler
-                .rescale(
-                    &subsys_state,
-                    Some(&handler_state),
-                    since_last_rescaling,
-                    metrics,
-                )
+            let metrics = test_metrics(20, min_mem_mb, false);
+            rescale_with_metrics(&fn_rescaler, &mut handler_state, &mut subsys_state, metrics)
                 .await;
-            subsys_state.service_scales = rescaling_result.services_scales;
-            subsys_state.scaling_info = rescaling_result.services_scaling_info;
-            handler_state.handler_scales = rescaling_result.handler_scales.unwrap();
-            handler_state.scaling_info = rescaling_result.handler_scaling_info;
-            // println!("After Subsys: {subsys_state:?}");
-            // show_handler_state("Before Handler:", &handler_state);
         }
         println!("After Subsys: {subsys_state:?}");
         show_handler_state("After Handler:", &handler_state);
@@ -734,38 +803,31 @@ mod tests {
         assert!(handler_scales.get(&min_mem_mb).unwrap() == &2);
     }
 
-    /// Increase and decrease utilization to see if scaling happens correctly.
+    /// Test if scale up happens correctly.
     #[tokio::test]
-    async fn basic_usage_test() {
-        run_basic_usage_test().await;
+    async fn basic_scaleup_test() {
+        run_basic_scaleup_test().await;
     }
 
-    async fn run_basic_usage_test() {
+    async fn run_basic_scaleup_test() {
         let fn_rescaler = FunctionalRescaler::new().await;
         let mut subsys_state = test_subsys_state();
         let mut handler_state = test_handler_state(1.0);
-        let since_last_rescaling = std::time::Duration::from_secs(10);
-        let min_mem_mb = 1024;
+        let min_mem_mb = MIN_ECS_MEM;
         let scaled_mem_mb = 2 * min_mem_mb;
+        let init_lambda_metrics = test_metrics(10, min_mem_mb, true);
+        rescale_with_metrics(
+            &fn_rescaler,
+            &mut handler_state,
+            &mut subsys_state,
+            init_lambda_metrics,
+        )
+        .await;
+        // First run without concurrency.
         for _ in 0..100 {
-            // Make overutilized.
-            let metrics = test_metrics(10, min_mem_mb, 1.0);
-            // println!("Before Subsys: {subsys_state:?}");
-            // show_handler_state("Before Handler:", &handler_state);
-            let rescaling_result = fn_rescaler
-                .rescale(
-                    &subsys_state,
-                    Some(&handler_state),
-                    since_last_rescaling,
-                    metrics,
-                )
+            let metrics = test_metrics(10, min_mem_mb, false);
+            rescale_with_metrics(&fn_rescaler, &mut handler_state, &mut subsys_state, metrics)
                 .await;
-            subsys_state.service_scales = rescaling_result.services_scales;
-            subsys_state.scaling_info = rescaling_result.services_scaling_info;
-            handler_state.handler_scales = rescaling_result.handler_scales.unwrap();
-            handler_state.scaling_info = rescaling_result.handler_scaling_info;
-            // println!("After Subsys: {subsys_state:?}");
-            // show_handler_state("Before Handler:", &handler_state);
         }
         println!("After Subsys: {subsys_state:?}");
         show_handler_state("After Handler:", &handler_state);
@@ -773,58 +835,112 @@ mod tests {
         let pre_handler_scales = handler_state.handler_scales.clone();
         let post_handler_scales = compute_actual_scales(&handler_state);
         assert!(pre_handler_scales.get(&min_mem_mb).unwrap() == &1);
-        // assert!(pre_handler_scales.get(&scaled_mem_mb).unwrap() == &1);
+        assert!(pre_handler_scales.get(&scaled_mem_mb).unwrap() == &1);
         assert!(post_handler_scales.get(&min_mem_mb).unwrap() == &0);
-        // assert!(post_handler_scales.get(&scaled_mem_mb).unwrap() == &1);
+        assert!(post_handler_scales.get(&scaled_mem_mb).unwrap() == &1);
         assert!(subsys_state.service_scales.get("invoker").unwrap() == &1);
+        // Now run with more concurrency.
         for _ in 0..100 {
-            // Now make 1024 underutilize. Show scale down to 512MB.
-            // Also set high oberseved concurrency to see if both change.
-            let metrics = test_metrics(1, 2 * min_mem_mb, 0.1);
-            let rescaling_result = fn_rescaler
-                .rescale(
-                    &subsys_state,
-                    Some(&handler_state),
-                    since_last_rescaling,
-                    metrics,
-                )
+            let metrics = test_metrics(20, 2 * min_mem_mb, false);
+            rescale_with_metrics(&fn_rescaler, &mut handler_state, &mut subsys_state, metrics)
                 .await;
-            subsys_state.service_scales = rescaling_result.services_scales;
-            subsys_state.scaling_info = rescaling_result.services_scaling_info;
-            handler_state.handler_scales = rescaling_result.handler_scales.unwrap();
-            handler_state.scaling_info = rescaling_result.handler_scaling_info;
         }
         println!("After Subsys: {subsys_state:?}");
         show_handler_state("After Handler:", &handler_state);
-        // Before scheduled time, both instances should be active. After, only the larger one.
-        let pre_handler_scales = handler_state.handler_scales.clone();
+        // Only The larger instance should scale out.
         let post_handler_scales = compute_actual_scales(&handler_state);
-        assert!(pre_handler_scales.get(&min_mem_mb).unwrap() == &2);
-        assert!(pre_handler_scales.get(&scaled_mem_mb).unwrap() > &0);
-        assert!(post_handler_scales.get(&min_mem_mb).unwrap() == &2);
-        assert!(post_handler_scales.get(&scaled_mem_mb).unwrap() == &0);
+        assert!(post_handler_scales.get(&min_mem_mb).unwrap() == &0);
+        assert!(post_handler_scales.get(&scaled_mem_mb).unwrap() > &1);
         assert!(subsys_state.service_scales.get("invoker").unwrap() == &1);
-        // Now wait for 1 minute. Should shutdown the larger instance.
-        println!("Waiting for scheduled scale downs.");
-        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-        {
-            let metrics = test_metrics(10 * 15, 2 * min_mem_mb, 0.1);
-            let rescaling_result = fn_rescaler
-                .rescale(
-                    &subsys_state,
-                    Some(&handler_state),
-                    since_last_rescaling,
-                    metrics,
-                )
+        // Now underutilize. Should all scale down.
+        for _ in 0..100 {
+            let metrics = vec![];
+            rescale_with_metrics(&fn_rescaler, &mut handler_state, &mut subsys_state, metrics)
                 .await;
-            subsys_state.service_scales = rescaling_result.services_scales;
-            subsys_state.scaling_info = rescaling_result.services_scaling_info;
-            handler_state.handler_scales = rescaling_result.handler_scales.unwrap();
-            handler_state.scaling_info = rescaling_result.handler_scaling_info;
         }
-        let pre_handler_scales = handler_state.handler_scales.clone();
-        assert!(pre_handler_scales.get(&min_mem_mb).unwrap() == &2);
-        assert!(pre_handler_scales.get(&scaled_mem_mb).unwrap() == &0);
-        assert!(subsys_state.service_scales.get("invoker").unwrap() == &1);
+        let post_handler_scales = compute_actual_scales(&handler_state);
+        show_handler_state("After Handler:", &handler_state);
+        assert!(post_handler_scales.get(&min_mem_mb).unwrap() == &0);
+        assert!(post_handler_scales.get(&scaled_mem_mb).unwrap() == &0);
+        println!("After Subsys: {subsys_state:?}");
+        assert!(subsys_state.service_scales.get("invoker").unwrap() == &0);
+    }
+
+    /// Test if forecasting is correct.
+    #[tokio::test]
+    async fn basic_forecast_test() {
+        run_basic_forecast_test().await;
+    }
+
+    async fn run_basic_forecast_test() {
+        let fn_rescaler = FunctionalRescaler::new().await;
+        let mut subsys_state = test_subsys_state();
+        let mut handler_state = test_handler_state(0.0);
+        let min_mem_mb = MIN_ECS_MEM;
+        let init_lambda_metrics = test_metrics(10, min_mem_mb, true);
+        // Pass forecasting data.
+        let now = chrono::Utc::now();
+        // For 2 minutes, forecast 100 invocations per second.
+        let num_points = (2.0 * 60.0 / FORECASTING_GRANULARITY_SECS) as usize;
+        let mut forecasts = vec![100.0; num_points];
+        // For the 2 minutes after, forecast 1 invocations per second.
+        let num_points = (2.0 * 60.0 / FORECASTING_GRANULARITY_SECS) as usize;
+        forecasts.extend(vec![1.0; num_points]);
+        let forecast = (now, forecasts);
+        let forecast = Some(forecast);
+        rescale_with_metrics_and_forecast(
+            &fn_rescaler,
+            &mut handler_state,
+            &mut subsys_state,
+            init_lambda_metrics,
+            forecast,
+        )
+        .await;
+        // The invocation rate should be 100.
+        let scaling_info = handler_state.scaling_info.as_ref().unwrap();
+        let scaling_info: FunctionalScalingInfo = serde_json::from_str(scaling_info).unwrap();
+        assert!(scaling_info.invocation_rate > 99.0 && scaling_info.invocation_rate < 101.0);
+        // Even if I pass specific metrics, the invocation rate should still be 100.0;
+        for _ in 0..100 {
+            let metrics = test_metrics(10, min_mem_mb, false);
+            rescale_with_metrics(&fn_rescaler, &mut handler_state, &mut subsys_state, metrics)
+                .await;
+        }
+        let scaling_info = handler_state.scaling_info.as_ref().unwrap();
+        let scaling_info: FunctionalScalingInfo = serde_json::from_str(scaling_info).unwrap();
+        assert!(scaling_info.invocation_rate > 99.0 && scaling_info.invocation_rate < 101.0);
+        // Wait for next phase to start.
+        println!("Waiting for next phase to start (2 minutes)...");
+        tokio::time::sleep(tokio::time::Duration::from_secs(2 * 60)).await;
+        // At forecast boundary, should avoid decreasing. So still 100.0.
+        rescale_with_metrics(&fn_rescaler, &mut handler_state, &mut subsys_state, vec![]).await;
+        let scaling_info = handler_state.scaling_info.as_ref().unwrap();
+        let scaling_info: FunctionalScalingInfo = serde_json::from_str(scaling_info).unwrap();
+        println!("Scaling info: {scaling_info:?}");
+        assert!(scaling_info.invocation_rate > 99.0 && scaling_info.invocation_rate < 101.0);
+        // Cross boundary.
+        println!("Crossing boundary");
+        tokio::time::sleep(tokio::time::Duration::from_secs_f64(
+            2.0 * FORECASTING_GRANULARITY_SECS,
+        ))
+        .await;
+        // The invocation rate should be 1.0, regardless of the metrics passed in.
+        rescale_with_metrics(&fn_rescaler, &mut handler_state, &mut subsys_state, vec![]).await;
+        let scaling_info = handler_state.scaling_info.as_ref().unwrap();
+        let scaling_info: FunctionalScalingInfo = serde_json::from_str(scaling_info).unwrap();
+        println!("Scaling info: {scaling_info:?}");
+        assert!(scaling_info.invocation_rate > 0.9 && scaling_info.invocation_rate < 1.1);
+        // Wait for forecast to end.
+        println!("Waiting for forecast to end (3 minutes)...");
+        tokio::time::sleep(tokio::time::Duration::from_secs(3 * 60)).await;
+        // Now the metrics should be used.
+        for _ in 0..100 {
+            let metrics = test_metrics(2 * 10, min_mem_mb, false);
+            rescale_with_metrics(&fn_rescaler, &mut handler_state, &mut subsys_state, metrics)
+                .await;
+        }
+        let scaling_info = handler_state.scaling_info.as_ref().unwrap();
+        let scaling_info: FunctionalScalingInfo = serde_json::from_str(scaling_info).unwrap();
+        assert!(scaling_info.invocation_rate > 1.9 && scaling_info.invocation_rate < 2.1);
     }
 }

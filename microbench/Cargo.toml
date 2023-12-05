@@ -13,6 +13,9 @@ persistence = {path="../persistence"}
 common = {path="../common"}
 functional = {path="../functional"}
 async-trait = "*"
+chrono = {version="*", features=["serde"]}
+bincode = "*"
+
 
 [dev-dependencies]
 csv = "*"

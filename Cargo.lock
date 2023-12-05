@@ -1475,6 +1475,8 @@ name = "microbench"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bincode",
+ "chrono",
  "common",
  "csv",
  "functional",

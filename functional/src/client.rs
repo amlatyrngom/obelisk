@@ -491,7 +491,7 @@ mod tests {
     }
 
     async fn run_simple_invoke_test(name: &str, id: Option<usize>) {
-        let fc = super::FunctionalClient::new("functional", name, id, Some(1024)).await;
+        let fc = FunctionalClient::new("functional", name, id, Some(1024)).await;
         let resp = fc.invoke("0.5", b"Ngom").await;
         println!("Resp: {resp:?}");
         // Try invoking rescaler.
