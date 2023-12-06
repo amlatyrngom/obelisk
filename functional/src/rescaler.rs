@@ -17,14 +17,14 @@ pub const SCALE_DOWN_DELAY_SECS: i64 = 60;
 
 /// Exploration stats.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-struct ExplorationStats {
+pub struct ExplorationStats {
     num_points: f64,
     avg_latency: f64,
 }
 
 /// Info to maintain for scaling functions.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-struct FunctionalScalingInfo {
+pub struct FunctionalScalingInfo {
     invocation_rate: f64,
     global_avg_latency: f64,
     caller_mem_avg: f64,
@@ -72,12 +72,12 @@ impl Rescaler for FunctionalRescaler {
         // Read current stats or make new ones.
         let mut current_stats = handler_scaling_state.scaling_info.as_ref().map_or(
             FunctionalScalingInfo {
-                global_avg_latency: 1.0,
+                global_avg_latency: 0.001,
                 invocation_rate: 0.0,
                 caller_mem_avg: 0.0,
                 lambda_stats: ExplorationStats {
                     num_points: 0.0,
-                    avg_latency: 1.0,
+                    avg_latency: 0.001, // 1ms default.
                 },
                 scheduled_scale_downs: BTreeMap::new(),
                 exploration_stats: handler_scaling_state
@@ -88,7 +88,7 @@ impl Rescaler for FunctionalRescaler {
                             *m,
                             ExplorationStats {
                                 num_points: 0.0,
-                                avg_latency: 1.0,
+                                avg_latency: 0.001, // 1ms default.
                             },
                         )
                     })
@@ -563,13 +563,18 @@ impl FunctionalRescaler {
             let since = now.signed_duration_since(*forecast_start).num_seconds() as f64;
             let idx = (since / FORECASTING_GRANULARITY_SECS) as usize;
             // Compute forecast window and lookahead.
+            // Window should be ~30s (beneficial soaking of burst).
+            // Lookahead should be ~60s (pessimistic startup time).
             let forecast_window = 1 + (30.0 / FORECASTING_GRANULARITY_SECS) as usize;
-            if idx + 2 * forecast_window > forecasts.len() {
+            let forecast_lookahead = (60.0 / FORECASTING_GRANULARITY_SECS) as usize;
+            let lookahead_start = idx + forecast_lookahead;
+            let lookahead_end = lookahead_start + forecast_window;
+            if lookahead_end > forecasts.len() {
                 current_stats.forecasted_invocations = None;
                 return;
             }
             // Take average invocation rate in the lookahead window.
-            let next_window = &forecasts[(idx + forecast_window)..(idx + 2 * forecast_window)];
+            let next_window = &forecasts[lookahead_start..lookahead_end];
             let forecasted_invocation_rate: f64 =
                 next_window.iter().sum::<f64>() / next_window.len() as f64;
             // Now find the max forecasted in the current window.
@@ -587,7 +592,7 @@ impl FunctionalRescaler {
                 );
                 current_stats.invocation_rate = forecasted_invocation_rate;
             } else {
-                // When decreasing, only do so if the current window is very low.
+                // Avoid decreasing below the current window.
                 if *max_invocation_rate < forecasted_invocation_rate {
                     println!("Using forecasted invocation rate (decrease): {forecasted_invocation_rate}.");
                     current_stats.invocation_rate = forecasted_invocation_rate;
