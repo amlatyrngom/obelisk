@@ -9,7 +9,7 @@ path = "microbench::MicroFunction"
 mem = 1769
 timeout = 10
 concurrency = 1
-scaleup = 0.0
+scaleup = 1.0
 
 [[handlers]]
 name = "echofn" # Function name

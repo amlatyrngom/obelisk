@@ -19,6 +19,7 @@ mod tests {
     use crate::micro_actor::MicroActorReq;
     use crate::runner::RunnerReq;
     use functional::FunctionalClient;
+    use std::os::unix::thread;
     // use messaging::MessagingClient;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -31,6 +32,7 @@ mod tests {
         is_sim: bool,
         curr_avg_latency: f64,
         desired_requests_per_second: f64,
+        thread_cap: f64,
         fc: Arc<FunctionalClient>,
     }
 
@@ -39,8 +41,12 @@ mod tests {
         async fn send_request_window(&mut self) -> Vec<(Duration, Vec<u8>)> {
             // Window duration.
             let window_duration = 5.0;
-            let num_needed_threads =
+            let mut num_needed_threads =
                 (self.desired_requests_per_second * self.curr_avg_latency).ceil();
+            if num_needed_threads > self.thread_cap {
+                // Use to manually prevent wrong latency estimate from ruining the benchmark.
+                num_needed_threads = self.thread_cap;
+            }
             let total_num_requests = window_duration * self.desired_requests_per_second;
             let requests_per_thread = (total_num_requests / num_needed_threads).ceil();
             let actual_total_num_requests = requests_per_thread * num_needed_threads;
@@ -101,7 +107,7 @@ mod tests {
             }
             let avg_duration = sum_duration.as_secs_f64() / (actual_total_num_requests);
             let factor = 0.75;
-            self.curr_avg_latency = factor * self.curr_avg_latency + (1.0-factor) * avg_duration;
+            self.curr_avg_latency = factor * self.curr_avg_latency + (1.0 - factor) * avg_duration;
             let mut avg_req_latency =
                 all_responses.iter().fold(Duration::from_secs(0), |acc, x| {
                     acc.checked_add(x.0.clone()).unwrap()
@@ -213,9 +219,11 @@ mod tests {
             // Make sure stuff is initialized.
             let _fn_client =
                 Arc::new(FunctionalClient::new("microbench", "microfn", None, Some(512)).await);
-            // let _actor_client = Arc::new(
-            //     FunctionalClient::new("microbench", "microactor", Some(0), Some(512)).await,
-            // );
+            let _actor_client = Arc::new(
+                FunctionalClient::new("microbench", "microactor", Some(0), Some(512)).await,
+            );
+            let _sim_client =
+                Arc::new(FunctionalClient::new("microbench", "simactor", Some(0), Some(512)).await);
         }
         let fc =
             Arc::new(FunctionalClient::new("microbench", "microrunner", None, Some(512)).await);
@@ -309,10 +317,72 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    async fn test_set_forced_deployment() {
+        set_forced_deployment(5.0 * 60.0, 4096, 3, "microbench", "microfn")
+            .await
+            .unwrap();
+    }
+
+    async fn set_forced_deployment(
+        duration_secs: f64,
+        forced_mem: i32,
+        forced_scale: i32,
+        namespace: &str,
+        name: &str,
+    ) -> Result<(), String> {
+        let now = chrono::Utc::now();
+        let expiry_time = now + chrono::Duration::seconds(duration_secs as i64);
+        let forced_deployment = (expiry_time, forced_mem, forced_scale);
+        let forced_deployment = bincode::serialize(&forced_deployment).unwrap();
+        let mm = MetricsManager::new("functional", namespace, name).await;
+        mm.accumulate_metric(forced_deployment).await;
+        mm.push_metrics().await.unwrap();
+        let sm =
+            common::scaling_state::ScalingStateManager::new("functional", namespace, name).await;
+        sm.start_rescaling_thread().await;
+        for _ in 0..10 {
+            match sm.retrieve_scaling_state().await {
+                Err(x) => {
+                    println!("Error: {x:?}. Retrying...");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+                Ok(x) => {
+                    let scaling_info = x.handler_state.unwrap().scaling_info;
+                    if scaling_info.is_none() {
+                        println!("Scaling info not set. Retrying...");
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        continue;
+                    }
+                    let scaling_info = scaling_info.unwrap();
+                    let scaling_info: functional::rescaler::FunctionalScalingInfo =
+                        serde_json::from_str(&scaling_info).unwrap();
+                    let forced_deployment = scaling_info.forced_deployment;
+                    if forced_deployment.is_none() {
+                        println!("Forced deployment not set. Retrying...");
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        continue;
+                    }
+                    let forced_deployment = forced_deployment.unwrap();
+                    if forced_deployment.0 != expiry_time {
+                        println!("Forced deployment corret expiry time not set. Retrying...");
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        continue;
+                    }
+                    println!("Forced deployment set: {:?}.", forced_deployment);
+                    return Ok(());
+                }
+            }
+        }
+        Err("Could not set forced deployment.".to_string())
+    }
+
     async fn run_generated_workload(
         workload: Vec<(f64, f64)>,
         forecasts: (chrono::DateTime<chrono::Utc>, Vec<f64>),
         use_forecast: bool,
+        thread_cap: f64,
     ) {
         let prefix = if use_forecast {
             // TODO: Push forecast metrics.
@@ -338,6 +408,7 @@ mod tests {
             is_sim: false,
             curr_avg_latency: 0.025,
             desired_requests_per_second: 0.0,
+            thread_cap,
             fc: fc.clone(),
         };
 
@@ -367,12 +438,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
     async fn robustness_fn_bench_cloud() {
         let use_forecast = true;
-        let quiet_intensity = 10.0; // 10 requests per second.
+        let quiet_intensity = 4.0; // 4 requests per second.
         let quiet_interval = 60.0 * 5.0;
-        let burst_intensity = 400.0; // 100 requests per second.
-        let shortest_burst_interval = 30.0; // 30 seconds
-        let num_intervals = 4; // 30s, 60s, 120s, 240s.
-                               // Run.
+        let burst_intensity = 400.0; // 400 requests per second.
+        let shortest_burst_interval = 60.0; // 60 seconds
+        let num_intervals = 3; // 60s, 120s, 240s.
+                               // Prevent benchmarker from overadapting. This is manually determined.
+        let thread_cap = if use_forecast { 7.0 + 1e-4 } else { 10.0 };
         let (workload, forecasts) = generate_robustness_workload(
             quiet_intensity,
             quiet_interval,
@@ -381,7 +453,7 @@ mod tests {
             num_intervals,
         )
         .await;
-        run_generated_workload(workload, forecasts, use_forecast).await;
+        run_generated_workload(workload, forecasts, use_forecast, thread_cap).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
@@ -399,6 +471,7 @@ mod tests {
             curr_avg_latency: 0.025,
             desired_requests_per_second: 0.0,
             fc: fc.clone(),
+            thread_cap: 100.0, // Effectively no cap.
         };
         // Low
         request_sender.desired_requests_per_second = low_req_per_secs;
@@ -449,6 +522,7 @@ mod tests {
             curr_avg_latency: 0.020,
             desired_requests_per_second: 0.0,
             fc: fc.clone(),
+            thread_cap: 100.0, // Effectively no cap.
         };
         // Low
         request_sender.desired_requests_per_second = low_req_per_secs;
@@ -499,6 +573,7 @@ mod tests {
             curr_avg_latency: 0.025,
             desired_requests_per_second: 0.0,
             fc: fc.clone(),
+            thread_cap: 100.0, // Effectively no cap.
         };
         // // Low
         // request_sender.desired_requests_per_second = low_req_per_secs;

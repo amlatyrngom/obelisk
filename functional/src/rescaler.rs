@@ -6,10 +6,10 @@ use serde::{Deserialize, Serialize};
 /// Factor for moving average.
 const MOVING_FACTOR: f64 = 0.25;
 /// Overhead of lambda.
-const AVG_LAMBDA_OVERHEAD_SECS: f64 = 0.013;
+const AVG_LAMBDA_OVERHEAD_SECS: f64 = 0.010;
 /// Upscaling for stability. When optimal deployment is too close to two configs,
 /// Oscillating between them leads to much lower performance.
-const UPSCALE_FACTOR: f64 = 1.25;
+const UPSCALE_FACTOR: f64 = 0.25;
 /// Forecasting granularity.
 pub const FORECASTING_GRANULARITY_SECS: f64 = 10.0;
 /// Scale down delay.
@@ -35,6 +35,10 @@ pub struct FunctionalScalingInfo {
     // The datetime is the start of the forecast interval.
     // vec[i] should contain invocatio rate atstart_time + 30s.
     forecasted_invocations: Option<(chrono::DateTime<chrono::Utc>, Vec<f64>)>,
+    // Force a particular deployment type.
+    pub forced_deployment: Option<(chrono::DateTime<chrono::Utc>, i32, i32)>,
+    // Previous forecasted invocation rate. To avoid premature decrease.
+    prev_forecast: f64,
 }
 
 /// Metrics for scaling functions.
@@ -94,6 +98,8 @@ impl Rescaler for FunctionalRescaler {
                     })
                     .collect(),
                 forecasted_invocations: None,
+                forced_deployment: None,
+                prev_forecast: 0.0,
             },
             |s| serde_json::from_str(s).unwrap(),
         );
@@ -104,6 +110,11 @@ impl Rescaler for FunctionalRescaler {
             metrics,
             since_last_rescale.as_secs_f64(),
         );
+        // Check forced deployment.
+        if self.try_use_forced_deployment(&mut rescaling_result, &mut current_stats) {
+            return rescaling_result;
+        }
+        // Check forecasted invocations.
         self.try_use_forcasted_invocations(&mut current_stats);
         // Find ideal mem and summary.
         let to_explore = self.get_mems_to_explore(
@@ -163,14 +174,16 @@ impl Rescaler for FunctionalRescaler {
             );
         }
         // Determines the number of base containers we can deploy in a cost effective manner and still be able to handle the load.
-        let cost_ratio = (lambda_price - invoker_price - ecs_user_cost) / ecs_compute_price;
+        let cost_ratio = ((lambda_price - invoker_price) - ecs_user_cost) / ecs_compute_price;
         let target_scale =
             observed_concurrency / handler_scaling_state.handler_spec.concurrency as f64;
         let mut target_scale = target_scale;
-        if target_scale > 2.0 {
-            // Hack to prevent oscillations around ideal concurency.
-            // At this point, ECS is so much cheaper than Lambda that extra deployments are ok.
-            target_scale = target_scale * UPSCALE_FACTOR;
+        // Hack to prevent oscillations around ideal concurency.
+        // At this point, ECS is so much cheaper than Lambda that extra deployments are ok.
+        if target_scale > 4.0 {
+            target_scale = target_scale * (1.0 + 2.0 * UPSCALE_FACTOR);
+        } else if target_scale > 2.0 {
+            target_scale = target_scale * (1.0 + 1.0 * UPSCALE_FACTOR);
         }
         let to_deploy: f64 = if cost_ratio.floor() > target_scale.ceil() {
             target_scale.ceil()
@@ -178,6 +191,7 @@ impl Rescaler for FunctionalRescaler {
             cost_ratio.floor()
         };
         let to_deploy = to_deploy as i32;
+
         self.mark_rescaling(
             &mut rescaling_result,
             &handler_scaling_state,
@@ -219,6 +233,12 @@ impl FunctionalRescaler {
                 bincode::deserialize::<(chrono::DateTime<chrono::Utc>, Vec<f64>)>(metric)
             {
                 current_stats.forecasted_invocations = Some(forecast);
+                continue;
+            }
+            if let Ok(forced_deployment) =
+                bincode::deserialize::<(chrono::DateTime<chrono::Utc>, i32, i32)>(metric)
+            {
+                current_stats.forced_deployment = Some(forced_deployment);
                 continue;
             }
             let metric: FunctionalMetric = bincode::deserialize(metric).unwrap();
@@ -557,6 +577,16 @@ impl FunctionalRescaler {
 
     /// Try using forecasted invocations.
     fn try_use_forcasted_invocations(&self, current_stats: &mut FunctionalScalingInfo) {
+        let median_fn = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let mid = v.len() / 2;
+            if v.len() % 2 == 0 {
+                (v[mid] + v[mid - 1]) / 2.0
+            } else {
+                v[mid]
+            }
+        };
+
         if let Some((forecast_start, forecasts)) = &current_stats.forecasted_invocations {
             // Find index of current time.
             let now = chrono::Utc::now();
@@ -573,35 +603,74 @@ impl FunctionalRescaler {
                 current_stats.forecasted_invocations = None;
                 return;
             }
-            // Take average invocation rate in the lookahead window.
+            // Take median invocation rate in the lookahead window.
             let next_window = &forecasts[lookahead_start..lookahead_end];
-            let forecasted_invocation_rate: f64 =
-                next_window.iter().sum::<f64>() / next_window.len() as f64;
-            // Now find the max forecasted in the current window.
+            let forecasted_invocation_rate: f64 = median_fn(next_window.to_vec());
+            // Now find the max forecasted in the current time up to the start of the lookahead window.
             let start_idx = if idx > 0 { idx - 1 } else { idx };
-            let curr_window = &forecasts[(start_idx)..(idx + forecast_window)];
+            let curr_window = &forecasts[(start_idx)..lookahead_start];
             let max_invocation_rate = curr_window
                 .iter()
                 .max_by(|x, y| x.partial_cmp(y).unwrap())
                 .unwrap();
             // Set the invocation rate, being careful not to prematurely decrease.
             if forecasted_invocation_rate > current_stats.invocation_rate {
-                // It's always ok to increase before hand.
+                // It's always ok to increase.
                 println!(
                     "Using forecasted invocation rate (increase): {forecasted_invocation_rate}."
                 );
                 current_stats.invocation_rate = forecasted_invocation_rate;
+                current_stats.prev_forecast = forecasted_invocation_rate;
             } else {
-                // Avoid decreasing below the current window.
-                if *max_invocation_rate < forecasted_invocation_rate {
-                    println!("Using forecasted invocation rate (decrease): {forecasted_invocation_rate}.");
-                    current_stats.invocation_rate = forecasted_invocation_rate;
+                // Only decrease if the current window is lower than any previous increase.
+                if *max_invocation_rate < current_stats.prev_forecast {
+                    println!("Invocation rate can decrease (decrease): {max_invocation_rate}.");
+                    current_stats.invocation_rate = *max_invocation_rate;
+                    current_stats.prev_forecast = forecasted_invocation_rate;
                 } else {
                     println!("Avoiding forecast decrease. Max={max_invocation_rate}. Forecasted={forecasted_invocation_rate}.");
-                    current_stats.invocation_rate = *max_invocation_rate;
+                    current_stats.invocation_rate = current_stats.prev_forecast;
                 }
             }
         }
+    }
+
+    /// Try using forced deployment.
+    fn try_use_forced_deployment(
+        &self,
+        rescaling_result: &mut RescalingResult,
+        current_stats: &mut FunctionalScalingInfo,
+    ) -> bool {
+        let (forced_mem, forced_scale) = if let Some((expiry_time, forced_mem, forced_scale)) =
+            current_stats.forced_deployment.clone()
+        {
+            if expiry_time < chrono::Utc::now() {
+                // Expired.
+                current_stats.forced_deployment = None;
+                return false;
+            } else {
+                (forced_mem, forced_scale)
+            }
+        } else {
+            // No forced deployment.
+            return false;
+        };
+        // Set invoker to 1.
+        rescaling_result.services_scales.insert("invoker".into(), 1);
+        // Set all handler scales to 0 except forced mem.
+        let handler_scales = rescaling_result.handler_scales.as_mut().unwrap();
+        for (mem, _) in &current_stats.exploration_stats {
+            if *mem == forced_mem {
+                handler_scales.insert(*mem, forced_scale as u64);
+            } else {
+                handler_scales.insert(*mem, 0);
+            }
+        }
+        // Set scaling info.
+        rescaling_result.handler_scaling_info =
+            Some(serde_json::to_string(&current_stats).unwrap());
+
+        true
     }
 }
 
@@ -780,8 +849,8 @@ mod tests {
         assert!(subsys_state.service_scales.get("invoker").unwrap() == &1);
         let handler_scales = compute_actual_scales(&handler_state);
         // assert!(handler_scales.get(&512).unwrap() == &1);
-        assert!(handler_scales.get(&min_mem_mb).unwrap() == &1); // 1024 is minimum size.
-                                                                 // Now underutilize. Should scale down.
+        assert!(handler_scales.get(&min_mem_mb).unwrap() == &1);
+        // Now underutilize. Should scale down.
         for _ in 0..100 {
             let metrics = vec![];
             rescale_with_metrics(&fn_rescaler, &mut handler_state, &mut subsys_state, metrics)
@@ -947,5 +1016,75 @@ mod tests {
         let scaling_info = handler_state.scaling_info.as_ref().unwrap();
         let scaling_info: FunctionalScalingInfo = serde_json::from_str(scaling_info).unwrap();
         assert!(scaling_info.invocation_rate > 1.9 && scaling_info.invocation_rate < 2.1);
+    }
+
+    /// Test if forecasting is correct.
+    #[tokio::test]
+    async fn basic_forced_deployment_test() {
+        run_basic_forced_deployment_test().await;
+    }
+
+    async fn run_basic_forced_deployment_test() {
+        let fn_rescaler = FunctionalRescaler::new().await;
+        let mut subsys_state = test_subsys_state();
+        // Scale up should be small to go down to smallest mem after expiry.
+        let mut handler_state = test_handler_state(0.01);
+        let min_mem_mb = MIN_ECS_MEM;
+        let forced_scale = 7;
+        let forced_mem_mb = 4 * min_mem_mb;
+        let init_lambda_metrics = test_metrics(10, min_mem_mb, true);
+        rescale_with_metrics(
+            &fn_rescaler,
+            &mut handler_state,
+            &mut subsys_state,
+            init_lambda_metrics,
+        )
+        .await;
+        // Passed forced deployment. Expiry is 1 minute from now.
+        let now = chrono::Utc::now();
+        let expiry_time = now + chrono::Duration::seconds(60);
+        let forced_deployment = (expiry_time, forced_mem_mb, forced_scale);
+        let forced_deployment = bincode::serialize(&forced_deployment).unwrap();
+        let metrics = vec![forced_deployment];
+        rescale_with_metrics(&fn_rescaler, &mut handler_state, &mut subsys_state, metrics).await;
+        // The scale should be 7 with forced_mem.
+        let scaling_info = handler_state.scaling_info.as_ref().unwrap();
+        let scaling_info: FunctionalScalingInfo = serde_json::from_str(scaling_info).unwrap();
+        println!("Forced scaling info: {scaling_info:?}");
+        let handler_scales = compute_actual_scales(&handler_state);
+        assert!(handler_scales.get(&min_mem_mb).unwrap() == &0);
+        assert!(handler_scales.get(&forced_mem_mb).unwrap() == &forced_scale);
+        assert!(subsys_state.service_scales.get("invoker").unwrap() == &1);
+        // Even with other metrics, the scale should still be 7 with forced_mem.
+        for _ in 0..100 {
+            let metrics = test_metrics(10, min_mem_mb, false);
+            rescale_with_metrics(&fn_rescaler, &mut handler_state, &mut subsys_state, metrics)
+                .await;
+        }
+        let scaling_info = handler_state.scaling_info.as_ref().unwrap();
+        let scaling_info: FunctionalScalingInfo = serde_json::from_str(scaling_info).unwrap();
+        println!("Forced scaling info: {scaling_info:?}");
+        let handler_scales = compute_actual_scales(&handler_state);
+        assert!(handler_scales.get(&min_mem_mb).unwrap() == &0);
+        assert!(handler_scales.get(&forced_mem_mb).unwrap() == &forced_scale);
+        assert!(subsys_state.service_scales.get("invoker").unwrap() == &1);
+        // Now wait for expiry.
+        println!("Waiting for expiry (1 minute + 5 seconds)...");
+        tokio::time::sleep(tokio::time::Duration::from_secs(60 + 5)).await;
+        // Pass in metrics.
+        for _ in 0..100 {
+            let metrics = test_metrics(10, min_mem_mb, false);
+            rescale_with_metrics(&fn_rescaler, &mut handler_state, &mut subsys_state, metrics)
+                .await;
+        }
+        // The scale should be 1 with min_mem.
+        let scaling_info = handler_state.scaling_info.as_ref().unwrap();
+        let scaling_info: FunctionalScalingInfo = serde_json::from_str(scaling_info).unwrap();
+        println!("Forced scaling info: {scaling_info:?}");
+        let handler_scales = compute_actual_scales(&handler_state);
+        println!("Handler scales: {handler_scales:?}");
+        assert!(handler_scales.get(&min_mem_mb).unwrap() == &1);
+        assert!(handler_scales.get(&forced_mem_mb).unwrap() == &0);
+        assert!(subsys_state.service_scales.get("invoker").unwrap() == &1);
     }
 }
