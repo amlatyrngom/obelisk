@@ -90,12 +90,12 @@ impl Invoker {
             workers: HashMap::new(),
         }));
         // Make lambda client.
-        let shared_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        let shared_config = aws_config::load_from_env().await;
         let lambda_client = aws_sdk_lambda::Client::new(&shared_config);
         // Make direct client.
         let direct_client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_millis(10)) // Same region, so should be small.
-            .timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(1))
             .build()
             .unwrap();
         // Finalize.
@@ -124,6 +124,7 @@ impl Invoker {
         let resp = self
             .direct_client
             .post(url)
+            .timeout(std::time::Duration::from_secs(1)) // TODO: Set to correct value
             .header("Content-Type", "application/octect-stream")
             .header("content-length", payload.len())
             .header("obelisk-meta", meta)
@@ -162,7 +163,7 @@ impl Invoker {
                 .iter_mut()
                 .filter(|(_, w)| {
                     w.avail_concurrency > 0
-                        && now.signed_duration_since(w.join_time).num_seconds() > 20
+                        && now.signed_duration_since(w.join_time).num_seconds() > 30
                 })
                 .map(|(_, w)| w)
                 .collect::<Vec<_>>();
