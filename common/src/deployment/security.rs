@@ -10,7 +10,7 @@ pub struct SecurityDeployment {
 
 impl SecurityDeployment {
     pub async fn new() -> Self {
-        let shared_config = aws_config::load_from_env().await;
+        let shared_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let iam_client = aws_sdk_iam::Client::new(&shared_config);
         let (lambda_role_arn, ecs_role_arn) = Self::get_role(&iam_client).await;
         SecurityDeployment {
@@ -28,17 +28,15 @@ impl SecurityDeployment {
             .send()
             .await
             .unwrap();
-        let mut role = if let Some(roles) = roles.roles() {
+        let mut role = {
             let mut role = None;
-            for r in roles.iter() {
-                if r.role_name().unwrap() == LAMBDA_ROLE {
+            for r in roles.roles().iter() {
+                if r.role_name() == LAMBDA_ROLE {
                     role = Some(r.clone());
                     break;
                 }
             }
             role
-        } else {
-            None
         };
         if role.is_none() {
             println!("Making lambda role...");
@@ -58,7 +56,7 @@ impl SecurityDeployment {
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         }
         let role = role.unwrap();
-        (role.role_name().unwrap().into(), role.arn().unwrap().into())
+        (role.role_name().into(), role.arn().into())
     }
 
     /// Get ecs role name and arn.
@@ -70,17 +68,15 @@ impl SecurityDeployment {
             .send()
             .await
             .unwrap();
-        let mut role = if let Some(roles) = roles.roles() {
+        let mut role = {
             let mut role = None;
-            for r in roles.iter() {
-                if r.role_name().unwrap() == ECS_ROLE {
+            for r in roles.roles().iter() {
+                if r.role_name() == ECS_ROLE {
                     role = Some(r.clone());
                     break;
                 }
             }
             role
-        } else {
-            None
         };
         if role.is_none() {
             println!("Making ECS role...");
@@ -100,7 +96,7 @@ impl SecurityDeployment {
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         }
         let role = role.unwrap();
-        (role.role_name().unwrap().into(), role.arn().unwrap().into())
+        (role.role_name().into(), role.arn().into())
     }
 
     /// Get access policy.
@@ -112,17 +108,15 @@ impl SecurityDeployment {
             .send()
             .await
             .unwrap();
-        let mut policy = if let Some(policies) = policies.policies() {
+        let mut policy = {
             let mut policy = None;
-            for p in policies.iter() {
+            for p in policies.policies().iter() {
                 if p.policy_name().unwrap() == POLICY {
                     policy = Some(p.clone());
                     break;
                 }
             }
             policy
-        } else {
-            None
         };
         if policy.is_none() {
             println!("Making IAM policy...");

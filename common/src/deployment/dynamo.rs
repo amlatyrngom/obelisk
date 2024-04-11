@@ -50,25 +50,29 @@ impl DynamoDeployment {
                     KeySchemaElement::builder()
                         .attribute_name("subsystem")
                         .key_type(KeyType::Hash)
-                        .build(),
+                        .build()
+                        .unwrap(),
                 )
                 .key_schema(
                     KeySchemaElement::builder()
                         .attribute_name("identifier")
                         .key_type(KeyType::Range)
-                        .build(),
+                        .build()
+                        .unwrap(),
                 )
                 .attribute_definitions(
                     AttributeDefinition::builder()
                         .attribute_name("subsystem")
                         .attribute_type(ScalarAttributeType::S)
-                        .build(),
+                        .build()
+                        .unwrap(),
                 )
                 .attribute_definitions(
                     AttributeDefinition::builder()
                         .attribute_name("identifier")
                         .attribute_type(ScalarAttributeType::S)
-                        .build(),
+                        .build()
+                        .unwrap(),
                 )
                 .send()
                 .await
@@ -92,7 +96,8 @@ impl DynamoDeployment {
                 TimeToLiveSpecification::builder()
                     .attribute_name("gc_ttl")
                     .enabled(true)
-                    .build(),
+                    .build()
+                    .unwrap(),
             )
             .send()
             .await

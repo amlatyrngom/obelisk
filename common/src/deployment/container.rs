@@ -80,7 +80,7 @@ impl ContainerDeployment {
     ) {
         let task_def_name =
             Self::service_task_def_name(&spec.namespace, &spec.name, target_namespace.clone());
-        let region = client.conf().region().unwrap().to_string();
+        let region = client.config().region().unwrap().to_string();
         // Create new definition.
         let task_def = client
             .register_task_definition()
@@ -104,7 +104,8 @@ impl ContainerDeployment {
                                     .build(),
                             )
                             .transit_encryption(aws_sdk_ecs::types::EfsTransitEncryption::Enabled)
-                            .build(),
+                            .build()
+                            .unwrap(),
                     )
                     .build(),
             );
@@ -126,7 +127,8 @@ impl ContainerDeployment {
                     .name(aws_sdk_ecs::types::UlimitName::Nofile)
                     .soft_limit(10000)
                     .hard_limit(10000)
-                    .build(),
+                    .build()
+                    .unwrap(),
             )
             .mount_points(
                 aws_sdk_ecs::types::MountPoint::builder()
@@ -141,7 +143,8 @@ impl ContainerDeployment {
                     .options("awslogs-create-group", "true")
                     .options("awslogs-region", &region)
                     .options("awslogs-stream-prefix", task_def_name)
-                    .build(),
+                    .build()
+                    .unwrap(),
             )
             .environment(
                 KeyValuePair::builder()
@@ -207,7 +210,7 @@ impl ContainerDeployment {
     ) {
         let mem_str = Self::mem_mb_to_str(mem);
         let task_def_name = Self::handler_task_def_name(&spec.namespace, &spec.name, &mem_str);
-        let region = client.conf().region().unwrap().to_string();
+        let region = client.config().region().unwrap().to_string();
         // Create new definition.
         let mut task_def = client
             .register_task_definition()
@@ -232,7 +235,8 @@ impl ContainerDeployment {
                                     .build(),
                             )
                             .transit_encryption(aws_sdk_ecs::types::EfsTransitEncryption::Enabled)
-                            .build(),
+                            .build()
+                            .unwrap(),
                     )
                     .build(),
             );
@@ -256,7 +260,8 @@ impl ContainerDeployment {
                     .name(aws_sdk_ecs::types::UlimitName::Nofile)
                     .soft_limit(10000)
                     .hard_limit(10000)
-                    .build(),
+                    .build()
+                    .unwrap(),
             )
             .log_configuration(
                 aws_sdk_ecs::types::LogConfiguration::builder()
@@ -265,7 +270,8 @@ impl ContainerDeployment {
                     .options("awslogs-create-group", "true")
                     .options("awslogs-region", &region)
                     .options("awslogs-stream-prefix", task_def_name)
-                    .build(),
+                    .build()
+                    .unwrap(),
             )
             .environment(
                 KeyValuePair::builder()
@@ -451,7 +457,7 @@ impl ContainerDeployment {
         for subnet_id in subnet_ids {
             vpc_config = vpc_config.subnets(subnet_id);
         }
-        let vpc_config = vpc_config.build();
+        let vpc_config = vpc_config.build().unwrap();
         let identifier_tag = aws_sdk_ecs::types::Tag::builder()
             .key("OBK_IDENTIFIER")
             .value(identifier)
@@ -476,7 +482,8 @@ impl ContainerDeployment {
                     .capacity_provider("FARGATE_SPOT")
                     .weight(1)
                     .base(0)
-                    .build(),
+                    .build()
+                    .unwrap(),
             )
             .tags(identifier_tag)
             .tags(ns_tag)
@@ -553,7 +560,7 @@ impl ContainerDeployment {
         for subnet_id in subnet_ids {
             vpc_config = vpc_config.subnets(subnet_id);
         }
-        let vpc_config = vpc_config.build();
+        let vpc_config = vpc_config.build().unwrap();
         let identifier_tag = aws_sdk_ecs::types::Tag::builder()
             .key("OBK_IDENTIFIER")
             .value(identifier)
@@ -574,7 +581,8 @@ impl ContainerDeployment {
                     .capacity_provider(provider)
                     .weight(1)
                     .base(0)
-                    .build(),
+                    .build()
+                    .unwrap(),
             )
             .tags(identifier_tag)
             .propagate_tags(aws_sdk_ecs::types::PropagateTags::Service);
@@ -606,7 +614,8 @@ impl ContainerDeployment {
                         .capacity_provider(provider)
                         .weight(1)
                         .base(0)
-                        .build(),
+                        .build()
+                        .unwrap(),
                 )
                 .propagate_tags(aws_sdk_ecs::types::PropagateTags::Service)
                 .send()

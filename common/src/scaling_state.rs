@@ -166,7 +166,7 @@ impl ScalingStateManager {
 
     /// Periodically call the rescaler.
     async fn rescaling_thread(&self) {
-        let shared_config = aws_config::load_from_env().await;
+        let shared_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let lambda_client = aws_sdk_lambda::Client::new(&shared_config);
         let duration = std::time::Duration::from_secs(RESCALING_INTERVAL_SECS);
         let mut interval = tokio::time::interval(duration);
@@ -272,7 +272,7 @@ impl ScalingStateManager {
 
     /// Create.
     pub async fn new(subsystem: &str, namespace: &str, identifier: &str) -> Self {
-        let shared_config = aws_config::load_from_env().await;
+        let shared_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let dynamo_client = aws_sdk_dynamodb::Client::new(&shared_config);
         let scaling_table = deployment::dynamo::DynamoDeployment::scaling_table_name(namespace);
         let leaser: Leaser = Leaser::new(&scaling_table).await;

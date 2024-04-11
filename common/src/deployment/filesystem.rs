@@ -1,5 +1,3 @@
-use aws_sdk_efs::types::FileSystemDescription;
-
 pub struct FilesystemDeployment {}
 
 impl FilesystemDeployment {
@@ -45,8 +43,8 @@ impl FilesystemDeployment {
                     .await
                     .unwrap();
                 let mut avail = true;
-                for mt in mts.mount_targets().unwrap() {
-                    let lf = mt.life_cycle_state().unwrap();
+                for mt in mts.mount_targets() {
+                    let lf = mt.life_cycle_state();
                     match lf {
                         aws_sdk_efs::types::LifeCycleState::Available => {}
                         _ => {
@@ -80,12 +78,10 @@ impl FilesystemDeployment {
             .await;
 
         if let Ok(ap_info) = ap_info {
-            if let Some(ap_info) = ap_info.access_points() {
-                if !ap_info.is_empty() {
-                    let ap_id = ap_info.first().unwrap().access_point_id().unwrap();
-                    let ap_arn = ap_info.first().unwrap().access_point_arn().unwrap();
-                    return (ap_id.into(), ap_arn.into());
-                }
+            if let Some(ap_info) = ap_info.access_points().first() {
+                let ap_id = ap_info.access_point_id().unwrap();
+                let ap_arn = ap_info.access_point_arn().unwrap();
+                return (ap_id.into(), ap_arn.into());
             }
         }
 
@@ -100,7 +96,8 @@ impl FilesystemDeployment {
                             .owner_gid(1001)
                             .owner_uid(1001)
                             .permissions("755")
-                            .build(),
+                            .build()
+                            .unwrap(),
                     )
                     .build(),
             )
@@ -108,7 +105,8 @@ impl FilesystemDeployment {
                 aws_sdk_efs::types::PosixUser::builder()
                     .uid(1001)
                     .gid(1001)
-                    .build(),
+                    .build()
+                    .unwrap(),
             )
             .client_token(&fs_name)
             .send()
@@ -123,7 +121,6 @@ impl FilesystemDeployment {
                 .await
                 .unwrap()
                 .access_points()
-                .unwrap()
                 .first()
                 .unwrap()
                 .clone();
@@ -156,16 +153,13 @@ impl FilesystemDeployment {
             }
             let fs_info = fs_info.send().await.unwrap();
             marker = fs_info.next_marker().map(|x| x.to_string());
-            let fs_info: Vec<FileSystemDescription> =
-                fs_info.file_systems().map_or(vec![], |f| f.into());
+            let fs_info = fs_info.file_systems();
             if fs_info.is_empty() {
                 break;
             }
             for fs in fs_info {
-                if fs.creation_token().unwrap_or("") == fs_name
-                    && fs.name().unwrap_or("") == fs_name
-                {
-                    return fs.file_system_id().unwrap().into();
+                if fs.creation_token() == fs_name && fs.name().unwrap_or("") == fs_name {
+                    return fs.file_system_id().into();
                 }
             }
             if marker.is_none() {
@@ -178,7 +172,8 @@ impl FilesystemDeployment {
                 aws_sdk_efs::types::Tag::builder()
                     .key("Name")
                     .value(&fs_name)
-                    .build(),
+                    .build()
+                    .unwrap(),
             )
             .performance_mode(aws_sdk_efs::types::PerformanceMode::GeneralPurpose)
             .creation_token(&fs_name)
@@ -194,14 +189,13 @@ impl FilesystemDeployment {
                 .await
                 .unwrap()
                 .file_systems()
-                .unwrap()
                 .first()
                 .unwrap()
                 .clone();
-            let state = fs_info.life_cycle_state().unwrap();
+            let state = fs_info.life_cycle_state();
             match state {
                 aws_sdk_efs::types::LifeCycleState::Available => {
-                    return fs_info.file_system_id().unwrap().into();
+                    return fs_info.file_system_id().into();
                 }
                 _ => {
                     println!("Waiting for EFS...");

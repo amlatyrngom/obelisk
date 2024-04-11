@@ -102,7 +102,7 @@ pub struct AdapterScaling {
 
 impl AdapterScaling {
     pub async fn new(rescaler: Option<Arc<dyn Rescaler>>, subsystem: &str) -> AdapterScaling {
-        let shared_config = aws_config::load_from_env().await;
+        let shared_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let sqs_client = aws_sdk_sqs::Client::new(&shared_config);
         let dynamo_client = aws_sdk_dynamodb::Client::new(&shared_config);
         let scaling_table = scaling_table_name(subsystem);

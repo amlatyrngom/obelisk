@@ -88,7 +88,7 @@ impl Deployment {
 
     /// Create a deployer.
     pub async fn new() -> Self {
-        let shared_config = aws_config::load_from_env().await;
+        let shared_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         // Security.
         let security_deployment = security::SecurityDeployment::new().await;
         let lambda_role_arn = security_deployment.lambda_role_arn;
@@ -375,9 +375,11 @@ impl Deployment {
                             )
                             .filter(aws_sdk_s3::types::LifecycleRuleFilter::Prefix(tmp_s3_dir()))
                             .status(aws_sdk_s3::types::ExpirationStatus::Enabled)
-                            .build(),
+                            .build()
+                            .unwrap(),
                     )
-                    .build(),
+                    .build()
+                    .unwrap(),
             )
             .send()
             .await;

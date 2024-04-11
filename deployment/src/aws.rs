@@ -11,7 +11,7 @@ fn full_image_name(namespace: &str) -> String {
 impl AWS {
     /// Create.
     pub async fn new() -> Self {
-        let shared_config = aws_config::load_from_env().await;
+        let shared_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let public_ecr_config = aws_sdk_ecrpublic::config::Builder::from(&shared_config)
             .region(aws_types::region::Region::new("us-east-1"))
             .build();
@@ -42,10 +42,7 @@ impl AWS {
                     .send()
                     .await
                     .unwrap();
-                res.repositories().unwrap()[0]
-                    .repository_uri()
-                    .unwrap()
-                    .into()
+                res.repositories()[0].repository_uri().unwrap().into()
             }
         };
         let res = self
@@ -64,10 +61,7 @@ impl AWS {
                     .send()
                     .await
                     .unwrap();
-                res.repositories().unwrap()[0]
-                    .repository_uri()
-                    .unwrap()
-                    .into()
+                res.repositories()[0].repository_uri().unwrap().into()
             }
         };
 

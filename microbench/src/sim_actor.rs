@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-use async_trait::async_trait;
 use common::{HandlerKit, ScalingState, ServerlessHandler};
 
 pub struct SimActor {
@@ -32,7 +31,7 @@ impl SimActor {
 
 #[async_trait::async_trait]
 impl ServerlessHandler for SimActor {
-    async fn handle(&self, meta: String, payload: Vec<u8>) -> (String, Vec<u8>) {
+    async fn handle(&self, meta: String, _payload: Vec<u8>) -> (String, Vec<u8>) {
         // Simulate work.
         tokio::time::sleep(self.sleep_time.clone()).await;
         (meta, self.metadata.clone())

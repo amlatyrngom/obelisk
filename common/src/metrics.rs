@@ -51,7 +51,7 @@ impl MetricsManager {
 
     /// Create.
     pub async fn new(subsystem: &str, namespace: &str, identifier: &str) -> Self {
-        let shared_config = aws_config::load_from_env().await;
+        let shared_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let s3_client = aws_sdk_s3::Client::new(&shared_config);
         let inner = Arc::new(Mutex::new(MetricsManagerInner {
             curr_metrics: Vec::new(),
@@ -143,7 +143,7 @@ impl MetricsManager {
             .send()
             .await
             .map_err(|e| format!("{e:?}"))?;
-        let objs = resp.contents().unwrap_or_else(|| &[]);
+        let objs = resp.contents();
         let keys = objs
             .iter()
             .map(|obj| obj.key().unwrap().to_string())

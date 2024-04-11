@@ -83,7 +83,7 @@ impl ServerlessWrapper {
         serverless_storage: Option<Arc<ServerlessStorage>>,
         handler: Arc<dyn ServerlessHandler>,
     ) -> Self {
-        let shared_config = aws_config::load_from_env().await;
+        let shared_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let s3_client = aws_sdk_s3::Client::new(&shared_config);
         let time_service = TimeService::new().await;
         let join_time = time_service.current_time().await;
@@ -378,7 +378,7 @@ impl ServerlessWrapper {
             .send()
             .await
             .map_err(|e| format!("{e:?}"))?;
-        let objs = resp.contents().unwrap_or(&[]);
+        let objs = resp.contents();
         let keys = objs
             .iter()
             .map(|obj| obj.key().unwrap().to_string())
@@ -500,7 +500,7 @@ impl InstanceInfo {
 
     /// Get instance info for containers.
     async fn container_new() -> Result<InstanceInfo, String> {
-        let shared_config = aws_config::load_from_env().await;
+        let shared_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let ecs_client = aws_sdk_ecs::Client::new(&shared_config);
         // Read mem and cpus.
         let mem: i32 = std::env::var("OBK_MEMORY").unwrap().parse().unwrap();
@@ -556,8 +556,8 @@ impl InstanceInfo {
             .send()
             .await
             .map_err(debug_format!())?;
-        let task = task.tasks().unwrap().first().unwrap();
-        let tags = task.tags().unwrap();
+        let task = task.tasks().first().unwrap();
+        let tags = task.tags();
         println!("Found Tags: {tags:?}");
         let tag = tags
             .iter()

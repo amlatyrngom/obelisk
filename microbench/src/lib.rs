@@ -19,7 +19,6 @@ mod tests {
     use crate::micro_actor::MicroActorReq;
     use crate::runner::RunnerReq;
     use functional::FunctionalClient;
-    use std::os::unix::thread;
     // use messaging::MessagingClient;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -153,12 +152,12 @@ mod tests {
         writer.flush().unwrap();
     }
 
-    #[derive(Debug)]
-    enum RequestRate {
-        Low,
-        Medium,
-        High(usize),
-    }
+    // #[derive(Debug)]
+    // enum RequestRate {
+    //     Low,
+    //     Medium,
+    //     High(usize),
+    // }
 
     async fn run_bench(request_sender: &mut RequestSender, name: &str, test_duration: Duration) {
         let mut results: Vec<(u64, f64, Vec<u8>)> = Vec::new();
@@ -575,14 +574,14 @@ mod tests {
             fc: fc.clone(),
             thread_cap: 100.0, // Effectively no cap.
         };
-        // // Low
-        // request_sender.desired_requests_per_second = low_req_per_secs;
-        // run_bench(
-        //     &mut request_sender,
-        //     "pre_low",
-        //     Duration::from_secs_f64(60.0 * duration_mins),
-        // )
-        // .await;
+        // Low
+        request_sender.desired_requests_per_second = low_req_per_secs;
+        run_bench(
+            &mut request_sender,
+            "pre_low",
+            Duration::from_secs_f64(60.0 * duration_mins),
+        )
+        .await;
         // Medium
         request_sender.desired_requests_per_second = medium_req_per_secs;
         run_bench(
@@ -599,13 +598,13 @@ mod tests {
             Duration::from_secs_f64(60.0 * duration_mins),
         )
         .await;
-        // // Low again.
-        // request_sender.desired_requests_per_second = low_req_per_secs;
-        // run_bench(
-        //     &mut request_sender,
-        //     "post_low",
-        //     Duration::from_secs_f64(60.0 * duration_mins),
-        // )
-        // .await;
+        // Low again.
+        request_sender.desired_requests_per_second = low_req_per_secs;
+        run_bench(
+            &mut request_sender,
+            "post_low",
+            Duration::from_secs_f64(60.0 * duration_mins),
+        )
+        .await;
     }
 }

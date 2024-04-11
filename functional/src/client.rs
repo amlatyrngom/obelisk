@@ -51,7 +51,7 @@ impl FunctionalClient {
             .connect_timeout(std::time::Duration::from_millis(connect_timeout_ms)) // Short on purpose. May break when connecting to a distant region.
             .build()
             .unwrap();
-        let shared_config = aws_config::load_from_env().await;
+        let shared_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         // Make Lambda.
         let lambda_config = aws_sdk_lambda::config::Builder::from(&shared_config)
             .retry_config(

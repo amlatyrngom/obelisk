@@ -25,4 +25,4 @@ r2d2_sqlite = "*"
 
 [dev-dependencies]
 fork = "*"
-nix = "*"
+nix = { version = "*", features = ["process"] }

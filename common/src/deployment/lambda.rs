@@ -103,21 +103,21 @@ impl LambdaDeployment {
                     let ephemeral_storage = config.ephemeral_storage().cloned().unwrap_or(
                         aws_sdk_lambda::types::EphemeralStorage::builder()
                             .size(512)
-                            .build(),
+                            .build()
+                            .unwrap(),
                     );
                     create_function = create_function.memory_size(mem_size).timeout(timeout);
                     create_function = create_function.ephemeral_storage(ephemeral_storage);
-                    if let Some(efs_config) = config.file_system_configs() {
-                        create_function = create_function
-                            .file_system_configs(efs_config.first().unwrap().clone());
+                    if let Some(efs_config) = config.file_system_configs().first() {
+                        create_function = create_function.file_system_configs(efs_config.clone());
                     }
                     if let Some(vpc_config) = config.vpc_config() {
                         create_function = create_function.vpc_config(
                             aws_sdk_lambda::types::VpcConfig::builder()
                                 .security_group_ids(
-                                    vpc_config.security_group_ids().unwrap().first().unwrap(),
+                                    vpc_config.security_group_ids().first().unwrap(),
                                 )
-                                .subnet_ids(vpc_config.subnet_ids().unwrap().first().unwrap())
+                                .subnet_ids(vpc_config.subnet_ids().first().unwrap())
                                 .build(),
                         );
                     }
@@ -170,11 +170,11 @@ impl LambdaDeployment {
             }
             let curr_fns = curr_fns.send().await.unwrap();
             marker = curr_fns.next_marker().map(|x| x.to_string());
-            let curr_fns = curr_fns.functions().map_or(vec![], |f| {
-                f.iter()
-                    .map(|f| f.function_name().unwrap().to_string())
-                    .collect()
-            });
+            let curr_fns = curr_fns
+                .functions()
+                .iter()
+                .map(|f| f.function_name().unwrap().to_string())
+                .collect::<Vec<_>>();
             if curr_fns.is_empty() {
                 break;
             }
@@ -222,7 +222,8 @@ impl LambdaDeployment {
             .ephemeral_storage(
                 aws_sdk_lambda::types::EphemeralStorage::builder()
                     .size(spec.ephemeral)
-                    .build(),
+                    .build()
+                    .unwrap(),
             )
             .role(role_arn)
             .environment(environ);
@@ -238,7 +239,8 @@ impl LambdaDeployment {
                     aws_sdk_lambda::types::FileSystemConfig::builder()
                         .arn(ap_arn)
                         .local_mount_path(crate::persistence_mnt_path())
-                        .build(),
+                        .build()
+                        .unwrap(),
                 )
                 .vpc_config(vpc_config);
         }

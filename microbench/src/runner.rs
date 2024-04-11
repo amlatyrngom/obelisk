@@ -1,4 +1,4 @@
-use crate::micro_actor::{MicroActorReq, MicroActorResp};
+use crate::micro_actor::MicroActorReq;
 use common::{HandlerKit, ScalingState, ServerlessHandler};
 use functional::FunctionalClient;
 use serde::{Deserialize, Serialize};

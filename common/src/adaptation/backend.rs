@@ -52,7 +52,7 @@ impl AdapterBackend {
     pub async fn new(svc_info: Arc<ServiceInfo>, svc: Arc<dyn ServiceInstance>) -> Self {
         let time_service = TimeService::new().await;
         let join_time = time_service.current_time().await;
-        let shared_config = aws_config::load_from_env().await;
+        let shared_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let lambda_client = aws_sdk_lambda::Client::new(&shared_config);
         let curr_stats = svc_info.read_stats().await.unwrap();
         let inner = Arc::new(RwLock::new(AdapterBackerInner {
@@ -248,7 +248,7 @@ impl AdapterBackend {
 impl ServiceInfo {
     /// Retrieve information about a service.
     pub async fn new() -> Result<ServiceInfo, String> {
-        let shared_config = aws_config::load_from_env().await;
+        let shared_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let ecs_client = aws_sdk_ecs::Client::new(&shared_config);
         // Getting Task Metadata.
         println!("Getting Task Metadata!");

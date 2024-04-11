@@ -49,7 +49,7 @@ impl ScalingStateRescaler {
     /// Create new rescaler.
     pub async fn new(subsystem: &str, rescaler: Arc<dyn Rescaler>) -> Self {
         let ntwk = networking::NetworkingDeployment::new().await;
-        let shared_config = aws_config::load_from_env().await;
+        let shared_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let ecs_client = aws_sdk_ecs::Client::new(&shared_config);
         ScalingStateRescaler {
             subsystem: subsystem.into(),

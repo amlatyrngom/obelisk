@@ -138,7 +138,7 @@ pub fn make_function_info(
 impl AdapterDeployment {
     /// Create a deployer.
     pub async fn new() -> Self {
-        let shared_config = aws_config::load_from_env().await;
+        let shared_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         AdapterDeployment {
             lambda_client: aws_sdk_lambda::Client::new(&shared_config),
             dynamo_client: aws_sdk_dynamodb::Client::new(&shared_config),

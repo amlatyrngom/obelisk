@@ -25,7 +25,7 @@ impl MessagingClient {
         if !has_external_access() {
             panic!("Lambda actor {namespace}/{name}. Attempting to creating a client without external access");
         }
-        let shared_config = aws_config::load_from_env().await;
+        let shared_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         // Lambda.
         let lambda_config = aws_sdk_lambda::config::Builder::from(&shared_config)
             .retry_config(

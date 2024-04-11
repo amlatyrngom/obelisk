@@ -109,7 +109,7 @@ impl LeaserInner {
 impl Leaser {
     /// Create a new leaser.
     pub async fn new(table_name: &str) -> Self {
-        let shared_config = aws_config::load_from_env().await;
+        let shared_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let dynamo_client = aws_sdk_dynamodb::Client::new(&shared_config);
         let inner = Arc::new(Mutex::new(LeaserInner::new().await));
         let lease_id = Uuid::new_v4().to_string();
@@ -296,7 +296,7 @@ mod tests {
 
     /// Create table for test.
     async fn make_test_table() {
-        let shared_config = aws_config::load_from_env().await;
+        let shared_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let dynamo_client = aws_sdk_dynamodb::Client::new(&shared_config);
         // key-value table.
         let resp = dynamo_client
@@ -307,25 +307,29 @@ mod tests {
                 KeySchemaElement::builder()
                     .attribute_name("namespace")
                     .key_type(KeyType::Hash)
-                    .build(),
+                    .build()
+                    .unwrap(),
             )
             .key_schema(
                 KeySchemaElement::builder()
                     .attribute_name("name")
                     .key_type(KeyType::Range)
-                    .build(),
+                    .build()
+                    .unwrap(),
             )
             .attribute_definitions(
                 AttributeDefinition::builder()
                     .attribute_name("namespace")
                     .attribute_type(ScalarAttributeType::S)
-                    .build(),
+                    .build()
+                    .unwrap(),
             )
             .attribute_definitions(
                 AttributeDefinition::builder()
                     .attribute_name("name")
                     .attribute_type(ScalarAttributeType::S)
-                    .build(),
+                    .build()
+                    .unwrap(),
             )
             .send()
             .await;
@@ -346,7 +350,8 @@ mod tests {
                 TimeToLiveSpecification::builder()
                     .attribute_name("gc_ttl")
                     .enabled(true)
-                    .build(),
+                    .build()
+                    .unwrap(),
             )
             .send()
             .await;

@@ -13,7 +13,7 @@ impl NetworkingDeployment {
 
     /// Get default public subnet.
     pub async fn setup_subnet_with_endpoints(setup_endpoints: bool) -> (Vec<String>, String) {
-        let shared_config = aws_config::load_from_env().await;
+        let shared_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let region = shared_config.region().unwrap().to_string();
         let ec2_client = aws_sdk_ec2::Client::new(&shared_config);
 
@@ -31,7 +31,7 @@ impl NetworkingDeployment {
             .send()
             .await
             .unwrap();
-        let vpc = vpc.vpcs().unwrap().first().unwrap();
+        let vpc = vpc.vpcs().first().unwrap();
         let vpc_id = vpc.vpc_id().unwrap();
         // Get subnet ids.
         let subnet = ec2_client
@@ -46,7 +46,7 @@ impl NetworkingDeployment {
             .await
             .unwrap();
         println!("Subnets: {subnet:?}");
-        let subnets = subnet.subnets().unwrap();
+        let subnets = subnet.subnets();
         let subnet_ids: Vec<String> = subnets
             .iter()
             .map(|s| s.subnet_id().unwrap().into())
@@ -69,7 +69,7 @@ impl NetworkingDeployment {
             .send()
             .await
             .unwrap();
-        let sg = sg.security_groups().unwrap().first().unwrap();
+        let sg = sg.security_groups().first().unwrap();
         let sg_id: String = sg.group_id().unwrap().into();
         // Get routing table id.
         let rt = ec2_client
@@ -89,7 +89,7 @@ impl NetworkingDeployment {
             .send()
             .await
             .unwrap();
-        let rt = rt.route_tables().unwrap().first().unwrap();
+        let rt = rt.route_tables().first().unwrap();
         let rt_id: String = rt.route_table_id().unwrap().into();
         println!("Routing table ids: {rt_id}");
         // Create access endpoints.
@@ -118,11 +118,9 @@ impl NetworkingDeployment {
                     .send()
                     .await
                     .unwrap();
-                if let Some(resp) = resp.vpc_endpoints() {
-                    if let Some(resp) = resp.first() {
-                        println!("Found endpoint: {resp:?}");
-                        continue;
-                    }
+                if let Some(resp) = resp.vpc_endpoints().first() {
+                    println!("Found endpoint: {resp:?}");
+                    continue;
                 }
                 let mut req = ec2_client
                     .create_vpc_endpoint()
@@ -150,7 +148,7 @@ impl NetworkingDeployment {
     }
 
     pub async fn teardown_vpc_endpoints() {
-        let shared_config = aws_config::load_from_env().await;
+        let shared_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let region = shared_config.region().unwrap().to_string();
         let ec2_client = aws_sdk_ec2::Client::new(&shared_config);
         // Get vpc.
@@ -165,7 +163,7 @@ impl NetworkingDeployment {
             .send()
             .await
             .unwrap();
-        let vpc = vpc.vpcs().unwrap().first().unwrap();
+        let vpc = vpc.vpcs().first().unwrap();
         let vpc_id = vpc.vpc_id().unwrap();
         let svc_names = vec![
             (format!("com.amazonaws.{}.s3", region), true),
@@ -191,12 +189,10 @@ impl NetworkingDeployment {
                 .send()
                 .await
                 .unwrap();
-            if let Some(resp) = resp.vpc_endpoints() {
-                if let Some(resp) = resp.first() {
-                    found = true;
-                    let endpoint_id = resp.vpc_endpoint_id().unwrap();
-                    delete_req = delete_req.vpc_endpoint_ids(endpoint_id);
-                }
+            if let Some(resp) = resp.vpc_endpoints().first() {
+                found = true;
+                let endpoint_id = resp.vpc_endpoint_id().unwrap();
+                delete_req = delete_req.vpc_endpoint_ids(endpoint_id);
             }
         }
         if found {

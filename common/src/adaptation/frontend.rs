@@ -59,7 +59,7 @@ impl AdapterFrontend {
         // Special case: lambdas inside VPCs have no internet access.
         let execution_mode = std::env::var("EXECUTION_MODE").unwrap_or_default();
         let has_external_access = execution_mode != "messaging_lambda" && execution_mode != "local";
-        let shared_config = aws_config::load_from_env().await;
+        let shared_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let dynamo_client = aws_sdk_dynamodb::Client::new(&shared_config);
         let clients = if has_external_access {
             let sqs_client = aws_sdk_sqs::Client::new(&shared_config);
