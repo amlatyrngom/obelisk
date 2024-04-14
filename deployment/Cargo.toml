@@ -11,11 +11,11 @@ quote = "*"
 syn = "*"
 proc-macro2 = "*"
 tokio = { version = "*", features = ["full"] }
-aws-sdk-iam = "*"
-aws-sdk-ecr = "*"
-aws-sdk-ecrpublic = "*"
-aws-config = "*"
-aws-types = "*"
+aws-sdk-iam = "1.20"
+aws-sdk-ecr = "1.19"
+aws-sdk-ecrpublic = "1.19"
+aws-config = "1.1.10"
+aws-types = "1.1.9"
 serde = {version="*", features=["derive"]}
 common = {path="../common"}
 functional = {path="../functional"}

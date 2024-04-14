@@ -8,13 +8,12 @@ edition = "2021"
 [dependencies]
 tokio = { version = "*", features = ["full"] }
 reqwest = { version = "*", features = ["json", "rustls-tls"], default-features = false }
-aws-sdk-lambda = "*"
-aws-sdk-sqs = "*"
-aws-sdk-s3 = "*"
-aws-sdk-ecs = "*"
-aws-config = "*"
+aws-sdk-lambda = "1.20"
+aws-sdk-s3 = "1.22"
+aws-sdk-ecs = "1.20"
+aws-config = "1.1.10"
 aws-smithy-types = "*"
-aws-types = "*"
+aws-types = "1.1.9"
 async-trait = "*"
 serde_json = "*"
 bincode = "*"
