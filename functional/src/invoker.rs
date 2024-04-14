@@ -90,7 +90,7 @@ impl Invoker {
             workers: HashMap::new(),
         }));
         // Make lambda client.
-        let shared_config = aws_config::load_from_env().await;
+        let shared_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let lambda_client = aws_sdk_lambda::Client::new(&shared_config);
         // Make direct client.
         let direct_client = reqwest::Client::builder()
