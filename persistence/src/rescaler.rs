@@ -60,6 +60,8 @@ impl Rescaler for WalRescaler {
         rescaling_result
             .services_scales
             .insert("replica".into(), to_deploy);
+        rescaling_result.services_scaling_info =
+            Some(serde_json::to_string(&current_stats).unwrap());
         rescaling_result
     }
 }
@@ -78,9 +80,13 @@ impl WalRescaler {
         since: f64,
     ) {
         let mut user_activity_gbsec = 0.0;
+        println!("Received {} metrics.", metrics.len());
         for metric in &metrics {
             let metric: WalMetric = bincode::deserialize(metric).unwrap();
             for mem in metric.user_mems {
+                if user_activity_gbsec == 0.0 {
+                    println!("First metric with mem {}.", mem);
+                }
                 user_activity_gbsec += (mem as f64 / 1024.0) * REPLICATION_GAIN_SECS;
             }
         }

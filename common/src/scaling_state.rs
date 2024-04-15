@@ -541,6 +541,13 @@ impl ScalingStateManager {
             instance_info: instance_info.as_ref().clone(),
             instance_stats,
         };
+        let is_replica = instance_info
+            .service_name
+            .as_ref()
+            .map_or(false, |n| n.contains("replica"));
+        if is_replica {
+            println!("Updating replica peer!");
+        }
         loop {
             // Get scaling state.
             let mut scaling_state = self.retrieve_scaling_state().await?;
@@ -575,6 +582,9 @@ impl ScalingStateManager {
             let updated = self
                 .write_scaling_state(&mut scaling_state, &old_id)
                 .await?;
+            if is_replica {
+                println!("Updated replica peer: {scaling_state:?}.");
+            }
             if updated {
                 break;
             }

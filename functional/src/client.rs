@@ -47,7 +47,7 @@ impl FunctionalClient {
         // TODO: Find ways set to make it shorter, possibly using some heuristics.
         let connect_timeout_ms: u64 = if Self::is_in_aws() { 10 } else { 100 };
         let direct_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10)) // TODO: set to correct value.
+            .timeout(std::time::Duration::from_secs(1)) // TODO: set to correct value.
             .connect_timeout(std::time::Duration::from_millis(connect_timeout_ms)) // Short on purpose. May break when connecting to a distant region.
             .build()
             .unwrap();

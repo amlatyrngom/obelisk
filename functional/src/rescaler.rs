@@ -125,6 +125,12 @@ impl Rescaler for FunctionalRescaler {
         println!("To Explore: {to_explore:?}");
         let mut ideal_mem =
             self.find_ideal_memory(&mut current_stats, &handler_scaling_state, &to_explore);
+        let prev_mem = self.find_previous_memory(&current_stats, &handler_scaling_state);
+        // Reduce oscillations by considering the previous deployment if still cost-effective.
+        if ideal_mem == (prev_mem / 2) {
+            println!("Considering previous deployment. Ideal={ideal_mem}. Prev={prev_mem}");
+            ideal_mem = prev_mem;
+        }
         let min_mem = *current_stats.exploration_stats.keys().min().unwrap();
         while ideal_mem > min_mem {
             let (
@@ -364,6 +370,21 @@ impl FunctionalRescaler {
             }
         }
         res
+    }
+
+    fn find_previous_memory(
+        &self,
+        current_stats: &FunctionalScalingInfo,
+        handler_scaling_state: &HandlerScalingState,
+    ) -> i32 {
+        let min_mem = *current_stats.exploration_stats.keys().min().unwrap();
+        let mut prev_mem = min_mem;
+        for (mem, scale) in &handler_scaling_state.handler_scales {
+            if *scale > 0 && *mem > prev_mem {
+                prev_mem = *mem;
+            }
+        }
+        prev_mem
     }
 
     /// Return the maximum allowable instance.
