@@ -195,10 +195,15 @@ impl FunctionalClient {
     }
 
     /// Wake the lambda function up.
-    pub async fn wake_lambda(&self) -> Result<(), String> {
+    pub async fn wake_lambda(&self, shutdown: bool) -> Result<(), String> {
         let fn_name =
             lambda::LambdaDeployment::handler_function_name(&self.namespace, &self.identifier);
-        let arg: (WrapperMessage, String) = (WrapperMessage::IndirectMessage, String::new());
+        let msg = if shutdown {
+            WrapperMessage::ForceShutdownMessage
+        } else {
+            WrapperMessage::IndirectMessage
+        };
+        let arg: (WrapperMessage, String) = (msg, String::new());
         let arg = serde_json::to_vec(&arg).unwrap();
         let arg = aws_smithy_types::Blob::new(arg);
         let lambda_client = self.lambda_client.clone();
@@ -322,7 +327,7 @@ impl FunctionalClient {
     ) -> Result<(HandlingResp, Vec<u8>), String> {
         let msg_id: String = uuid::Uuid::new_v4().to_string();
         // Wake up messaging function.
-        let _ = self.wake_lambda().await;
+        let _ = self.wake_lambda(false).await;
         // Write message to S3.
         let (send_prefix, recv_prefix) =
             common::ServerlessWrapper::messaging_prefix(&self.namespace, &self.identifier);
@@ -375,10 +380,16 @@ impl FunctionalClient {
                 }
                 Err(_) => {
                     // Wake up messaging function in case it is not active.
-                    let _ = self.wake_lambda().await;
+                    let _ = self.wake_lambda(false).await;
                 }
             }
         }
+        // After many retries, AWS likely started more than one instance of Lambda.
+        // Try shutting them down.
+        for _ in 0..10 {
+            let _ = self.wake_lambda(true).await;
+        }
+
         Err("timeout after many retries".into())
     }
 
