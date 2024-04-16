@@ -12,8 +12,6 @@ pub struct ServerlessStorage {
     pub shared_pool: Pool<SqliteConnectionManager>,
     /// File owned by a unique instance. Only present if unique=true and successfully acquired.
     pub exclusive_pool: Option<Pool<SqliteConnectionManager>>,
-    /// Successfully initialized.
-    pub initialized: bool,
 }
 
 impl ServerlessStorage {
@@ -150,7 +148,6 @@ impl ServerlessStorage {
             seq_num,
             shared_pool,
             exclusive_pool: None,
-            initialized: true,
         })
     }
 
@@ -185,19 +182,18 @@ impl ServerlessStorage {
             resp
         })?;
         let exclusive_pool = if let Ok(exclusive_pool) = exclusive_pool {
-            Some(exclusive_pool)
+            exclusive_pool
         } else {
             let dir = storage_dir.clone();
             tokio::task::block_in_place(move || {
                 let large_num_tries = 30;
                 Self::try_exclusive_file(&dir, large_num_tries)
-            }).ok()
+            })?
         };
         Ok(ServerlessStorage {
             seq_num,
             shared_pool,
-            initialized: exclusive_pool.is_some(),
-            exclusive_pool,
+            exclusive_pool: Some(exclusive_pool),
         })
     }
 

@@ -108,7 +108,6 @@ impl LogReplica {
     ) -> PersistenceRespMeta {
         println!("Handle Log: lo_lsn={lo_lsn}, hi_lsn={hi_lsn}, owner_id={owner_id}");
         let mut inner = self.inner.lock().await;
-        println!("Handle Log: Locked.");
         if persisted_lsn > inner.persisted_lsn {
             inner.persisted_lsn = persisted_lsn;
             inner.pending_logs.retain(|p| p.hi_lsn > persisted_lsn);

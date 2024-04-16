@@ -21,7 +21,6 @@ pub struct ServerlessWrapper {
     serverless_storage: Option<Arc<ServerlessStorage>>,
     handler: Arc<dyn ServerlessHandler>,
     instance_stats: Arc<RwLock<Option<InstanceStats>>>,
-    initialized: bool,
 }
 
 /// Information about a running instance.
@@ -97,11 +96,6 @@ impl ServerlessWrapper {
         .await;
         // Make wrapper.
         let instance_stats = instance_info.read_stats().await.ok();
-        let initialized = if let Some(ss) = &serverless_storage {
-            ss.initialized
-        } else {
-            true
-        };
         let wrapper = ServerlessWrapper {
             s3_client,
             join_time,
@@ -110,16 +104,7 @@ impl ServerlessWrapper {
             handler,
             serverless_storage,
             instance_stats: Arc::new(RwLock::new(instance_stats)),
-            initialized,
         };
-        if !wrapper.initialized {
-            if wrapper.instance_info.private_url.is_some() {
-                panic!("ServerlessWrapper::new. Serverless storage not initialized. Likely could not get lock!");
-            } else {
-                println!("Running Uninitialized Wrapper for Lambda!");
-                return wrapper;
-            }
-        }
         // Start state manager threads.
         wrapper.state_manager.start_refresh_thread().await;
         wrapper.state_manager.start_rescaling_thread().await;
@@ -190,7 +175,7 @@ impl ServerlessWrapper {
             WrapperMessage::IndirectMessage => {
                 let _ = self.handle_indirect_messages().await;
                 (String::new(), vec![])
-            },
+            }
             WrapperMessage::ForceShutdownMessage => {
                 self.checkpoint_handler(true).await;
                 (String::new(), vec![])
@@ -201,10 +186,6 @@ impl ServerlessWrapper {
 
     /// Handle lambda message.
     pub async fn handle_lambda_message(&self, request: serde_json::Value) -> serde_json::Value {
-        if !self.initialized {
-            println!("Uninitialized Wrapper. Exiting!");
-            std::process::exit(1);
-        }
         let start_time = std::time::Instant::now();
         let (meta, payload): (WrapperMessage, String) = serde_json::from_value(request).unwrap();
         match meta {

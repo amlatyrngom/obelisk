@@ -242,6 +242,8 @@ mod tests {
             let _actor_client = Arc::new(
                 FunctionalClient::new("microbench", "microactor", Some(0), Some(512)).await,
             );
+            let _sim_client =
+                Arc::new(FunctionalClient::new("microbench", "simactor", Some(0), Some(512)).await);
         }
         let fc =
             Arc::new(FunctionalClient::new("microbench", "microrunner", None, Some(512)).await);
