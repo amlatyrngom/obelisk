@@ -105,6 +105,10 @@ impl ServerlessWrapper {
             serverless_storage,
             instance_stats: Arc::new(RwLock::new(instance_stats)),
         };
+        if wrapper.instance_info.unique && wrapper.instance_info.private_url.is_some() {
+            // If unique, wait for url availability.
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        }
         // Start state manager threads.
         wrapper.state_manager.start_refresh_thread().await;
         wrapper.state_manager.start_rescaling_thread().await;

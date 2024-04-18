@@ -6,7 +6,7 @@ use common::wrapper::WrapperMessage;
 use common::{HandlingResp, MetricsManager};
 use std::sync::{atomic, Arc, Mutex};
 
-const NUM_INDIRECT_RETRIES: u64 = 50;
+const NUM_INDIRECT_RETRIES: u64 = 20;
 const INDIRECT_WAIT_TIME_SECS: f64 = 0.02;
 
 /// FunctionalClient.
@@ -351,6 +351,7 @@ impl FunctionalClient {
         // Repeatedly try reading response and waking up messaging function if response not found.
         for _n in 0..NUM_INDIRECT_RETRIES {
             // Wait for processing.
+            println!("Waiting for S3 response.");
             tokio::time::sleep(std::time::Duration::from_secs_f64(INDIRECT_WAIT_TIME_SECS)).await;
             // Try reading.
             let resp = self
@@ -387,7 +388,12 @@ impl FunctionalClient {
         // After many retries, AWS likely started more than one instance of Lambda.
         // Try shutting them down.
         for _ in 0..10 {
-            let _ = self.wake_lambda(true).await;
+            println!("Attempting to shutdown lambda!");
+            // Send two messages in parallel. Hopefully one of them will be received by the instance holding the lock.
+            // TODO: Figure out a way to consistently unlock the file.
+            let w1 = self.wake_lambda(true);
+            let w2 = self.wake_lambda(true);
+            let _ = tokio::join!(w1, w2);
         }
 
         Err("timeout after many retries".into())

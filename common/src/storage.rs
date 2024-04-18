@@ -158,6 +158,11 @@ impl ServerlessStorage {
         is_svc: bool,
     ) -> Result<Self, String> {
         let exec_mode = std::env::var("OBK_EXECUTION_MODE").unwrap();
+        let is_container = !exec_mode.contains("lambda");
+        if is_container {
+            // Wait for url to be available.
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        }
         let storage_dir = Self::get_storage_dir(namespace, identifier, is_svc);
         println!("Storage Dir: {storage_dir}");
         let _ = std::fs::create_dir_all(&storage_dir);
@@ -166,7 +171,7 @@ impl ServerlessStorage {
             let small_num_tries = 1;
             Self::try_exclusive_file(&dir, small_num_tries)
         });
-        if exclusive_pool.is_err() && exec_mode.contains("lambda") {
+        if exclusive_pool.is_err() && !is_container {
             // In Lambda mode, first acquisition attempt should be successful.
             let e = Err(format!(
                 "Lambda could not acquire lock file first: {:?}!",
@@ -263,12 +268,16 @@ impl ServerlessStorage {
             .get_timeout(std::time::Duration::from_secs(1))
             .map_err(debug_format!())?;
         let txn = conn.transaction().map_err(debug_format!())?;
-        txn.execute(
-            "UPDATE system__ownership SET seq_num=? WHERE seq_num=?",
-            [&self.seq_num, &self.seq_num],
-        )
-        .map_err(debug_format!())?;
+        let written = txn
+            .execute(
+                "UPDATE system__ownership SET seq_num=? WHERE seq_num=?",
+                [&self.seq_num, &self.seq_num],
+            )
+            .map_err(debug_format!())?;
         txn.commit().map_err(debug_format!())?;
+        if written == 0 {
+            return Err("Could not write to exclusive file!".into());
+        }
         Ok(())
     }
 
