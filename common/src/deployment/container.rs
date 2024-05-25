@@ -176,6 +176,12 @@ impl ContainerDeployment {
                     .value(true.to_string())
                     .build(),
             )
+            .environment(
+                KeyValuePair::builder()
+                    .name("RUST_BACKTRACE")
+                    .value("1")
+                    .build(),
+            )
             .build();
         let task_def = task_def.container_definitions(container_def);
         loop {
@@ -301,6 +307,12 @@ impl ContainerDeployment {
                 KeyValuePair::builder()
                     .name("OBK_PUBLIC")
                     .value(true.to_string())
+                    .build(),
+            )
+            .environment(
+                KeyValuePair::builder()
+                    .name("RUST_BACKTRACE")
+                    .value("1")
                     .build(),
             );
         if spec.persistent || spec.unique {

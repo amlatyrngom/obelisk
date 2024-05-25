@@ -30,7 +30,8 @@ impl LambdaDeployment {
         let environ = aws_sdk_lambda::types::Environment::builder()
             .variables("OBK_RESCALER_SPEC", spec_str)
             .variables("OBK_EXECUTION_MODE", "rescaler_lambda")
-            .variables("OBK_MEMORY", spec.mem.to_string());
+            .variables("OBK_MEMORY", spec.mem.to_string())
+            .variables("RUST_BACKTRACE", "1".to_string());
         let environ = environ.build();
         let _ = client
             .delete_function()
@@ -201,7 +202,8 @@ impl LambdaDeployment {
             .variables("OBK_IDENTIFIER", &spec.name)
             .variables("OBK_HANDLER_SPEC", spec_str)
             .variables("OBK_EXECUTION_MODE", "handler_lambda")
-            .variables("OBK_MEMORY", spec.default_mem.to_string());
+            .variables("OBK_MEMORY", spec.default_mem.to_string())
+            .variables("RUST_BACKTRACE", "1".to_string());
         if spec.persistent || spec.unique {
             environ = environ.variables("OBK_EXTERNAL_ACCESS", false.to_string());
         }

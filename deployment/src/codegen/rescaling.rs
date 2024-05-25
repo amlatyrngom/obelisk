@@ -55,7 +55,7 @@ pub fn gen_rescaler_aux() -> TokenStream {
                     Ok(resp)
                 },
                 Err(e) => {
-                    panic!("Rescaling Erro");
+                    panic!("Rescaling Error: {e:?}");
                 }
             }
         }

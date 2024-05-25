@@ -1,9 +1,9 @@
-use common::{HandlerKit, InstanceInfo, ScalingState, ServerlessHandler, ServerlessStorage};
+use common::{HandlerKit, InstanceInfo, ScalingState, ServerlessHandler};
 use std::sync::Arc;
 
 pub struct Echo {
     instance_info: Arc<InstanceInfo>,
-    serverless_storage: Arc<ServerlessStorage>,
+    _incarnation: i64,
 }
 
 impl Echo {
@@ -12,7 +12,7 @@ impl Echo {
         println!("Creating echo function: {:?}", kit.instance_info);
         Echo {
             instance_info: kit.instance_info,
-            serverless_storage: kit.serverless_storage.unwrap(),
+            _incarnation: kit.incarnation,
         }
     }
 }
@@ -21,11 +21,7 @@ impl Echo {
 impl ServerlessHandler for Echo {
     /// Handle message.
     async fn handle(&self, meta: String, payload: Vec<u8>) -> (String, Vec<u8>) {
-        println!(
-            "Echo Handler: {:?}. Meta={meta}. St={}",
-            self.instance_info,
-            self.serverless_storage.exclusive_pool.is_some()
-        );
+        println!("Echo Handler: {:?}. Meta={meta}.", self.instance_info,);
         (meta, payload)
     }
 

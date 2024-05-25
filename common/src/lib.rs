@@ -4,18 +4,17 @@ pub mod leasing;
 pub mod metrics;
 pub mod rescaler;
 pub mod scaling_state;
-pub mod storage;
 pub mod time_service;
 pub mod wrapper;
 
 pub use deployment::RescalerSpec;
+pub use low_level_systems::file_lease::FileLease;
 pub use metrics::MetricsManager;
 pub use rescaler::{Rescaler, RescalingResult, ScalingStateRescaler};
 pub use scaling_state::{HandlerScalingState, ScalingState, SubsystemScalingState};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-pub use storage::ServerlessStorage;
 pub use wrapper::{InstanceInfo, ServerlessWrapper, WrapperMessage};
 
 /// Input to a handler.
@@ -23,8 +22,8 @@ pub use wrapper::{InstanceInfo, ServerlessWrapper, WrapperMessage};
 pub struct HandlerKit {
     /// Contains information about the present instance.
     pub instance_info: Arc<InstanceInfo>,
-    /// Allows access to shared storage.
-    pub serverless_storage: Option<Arc<ServerlessStorage>>,
+    /// Incarnation number. Monothonically increasing when unique. Otherwise always 0.
+    pub incarnation: i64,
 }
 
 /// A serverless handler.
@@ -109,6 +108,13 @@ pub fn shared_storage_prefix() -> String {
     }
     // For local tests.
     "obelisk_shared_data".into()
+}
+
+pub fn storage_path(instance_info: &InstanceInfo) -> String {
+    let storage_dir = shared_storage_prefix();
+    let namespace = &instance_info.namespace;
+    let name = &instance_info.identifier;
+    format!("{storage_dir}/{namespace}/{name}", namespace = namespace)
 }
 
 pub fn persistence_mnt_path() -> String {

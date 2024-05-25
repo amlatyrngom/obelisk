@@ -11,6 +11,7 @@ functional = {path="./functional"}
 # messaging = {path="./messaging"}
 persistence = {path="./persistence"}
 microbench = {path="./microbench"}
+low_level_systems = {path="./low_level_systems"}
 
 [workspace]
 members = [
@@ -19,4 +20,5 @@ members = [
     # "messaging",
     "persistence",
     "microbench",
+    "low_level_systems",
 ]

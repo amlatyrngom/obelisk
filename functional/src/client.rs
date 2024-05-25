@@ -6,8 +6,8 @@ use common::wrapper::WrapperMessage;
 use common::{HandlingResp, MetricsManager};
 use std::sync::{atomic, Arc, Mutex};
 
-const NUM_INDIRECT_RETRIES: u64 = 20;
-const INDIRECT_WAIT_TIME_SECS: f64 = 0.02;
+const NUM_INDIRECT_RETRIES: u64 = 40;
+const INDIRECT_WAIT_TIME_SECS: f64 = 0.075; // Keep between 50ms and 100ms.
 
 /// FunctionalClient.
 #[derive(Clone)]
@@ -56,7 +56,7 @@ impl FunctionalClient {
         let lambda_config = aws_sdk_lambda::config::Builder::from(&shared_config)
             .retry_config(
                 aws_sdk_lambda::config::retry::RetryConfig::standard()
-                    .with_initial_backoff(std::time::Duration::from_millis(10)) // On avg: 25ms, 50ms, 100ms, ....
+                    .with_initial_backoff(std::time::Duration::from_millis(10)) // ....
                     .with_max_attempts(10),
             )
             .build();
@@ -385,16 +385,16 @@ impl FunctionalClient {
                 }
             }
         }
-        // After many retries, AWS likely started more than one instance of Lambda.
-        // Try shutting them down.
-        for _ in 0..10 {
-            println!("Attempting to shutdown lambda!");
-            // Send two messages in parallel. Hopefully one of them will be received by the instance holding the lock.
-            // TODO: Figure out a way to consistently unlock the file.
-            let w1 = self.wake_lambda(true);
-            let w2 = self.wake_lambda(true);
-            let _ = tokio::join!(w1, w2);
-        }
+        // // After many retries, AWS likely started more than one instance of Lambda.
+        // // Try shutting them down.
+        // for _ in 0..10 {
+        //     println!("Attempting to shutdown lambda!");
+        //     // Send two messages in parallel. Hopefully one of them will be received by the instance holding the lock.
+        //     // TODO: Figure out a way to consistently unlock the file.
+        //     let w1 = self.wake_lambda(true);
+        //     let w2 = self.wake_lambda(true);
+        //     let _ = tokio::join!(w1, w2);
+        // }
 
         Err("timeout after many retries".into())
     }

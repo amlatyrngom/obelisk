@@ -17,7 +17,7 @@ pub fn gen_wrapper_static_code(deployments: &[Deployment1]) -> TokenStream {
                     if x.is_none() && namespace == #namespace && name == #name {
                         let kit = HandlerKit {
                             instance_info: instance_info.clone(),
-                            serverless_storage: serverless_storage.clone(),
+                            incarnation,
                         };
                         x = Some(Arc::new(#path::new(kit).await));
                     }
@@ -33,7 +33,7 @@ pub fn gen_wrapper_static_code(deployments: &[Deployment1]) -> TokenStream {
                 if x.is_none() && namespace == #namespace && name == #name {
                     let kit = HandlerKit {
                         instance_info: instance_info.clone(),
-                        serverless_storage: serverless_storage.clone(),
+                        incarnation,
                     };
                     x = Some(Arc::new(#path::new(kit).await));
                 }
@@ -43,15 +43,21 @@ pub fn gen_wrapper_static_code(deployments: &[Deployment1]) -> TokenStream {
 
     let result = quote! {
         static ref HANDLER_WRAPPER: async_once::AsyncOnce<Arc<ServerlessWrapper>> = async_once::AsyncOnce::new(async {
+            // Initialize instance info and lease if needed.
             let instance_info = Arc::new(InstanceInfo::new().await.unwrap());
-            let serverless_storage = match ServerlessStorage::new_from_info(instance_info.clone()).await {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("Storage Err: {e:?}");
-                    // Force a complete restart of the Lambda.
-                    std::process::exit(1);
-                }
+            let (file_lease, incarnation) = if instance_info.unique {
+                let name = instance_info.identifier.clone();
+                let storage_dir = common::shared_storage_prefix();
+                let storage_dir = format!("{storage_dir}/{namespace}/{name}", namespace=instance_info.namespace);
+                let exclusive = instance_info.private_url.is_some();
+                let _ = std::fs::create_dir_all(&storage_dir);
+                let file_lease = FileLease::new(&storage_dir, &name, exclusive);
+                let incarnation = file_lease.incarnation;
+                (Some(Arc::new(file_lease)), incarnation)
+            } else {
+                (None, 0)
             };
+
             let (namespace, name) = if let Some(service_name) = &instance_info.service_name {
                 (&instance_info.subsystem, service_name)
             } else {
@@ -59,7 +65,7 @@ pub fn gen_wrapper_static_code(deployments: &[Deployment1]) -> TokenStream {
             };
             let mut x: Option<Arc<dyn ServerlessHandler>> = None;
             #all_handler_checks
-            Arc::new(ServerlessWrapper::new(instance_info, serverless_storage, x.unwrap()).await)
+            Arc::new(ServerlessWrapper::new(instance_info, file_lease, x.unwrap()).await)
         });
     };
 

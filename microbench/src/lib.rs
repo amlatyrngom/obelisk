@@ -7,6 +7,8 @@ pub mod runner;
 pub use runner::BenchRunner;
 pub mod sim_actor;
 pub use sim_actor::SimActor;
+pub mod micro_kv;
+pub use micro_kv::MicroKVActor;
 
 pub async fn prepare_deployment() -> Vec<String> {
     // Return specs.
@@ -193,7 +195,7 @@ mod tests {
         println!("Retrieve Resp: {resp:?}");
         println!("Retrieve Duration: {duration:?}");
         // Increment
-        let req = MicroActorReq::Increment(10);
+        let req = MicroActorReq::Increment(10, 512);
         let req = serde_json::to_string(&req).unwrap();
         let start_time = std::time::Instant::now();
         let resp = fc.invoke(&req, &[]).await;
@@ -202,7 +204,7 @@ mod tests {
         println!("Increment Resp: {resp:?}");
         println!("Increment Duration: {duration:?}");
         // Decrement
-        let req = MicroActorReq::Increment(-10);
+        let req = MicroActorReq::Increment(-10, 512);
         let req = serde_json::to_string(&req).unwrap();
         let start_time = std::time::Instant::now();
         let resp = fc.invoke(&req, &[]).await;

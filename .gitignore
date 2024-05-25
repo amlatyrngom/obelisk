@@ -2,3 +2,10 @@
 **/.obelisk_build
 **/obelisk_shared_data
 pitch.md
+**/venv
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/__pycache__
+**/bench_data
+low_level_systems/storage

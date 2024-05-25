@@ -12,6 +12,7 @@ serde = {version="*", features=["derive"]}
 persistence = {path="../persistence"}
 common = {path="../common"}
 functional = {path="../functional"}
+low_level_systems = {path="../low_level_systems"}
 async-trait = "*"
 chrono = {version="*", features=["serde"]}
 bincode = "*"
@@ -19,3 +20,5 @@ bincode = "*"
 
 [dev-dependencies]
 csv = "*"
+rand = "*"
+zipf = "7.0.1"

@@ -1,9 +1,9 @@
-use common::{HandlerKit, InstanceInfo, ScalingState, ServerlessHandler, ServerlessStorage};
+use common::{HandlerKit, InstanceInfo, ScalingState, ServerlessHandler};
 use std::sync::Arc;
 
 pub struct Echo {
     instance_info: Arc<InstanceInfo>,
-    serverless_storage: Option<Arc<ServerlessStorage>>,
+    _incarnation: i64,
 }
 
 impl Echo {
@@ -12,7 +12,7 @@ impl Echo {
         println!("Creating echo function: {:?}", kit.instance_info);
         Echo {
             instance_info: kit.instance_info,
-            serverless_storage: kit.serverless_storage,
+            _incarnation: kit.incarnation,
         }
     }
 }
@@ -23,11 +23,6 @@ impl ServerlessHandler for Echo {
     async fn handle(&self, meta: String, payload: Vec<u8>) -> (String, Vec<u8>) {
         println!("Echo Handler: {:?}. Meta={meta}", self.instance_info);
         let (resp_meta, resp_payload) = self.handle_request(meta, payload).await;
-        let resp_meta = if self.serverless_storage.is_some() {
-            self.handle_actor_invoke(resp_meta).await
-        } else {
-            resp_meta
-        };
         (resp_meta, resp_payload)
     }
 
@@ -74,16 +69,5 @@ impl Echo {
             tokio::time::sleep(sleep_time).await;
         };
         (meta, payload)
-    }
-
-    /// Actor invoke.
-    async fn handle_actor_invoke(&self, meta: String) -> String {
-        let st = self.serverless_storage.clone().unwrap();
-        let pool = st.exclusive_pool.clone().unwrap();
-        let conn = pool.get().unwrap();
-        let meta = conn
-            .query_row("SELECT 'sql' || ?;", [meta], |r| r.get::<usize, String>(0))
-            .unwrap();
-        meta
     }
 }

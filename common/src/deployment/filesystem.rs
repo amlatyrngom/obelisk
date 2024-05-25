@@ -55,7 +55,7 @@ impl FilesystemDeployment {
                 }
                 if !avail {
                     println!("Waiting for mount targets...");
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 } else {
                     break;
                 }

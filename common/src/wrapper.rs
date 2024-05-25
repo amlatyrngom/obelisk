@@ -1,11 +1,11 @@
 use crate::debug_format;
 use crate::scaling_state::ScalingStateManager;
-use crate::storage::ServerlessStorage;
 use crate::{deployment, ServerlessHandler};
 use crate::{time_service::TimeService, HandlingResp};
 use base64::{engine::general_purpose, Engine as _};
+use low_level_systems::file_lease::FileLease;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, RwLock};
+use std::sync::{atomic, Arc, RwLock};
 use tokio::signal::unix;
 
 /// Amount of time between checkpoints.
@@ -18,9 +18,10 @@ pub struct ServerlessWrapper {
     join_time: chrono::DateTime<chrono::Utc>,
     pub instance_info: Arc<InstanceInfo>,
     state_manager: Arc<ScalingStateManager>,
-    serverless_storage: Option<Arc<ServerlessStorage>>,
+    file_lease: Option<Arc<FileLease>>,
     handler: Arc<dyn ServerlessHandler>,
     instance_stats: Arc<RwLock<Option<InstanceStats>>>,
+    invocation_count: Arc<atomic::AtomicI64>,
 }
 
 /// Information about a running instance.
@@ -81,7 +82,7 @@ impl ServerlessWrapper {
     /// Create new adapter backend.
     pub async fn new(
         instance_info: Arc<InstanceInfo>,
-        serverless_storage: Option<Arc<ServerlessStorage>>,
+        file_lease: Option<Arc<FileLease>>,
         handler: Arc<dyn ServerlessHandler>,
     ) -> Self {
         let shared_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
@@ -102,13 +103,10 @@ impl ServerlessWrapper {
             instance_info,
             state_manager: Arc::new(state_manager),
             handler,
-            serverless_storage,
+            file_lease,
             instance_stats: Arc::new(RwLock::new(instance_stats)),
+            invocation_count: Arc::new(atomic::AtomicI64::new(0)),
         };
-        if wrapper.instance_info.unique && wrapper.instance_info.private_url.is_some() {
-            // If unique, wait for url availability.
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-        }
         // Start state manager threads.
         wrapper.state_manager.start_refresh_thread().await;
         wrapper.state_manager.start_rescaling_thread().await;
@@ -168,7 +166,15 @@ impl ServerlessWrapper {
     pub async fn handle_ecs_message(&self, meta: String, payload: Vec<u8>) -> (String, Vec<u8>) {
         let start_time = std::time::Instant::now();
         println!("Received Meta: {meta:?}");
-        let meta: WrapperMessage = serde_json::from_str(&meta).unwrap();
+        let meta = match serde_json::from_str::<WrapperMessage>(&meta) {
+            Ok(meta) => meta,
+            Err(_) => {
+                if !meta.is_empty() {
+                    println!("Warning: unformatted wrapper message. Should probably be avoided! Will eventually be treated as bug.");
+                }
+                WrapperMessage::HandlerMessage { meta }
+            }
+        };
         let (resp_meta, resp_payload) = match meta {
             WrapperMessage::HandlerMessage { meta } => {
                 let (resp_meta, resp_payload) =
@@ -190,9 +196,14 @@ impl ServerlessWrapper {
 
     /// Handle lambda message.
     pub async fn handle_lambda_message(&self, request: serde_json::Value) -> serde_json::Value {
+        if let Some(file_lease) = &self.file_lease {
+            tokio::task::block_in_place(|| {
+                let _ = file_lease.check_lease();
+            });
+        }
         let start_time = std::time::Instant::now();
         let (meta, payload): (WrapperMessage, String) = serde_json::from_value(request).unwrap();
-        match meta {
+        let resp = match meta {
             WrapperMessage::HandlerMessage { meta } => {
                 let payload = general_purpose::STANDARD_NO_PAD.decode(payload).unwrap();
                 let (resp_meta, resp_payload) =
@@ -209,7 +220,15 @@ impl ServerlessWrapper {
                 self.checkpoint_handler(true).await;
                 serde_json::Value::Null
             }
+        };
+        // Synchronously checkpoint every 100 invocations in a lambda.
+        self.invocation_count
+            .fetch_add(1, atomic::Ordering::Relaxed);
+        if self.invocation_count.load(atomic::Ordering::Relaxed) % 100 == 0 {
+            let curr_scaling_state = self.state_manager.current_scaling_state().await;
+            self.handler.checkpoint(&curr_scaling_state, false).await;
         }
+        resp
     }
 
     /// Handle direct message message.
@@ -226,28 +245,16 @@ impl ServerlessWrapper {
 
     /// Perform checkpointing.
     async fn checkpoint_handler(&self, terminating: bool) {
-        // Check unique.
-        let lost_incarnation = if let Some(ss) = &self.serverless_storage {
-            if ss.exclusive_pool.is_some() {
-                let x = ss.check_incarnation().await;
-                println!("Incarnation Check: {x:?}");
-                x.is_err()
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        let terminating = terminating || lost_incarnation;
         // Update stats.
         if let Ok(s) = self.instance_info.read_stats().await {
             let mut instance_stats = self.instance_stats.write().unwrap();
             *instance_stats = Some(s);
         }
-        // TODO: Think about whether put this before or after deregistering.
-        let scaling_state = self.state_manager.current_scaling_state().await;
-        self.handler.checkpoint(&scaling_state, terminating).await;
         if self.instance_info.private_url.is_some() {
+            // TODO: Think about whether put this before or after deregistering.
+            let scaling_state = self.state_manager.current_scaling_state().await;
+            // Checkpoint occurs asynchronously for ECS (here) and synchronously for Lambda.
+            self.handler.checkpoint(&scaling_state, terminating).await;
             // If serverful, update peer list.
             let _ = self
                 .state_manager
@@ -255,24 +262,17 @@ impl ServerlessWrapper {
                 .await;
         }
         if terminating {
-            // Release exclusive file if held.
-            if let Some(ss) = &self.serverless_storage {
-                tokio::task::block_in_place(move || {
-                    let _ = ss.release_exclusive_file(1);
+            // Release lease if held.
+            if let Some(lease_info) = &self.file_lease {
+                tokio::task::block_in_place(|| {
+                    let _ = lease_info.revoke_lease();
                 });
             }
-            // If unique, wait to avoid spurrious ecs restarts.
-            if self.instance_info.unique && self.instance_info.private_url.is_some() {
-                tokio::time::sleep(std::time::Duration::from_secs(100)).await;
-            }
+            // // If unique, wait to avoid spurrious ecs restarts.
+            // if self.instance_info.unique && self.instance_info.private_url.is_some() {
+            //     tokio::time::sleep(std::time::Duration::from_secs(100)).await;
+            // }
             std::process::exit(0);
-        } else {
-            // Seems necessary to keep the lock active?
-            if let Some(ss) = &self.serverless_storage {
-                tokio::task::block_in_place(move || {
-                    let _ = ss.dummy_write_to_exclusive();
-                });
-            }
         }
     }
 
@@ -416,7 +416,7 @@ impl InstanceInfo {
     /// Retrieve information about a instance.
     pub async fn new() -> Result<InstanceInfo, String> {
         let mode = std::env::var("OBK_EXECUTION_MODE").unwrap();
-        if mode.contains("lambda") {
+        if mode.contains("lambda") || mode.contains("local") {
             Self::function_new().await
         } else {
             Self::container_new().await

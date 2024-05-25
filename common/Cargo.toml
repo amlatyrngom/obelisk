@@ -32,3 +32,4 @@ aws-sdk-ecr = "=1.19"
 aws-sdk-ecrpublic = "=1.19"
 aws-sdk-efs = "=1.19"
 aws-sdk-s3 = "=1.22"
+low_level_systems = { path = "../low_level_systems" }

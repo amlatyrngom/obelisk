@@ -9,49 +9,7 @@ pub use log_replica::LogReplica;
 pub use persistent_log::PersistentLog;
 pub use rescaler::WalRescaler;
 
-use serde::{Deserialize, Serialize};
-
-const NUM_DB_RETRIES: usize = 20;
 const SUBSYSTEM_NAME: &str = "wal";
-
-#[derive(Serialize, Deserialize, Debug)]
-enum PersistenceReqMeta {
-    Log {
-        lo_lsn: usize,
-        hi_lsn: usize,
-        owner_id: usize,
-        persisted_lsn: usize,
-        replica_id: String,
-    },
-    Drain {
-        owner_id: usize,
-        persisted_lsn: usize,
-        replica_id: String,
-    },
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-enum RPersistenceReqMeta {
-    Log {
-        owner_id: usize,
-        persisted_lsn: usize,
-        replica_id: String,
-    },
-    Drain {
-        owner_id: usize,
-        persisted_lsn: usize,
-        replica_id: String,
-    },
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-enum PersistenceRespMeta {
-    Ok,
-    Outdated,
-    WrongReplica,
-    Terminating,
-    Err(String),
-}
 
 pub async fn prepare_deployment() -> Vec<String> {
     // Return spec

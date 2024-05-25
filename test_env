@@ -1,6 +1,7 @@
-NAMESPACE=functional
-MEMORY=512
-WORKER_INDEX=0
-EXECUTION_MODE=messaging_ecs
-TIMEOUT=1
-GRACE=1
+OBK_EXECUTION_MODE=local_ecs
+OBK_EXTERNAL_ACCESS=false
+OBK_HANDLER_SPEC='{"subsystem":"functional","namespace":"microbench","name":"microactor","timeout":10,"default_mem":1769,"concurrency":1,"ephemeral":512,"persistent":true,"unique":true,"scaleup":0.0,"spot":true}'
+OBK_IDENTIFIER=microactor0
+OBK_MEMORY=2048
+OBK_CPUS=1024
+OBK_PUBLIC=true

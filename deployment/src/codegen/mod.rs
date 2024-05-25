@@ -29,7 +29,7 @@ pub fn gen_imports(for_system: bool) -> TokenStream {
         // Used by rescaler.
         use #common_path::{ScalingStateRescaler, Rescaler, RescalerSpec};
         // Used by handlers.
-        use #common_path::{ServerlessHandler, ServerlessWrapper, InstanceInfo, HandlerKit, ServerlessStorage};
+        use #common_path::{ServerlessHandler, ServerlessWrapper, InstanceInfo, HandlerKit, FileLease};
         use lazy_static::lazy_static;
         use std::sync::Arc;
         use warp::Filter;
