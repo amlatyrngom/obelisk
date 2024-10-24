@@ -122,6 +122,13 @@ impl ServerlessHandler for MicroKVActor {
     async fn checkpoint(&self, _scaling_state: &ScalingState, terminating: bool) {
         println!("Checkpoint: Terminating=({terminating})");
         self.plog.check_replicas(terminating).await;
+        tokio::task::block_in_place(|| {
+            self.btree.perform_checkpoint();
+            if terminating {
+                // TODO: Just to be sure. Something seems wrong.
+                self.btree.perform_checkpoint();
+            }
+        });
     }
 }
 
@@ -145,7 +152,7 @@ mod test {
     // Not using powers of 2 for simplicity.
     const BENCH_NUM_KEYS: usize =
         (BENCH_DATA_SIZE_GB * 1000 * 1000 * 1000) / (BENCH_KEY_SIZE + BENCH_VAL_SIZE);
-    const WRITE_RATE: f64 = 0.2;
+    const WRITE_RATE: f64 = 0.1;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
     async fn basic_test() {
@@ -430,7 +437,7 @@ mod test {
                 (self.desired_requests_per_second * self.curr_avg_latency).ceil();
             if num_needed_threads > self.thread_cap {
                 // Use to manually prevent wrong latency estimate from ruining the benchmark.
-                num_needed_threads = self.thread_cap;
+                num_needed_threads = self.thread_cap.floor();
             }
             let total_num_requests = window_duration * self.desired_requests_per_second;
             let requests_per_thread = (total_num_requests / num_needed_threads).ceil();
@@ -582,7 +589,7 @@ mod test {
     async fn full_fn_bench_cloud() {
         let fc =
             Arc::new(FunctionalClient::new("microbench", "microrunner", None, Some(512)).await);
-        let duration_mins = 5.0;
+        let duration_mins = 30.0;
         let _low_req_per_secs = 4.0;
         let _medium_req_per_secs = 40.0;
         let _high_req_per_secs = 400.0;
@@ -592,15 +599,15 @@ mod test {
             fc: fc.clone(),
             thread_cap: 100.0,
         };
-        // // Low
-        // request_sender.desired_requests_per_second = _low_req_per_secs;
-        // request_sender.thread_cap = 1.0 + 1e-4;
-        // run_bench(
-        //     &mut request_sender,
-        //     "pre_low",
-        //     Duration::from_secs_f64(60.0 * duration_mins),
-        // )
-        // .await;
+        // Low
+        request_sender.desired_requests_per_second = _low_req_per_secs;
+        request_sender.thread_cap = 1.0 + 1e-4;
+        run_bench(
+            &mut request_sender,
+            "pre_low",
+            Duration::from_secs_f64(60.0 * duration_mins),
+        )
+        .await;
         // Medium
         request_sender.desired_requests_per_second = _medium_req_per_secs;
         request_sender.thread_cap = 1.0 + 1e-4;
@@ -610,15 +617,15 @@ mod test {
             Duration::from_secs_f64(60.0 * duration_mins),
         )
         .await;
-        // High
-        request_sender.desired_requests_per_second = _high_req_per_secs;
-        request_sender.thread_cap = 10.0 + 1e-4;
-        run_bench(
-            &mut request_sender,
-            "pre_high",
-            Duration::from_secs_f64(60.0 * duration_mins),
-        )
-        .await;
+        // // High
+        // request_sender.desired_requests_per_second = _high_req_per_secs;
+        // request_sender.thread_cap = 10.0 + 1e-4;
+        // run_bench(
+        //     &mut request_sender,
+        //     "pre_high",
+        //     Duration::from_secs_f64(60.0 * duration_mins),
+        // )
+        // .await;
         // // Low again
         // request_sender.desired_requests_per_second = _low_req_per_secs;
         // request_sender.thread_cap = 1.0 + 1e-4;
@@ -626,6 +633,7 @@ mod test {
         //     &mut request_sender,
         //     "post_low",
         //     Duration::from_secs_f64(60.0 * duration_mins),
-        // ).await;
+        // )
+        // .await;
     }
 }

@@ -3,3 +3,4 @@
 **/venv
 **/bench_data
 py_kv_bench
+**/notebooks

@@ -49,7 +49,6 @@ impl Manager {
     ) -> Result<Self, LLError> {
         let journal = Journal::new(2 * parallelism, page_size, storage_dir, name)?;
         let journal = Arc::new(journal);
-        // journal.recover_all()?;
         let mem_mb: usize = if let Ok(mem) = std::env::var("OBK_MEMORY") {
             mem.parse().unwrap()
         } else {

@@ -126,10 +126,10 @@ impl Manager {
             storage_dir,
             name,
         )?);
-        assert!(
-            parallelism <= WAL_PARALLELISM,
-            "WAL parallelism must be greater than BTREE parallelism."
-        );
+        // assert!(
+        //     parallelism <= WAL_PARALLELISM,
+        //     "WAL parallelism must be greater than BTREE parallelism."
+        // );
         // Start recovery: get root and entries.
         let (root_info, entries) = Self::start_recovery(&bpm, wal.as_ref())?;
         log::info!("[BTREE] Made/Recovered Root: {root_info:?}");

@@ -46,9 +46,8 @@ pub fn gen_wrapper_static_code(deployments: &[Deployment1]) -> TokenStream {
             // Initialize instance info and lease if needed.
             let instance_info = Arc::new(InstanceInfo::new().await.unwrap());
             let (file_lease, incarnation) = if instance_info.unique {
+                let storage_dir = common::storage_path(&instance_info);
                 let name = instance_info.identifier.clone();
-                let storage_dir = common::shared_storage_prefix();
-                let storage_dir = format!("{storage_dir}/{namespace}/{name}", namespace=instance_info.namespace);
                 let exclusive = instance_info.private_url.is_some();
                 let _ = std::fs::create_dir_all(&storage_dir);
                 let file_lease = FileLease::new(&storage_dir, &name, exclusive);
